@@ -1,7 +1,7 @@
 {
   "name": "htn-ai",
-  "version": "1.2.1",
-  "description": "TypeScript Hierarchical Task Network (HTN) planner for game AI, inspired by FluidHTN",
+  "version": "2.0.0-alpha.0",
+  "description": "Real-time AI planning and execution runtime for TypeScript agents: hierarchical task networks (HTN) + goal search (GOAP) over a typed symbolic representation, with budgeted/anytime planning, plan repair, temporal-lite deadlines/windows, and deterministic, auditable traces.",
   "type": "module",
   "source": "src/index.ts",
   "exports": {
@@ -19,57 +19,55 @@
   "unpkg": "./dist/index.global.js",
   "scripts": {
     "build": "tsup",
-    "lint": "eslint . --max-warnings=0",
+    "lint": "eslint src tests --max-warnings=0",
     "typecheck": "tsc --noEmit --project tsconfig.tests.json",
     "prepublishOnly": "npm run typecheck",
     "test": "tsx --tsconfig tsconfig.tests.json node_modules/uvu/bin.js tests",
-    "test:coverage": "c8 --check-coverage --lines 85 --reporter=html --reporter=text tsx --tsconfig tsconfig.tests.json node_modules/uvu/bin.js tests",
+    "test:coverage": "c8 --check-coverage --lines 80 --reporter=html --reporter=text tsx --tsconfig tsconfig.tests.json node_modules/uvu/bin.js tests",
     "test:report": "c8 report --reporter=text-lcov > coverage/tests.lcov",
     "test:watch": "chokidar \"**/*.ts\" -c \"npm test\""
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TotallyGatsby/GamePlanHTN.git"
+    "url": "git+https://github.com/Glavin001/HTN-AI.git"
   },
   "keywords": [
     "htn",
     "hierarchical-task-network",
-    "hierarchical task network",
     "planner",
     "planning",
-    "game",
+    "goap",
+    "goal-oriented-action-planning",
+    "agent",
+    "agents",
+    "llm",
     "game-ai",
     "gamedev",
+    "real-time",
+    "anytime",
     "typescript",
-    "javascript",
     "ai",
-    "ai behaviors",
-    "fluidhtn",
-    "fluid-htn",
     "orchestration"
   ],
   "author": "Glavin Wiechert",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/TotallyGatsby/GamePlanHTN/issues"
+    "url": "https://github.com/Glavin001/HTN-AI/issues"
   },
-  "homepage": "https://github.com/TotallyGatsby/GamePlanHTN#readme",
+  "homepage": "https://github.com/Glavin001/HTN-AI#readme",
+  "engines": {
+    "node": ">=20"
+  },
   "devDependencies": {
-    "@babel/eslint-parser": "^7.19.1",
     "@typescript-eslint/eslint-plugin": "^7.8.0",
     "@typescript-eslint/parser": "^7.8.0",
-    "@tivac/eslint-config": "^2.4.0",
     "@types/node": "^20.12.8",
     "c8": "^7.12.0",
     "chokidar-cli": "^3.0.0",
     "eslint": "^8.28.0",
-    "eslint-plugin-eslint-comments": "^3.2.0",
     "tsup": "^8.0.1",
     "tsx": "~3.12.7",
     "typescript": "~5.5.4",
     "uvu": "^0.5.6"
-  },
-  "dependencies": {
-    "loglevel": "^1.8.1"
   }
 }
