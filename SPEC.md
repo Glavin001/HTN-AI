@@ -20,7 +20,7 @@
 ### 1.2 Non-goals (v2)
 
 - Partial-order method execution semantics (we import PO-HDDL only via documented linearization or rejection; see D6).
-- Temporal/durative planning (PDDL 2.1 durative actions, HDDL 2.1). Deadlines/`maintain` are *execution-layer* features, not temporal search.
+- **Durative-action temporal search** (PDDL 2.1 durative actions, HDDL 2.1, makespan-optimized overlapping schedules). v2 ships **temporal-lite** instead — durations, projected-clock deadline/window pruning *in search*, timestamp-fluent process modeling, and timed execution — see §4.13 and D13. The IR reserves durative annotations so full temporal search remains an additive post-v2 option.
 - Probabilistic/FOND planning — nondeterminism is handled by repair/replan at execution.
 - Optimal-track guarantees under real-time budgets — we provide anytime convergence with reported suboptimality bounds instead.
 - Visual *editor* (authoring GUI). The inspector (read/debug) is in scope via the trace contract; editing UI is later.
@@ -90,7 +90,7 @@ A **fluent** is a typed, optionally parameterized state variable. Kinds:
 Notes:
 - Parameterized fluents ground to dense tables indexed by entity ids (row-major). This is the SAS+/Fast-Downward lesson: multi-valued variables, not seas of booleans.
 - `vec2/vec3` get built-in comparison sugar (`dist(pos(a), pos(b)) ≤ r`) which compiles to a semi-symbolic expression with declared reads `{pos(a), pos(b)}`.
-- v1 compatibility: the current string-keyed `WorldState` maps to an auto-declared bag of `boolean|int|unknown` fluents (tier-3, §4.9).
+- An untyped string-keyed bag fluent exists for quick prototyping only (tier-3 semantics, §4.9).
 
 ### 4.3 Formulas (precondition / goal / axiom-body language)
 
@@ -150,8 +150,8 @@ interface MethodDecl {
 }
 ```
 
-- v1's `select`/`sequence`/`utilitySelect` become method patterns (a select = one method per branch; sequence = one method with N subtasks); the fluent `DomainBuilder` API is preserved and now *emits IR*.
-- Slots/`PausePlan` carry over unchanged in semantics.
+- `select`/`sequence`/`utilitySelect` are method patterns (a select = one method per branch; a sequence = one method with N subtasks); the fluent builder API is a thin frontend that *emits IR*.
+- Slot (runtime domain splicing) and pause-plan (partial planning) semantics are kept — by choice, as proven FluidHTN-lineage features, specified fresh.
 
 ### 4.8 Goals
 
@@ -174,9 +174,9 @@ Every formula/effect node is classified at compile time:
 |---|---|---|---|
 | **T1 symbolic** | pure IR (fluents, comps, arithmetic) | full | everything: relaxation heuristics, landmarks, mutexes, regression/causal links, look-ahead pruning, perfect dirty-tracking, match-tree indexing |
 | **T2 scoped-native** | native fn + **declared read set / write set** (fluent patterns) | reads/writes, not semantics | dirty-tracking, memoization, successor indexing on the symbolic part, causal-link repair, partial pruning; treated as "unknown but bounded" by relaxation heuristics |
-| **T3 opaque** | bare closure (v1 compatibility) | none | none — evaluated every time; node-local; disables model-based heuristics on paths that depend on it |
+| **T3 opaque** | bare closure (prototyping escape hatch) | none | none — evaluated every time; node-local; disables model-based heuristics on paths that depend on it |
 
-Rule: **the engine exploits the best tier each node provides**; a domain's "optimization report" (§5.5) tells authors exactly what each T2/T3 node is costing them. This is the migration path: v1 closure domains run unmodified (all-T3), and every declaration upgrade buys measurable speed.
+Rule: **the engine exploits the best tier each node provides**; a domain's "optimization report" (§5.5) tells authors exactly what each T2/T3 node is costing them. Tiers are about *progressive declaration*, not compatibility: hack something together with closures, then upgrade nodes guided by the report — every declaration upgrade buys measurable speed and unlocks heuristics/repair on that path.
 
 ### 4.10 Spatial support (positions of players, regions, movement)
 
@@ -186,9 +186,9 @@ Rule: **the engine exploits the best tier each node provides**; a domain's "opti
 
 ### 4.11 Canonical document format (D1)
 
-- **`DomainDocument` / `ProblemDocument`**: versioned JSON (`"format": "htn-ai/domain@2"`), JSON-Schema published, fully describing §4.1–4.10 (T2/T3 nodes serialize as named refs resolved against a runtime registry — documents are always data; code is bound by name).
+- **Canonical = the IR itself.** `DomainDocument` / `ProblemDocument` are its lossless, versioned JSON serialization (`"format": "htn-ai/domain@2"`, JSON-Schema published), fully covering §4.1–4.10 (T2/T3 nodes serialize as named refs resolved against a runtime registry — documents are always data; code is bound by name).
 - Design properties: LLM-authorable (the schema *is* the prompt contract), diffable, structured-clone-safe (workers), and the unit of incremental validation (§10).
-- Builder API, JSON documents, and HDDL/PDDL imports all normalize into the same IR.
+- **Syntaxes are frontends over the IR**: the fluent builder API (programmatic TS), JSON (machine/LLM/wire — near-zero cost, needed anyway for workers/devtools), and HDDL/PDDL (interchange; HDDL doubles as a human-readable syntax for the symbolic fragment). A dedicated human-authoring DSL — with its own parser *and* serializer — is deliberately deferred until builder+JSON authoring proves insufficient in practice (D1).
 
 ### 4.12 Interchange & coverage (G5)
 
@@ -201,6 +201,17 @@ Rule: **the engine exploits the best tier each node provides**; a domain's "opti
 Out-of-fragment constructs fail imports with precise diagnostics (never silent semantic drift). Conversely, T2/T3 and spatial constructs are flagged "not exportable to HDDL/PDDL" per node.
 
 ---
+
+### 4.13 Temporal model — temporal-lite (D13)
+
+Durations and deadlines are *search-visible*; overlapping-action schedules are not. Specifically:
+
+- **Durations**: `duration?: NumExpr` on operators (may read state) — feeds costs, ETAs, the scheduler, and inspector timelines.
+- **Projected clock**: rollout maintains a `clock` projection (Σ durations along the plan prefix). Deadline and time-window conditions (`clock ≤ T`, `clock ∈ [a,b]`) are ordinary T1 numeric comparisons over the projection — so *search itself* prunes plans that cannot make a deadline. No new machinery: this is the classic time-as-resource compilation riding on §4.2 numerics.
+- **Timestamp-fluent process pattern**: overlapping *world* processes under a sequential agent — `startBoil: set(readyAt(pot), clock + 90)`; later `serve` gates on `clock ≥ readyAt(pot)`, and the agent chops vegetables in between. This expresses cooking-timer / RimWorld-job-class concurrency without durative search.
+- **Timeline dispatch & drift**: emitted plans carry projected start/ETA per step; execution compares actual vs projected and raises time expectation-violations → repair/abort *before* the deadline actually fails (STN-lite consistency at execution).
+- **Reserved annotations**: the document format parses and preserves `at-start / over-all / at-end` effect/condition annotations without interpreting them — durative semantics can be added later without breaking documents.
+- **Deliberately absent**: single-agent overlapping action schedules, makespan optimality, required concurrency. Required concurrency is rare outside specialized robotics (Cushing et al., IJCAI 2007: most "temporal" domains are temporally simple — sequential planning + scheduling is complete); our concurrency comes from multi-agent (each sequential) and execution lanes (§8). The eval suite includes a deadline/time-window scenario as the falsifier (§11.1) — if temporal-lite can't express a target scenario, D13 gets revisited.
 
 ## 5. Compilation pipeline
 
@@ -223,7 +234,7 @@ Compiled artifacts are serializable (cacheable, shippable to workers).
 - **Rollout**: copy-on-write **layers** for search (`base + delta`), generalizing today's `WorldStateChangeStack`; O(changed) apply/undo; node pooling — steady-state search performs **zero allocations** per expansion (pool hit).
 - **Hashing**: incremental Zobrist hash maintained per layer → O(1) visited-set keys (replaces JSON.stringify). Floats hash by quantized bits (D10 covers the lockstep/fixed-point profile).
 - **Dirty tracking**: writes outside planning mark precise fluent-level dirt; replan triggers consult the *read sets* of the active plan's conditions (T1/T2) — "replan only if something the plan depends on changed," sharpening today's global `IsDirty`.
-- **Facade**: `Context.getState/setState/hasState` remain, backed by the buffer; typed accessors generated from the domain (`ctx.fluents.health(unit)`).
+- **Accessors**: typed accessors generated from the domain (`ctx.fluents.health(unit)`); a generic string-keyed get/set API exists for prototyping (backed by the bag fluent, §4.2).
 - **Serialization**: state + active goals + RNG seed as JSON; **replan on load** (never persist mid-search internals).
 
 ---
@@ -265,7 +276,7 @@ Injected seeded RNG only; stable iteration everywhere; no wall-clock reads insid
 
 ## 8. Execution layer
 
-- **Planner v2 tick**: as today (run operator, executing conditions, effects on success) plus: budget pass-through, **fluent-precise replan triggers** (§6), and repair-first policy.
+- **Planner tick**: FluidHTN-proven reactive semantics, reimplemented (run executor, executing conditions, effects on success; MTR replan-only-if-better) plus: budget pass-through, **fluent-precise replan triggers** (§6), repair-first policy, and **timeline dispatch** (projected step ETAs from durations; actual-vs-projected drift raises time expectation-violations → repair before deadlines fail, §4.13).
 - **Plan repair**: decomposition trace retained per plan; on failure/relevant-delta, backtrack from the failure point and re-decompose minimally (IPyHOPPER pattern), validated against causal links (which effect supports which precondition — computable from T1/T2 declarations); fall back to full replan above a perturbation threshold (Fox 2006). MTR still arbitrates replace-vs-keep.
 - **Scoped execution**: first-class scopes with `onEnter/onExit` (exit runs on success, failure, *and* abort — the try/finally PR #12 emulated), `deadline(ms)` and `maintain(condition)` guards that abort the scope (triggering exit handlers + repair). Scope state lives in the **context**, not task instances (multi-agent safe).
 - **Concurrency**: M4+ — multiple intention lanes per agent (BDI-style) executing independent plan segments with conflict detection via write-set intersection; until then `DoInParallel` does not exist (no fake serialization).
@@ -304,7 +315,7 @@ Injected seeded RNG only; stable iteration everywhere; no wall-clock reads insid
 | **IPC TO-HTN** | IPC 2020/2023 HDDL domains (≥20 by M4) | correctness vs pandaPIparser --verify; coverage/quality/time vs reference planners |
 | **Classical** | IPC STRIPS + numeric subset via PDDL import | goal-search parity; VAL-verified plans |
 | **Puzzles** | PR #14's 15 problems, re-derived (solved *by search*, executed via `Planner.tick`) | representation expressivity (sokoban/blocks/jugs/river) |
-| **Game scenarios** | bunker, FPS, + new spatial escort/patrol (from PR #12's concepts) | T2 providers, repair, scopes, budgets |
+| **Game scenarios** | bunker, FPS, + new spatial escort/patrol with deadlines & time windows (from PR #12's concepts) | T2 providers, repair, scopes, budgets, **temporal-lite expressivity (D13 falsifier)** |
 | **Agent soak** | N agents × Hz × budget in headless sim + browser demo | scheduler, GC, determinism at scale |
 
 ### 11.2 Reference planners & validators (run natively in CI containers)
@@ -333,12 +344,12 @@ Tactics (specified, not optional): SoA typed-array state; pooling for nodes/laye
 
 ---
 
-## 13. Packaging, compatibility & migration
+## 13. Packaging & rewrite policy
 
 - **Packages** (D2): `htn-ai` (core, 0-dep) · `@htn-ai/hddl` · `@htn-ai/pddl` · `@htn-ai/llm` · `@htn-ai/eval` · `@htn-ai/devtools` · `@htn-ai/worker` · adapters (`/react`, `/xstate`, `/phaser`, `/excalibur`, `/langgraph`).
-- **v1 compatibility**: v1 API (Domain/Context/Planner/DomainBuilder, closure conditions/effects) ships as a compatibility layer over the v2 engine (all-T3 + facade); FluidHTN-parity test suite must stay green through v2.0. v1.x maintenance branch for fixes only.
-- **Migration**: codemods optional; the real path is incremental tier-upgrading guided by the optimization report (§5.5).
-- **Hygiene** (immediate, pre-M1): fix `package.json` `repository/homepage/bugs` → `Glavin001/HTN-AI`; CI Node 20/22/24 + browser (playwright smoke); request FluidHTN README listing.
+- **Clean-room rewrite — no backward compatibility.** v2 is implemented from scratch against this spec; no v1 source is carried over and no compatibility layer is built. v1 stays published on npm as-is (tagged `v1` branch, unmaintained). We optimize solely for the end-state library.
+- **Semantics are kept by choice, not by code.** Proven FluidHTN-lineage behaviors we *want* (MTR replan-only-if-better, partial plans/slots, effect timing tiers, executing conditions) are specified in §4/§7/§8 and covered by a **fresh spec-test suite** — behavioral intents are ported deliberately; implementation never is.
+- **Hygiene** (immediate, pre-M1): fix `package.json` `repository/homepage/bugs` → `Glavin001/HTN-AI`; CI Node 20/22/24 + browser (playwright smoke); request FluidHTN README listing (lineage visibility).
 
 ---
 
@@ -346,8 +357,8 @@ Tactics (specified, not optional): SoA typed-array state; pooling for nodes/laye
 
 | M | Scope | Gate (acceptance) |
 |---|---|---|
-| **M0** | This spec reviewed; §17 decisions signed off | Agreement on D1–D11 |
-| **M1** | IR + compiler (T1/T2/T3, validate, ground eager+lazy, packed state, evaluators) + HDDL import + plan verification | 5 IPC HDDL domains import, solve (slow search OK), pandaPIparser-verified; v1 parity suite green on facade; baseline perf measured → finalize §11.4/§12 numbers |
+| **M0** | This spec reviewed; §17 decisions signed off | Agreement on D1–D13 |
+| **M1** | IR + compiler (T1/T2/T3, validate, ground eager+lazy, packed state, evaluators, durations/clock) + HDDL import + plan verification | 5 IPC HDDL domains import, solve (slow search OK), pandaPIparser-verified; core-semantics spec suite green (MTR, partial plans, effect timing); baseline perf measured → finalize §11.4/§12 numbers |
 | **M2** | Search core: unified agenda, cycle detection, heap A\*/weighted A\*, h_add/h_FF, novelty, budgeted sessions, PDDL import | Puzzle suite solved by search via `tick`; budget honored (p99); determinism CI |
 | **M3** | Anytime driver, TDG heuristics, look-ahead pruning, landmarks, numeric relaxation, repair v1 (trace backtrack + causal links) | ≥20 IPC domains; anytime curves published; repair beats replan on perturbation suite |
 | **M4** | Execution v2: scopes/deadlines/maintain, scheduler, async lanes, worker pkg, HDDL/PDDL export, eval harness public | Agent-soak gate (200 agents demo); first public benchmark report |
@@ -365,7 +376,7 @@ Tactics (specified, not optional): SoA typed-array state; pooling for nodes/laye
 | **IR scope creep** (full PDDL/HDDL is a tar pit) | Frozen fragments (§4.12) with precise rejection diagnostics; expressivity pressure routed to axioms + T2, not grammar growth |
 | **JS perf ceiling vs native planners** | Targets framed on *our* goals (budgeted/anytime/repair) where no competitor exists; honest "respectable" bar offline (§11.4); typed-array discipline; optional codegen flag (D9); WASM consciously deferred (Zaplib evidence) |
 | **Heuristic implementation complexity** (h_FF/landmarks/TDG are subtle) | Sequenced M2→M3; each heuristic validated against reference planner expansions on shared domains; pyperplan as readable cross-check |
-| **Two-engine drift** (v1 facade vs v2) | v1 facade *is* v2 all-T3 — one engine; parity suite in CI |
+| **Rewrite regression** (losing proven v1/FluidHTN behaviors) | Kept semantics are *specified* (§4/§7/§8) and covered by a fresh spec-test suite; IPC verifier checks every emitted plan; behavioral test intents ported deliberately, code never copied |
 | **LLM-authored domains are wrong** | That's the product: incremental validation + simulation verification + expectation monitoring; nothing unverified executes |
 | **Determinism vs floats** | Quantized hashing; documented hazards; fixed-point profile decision (D10) |
 | **Solo-maintainer bandwidth** | Milestones are independently shippable; eval harness + parity suite make contributions safe; benchmark report attracts contributors |
@@ -374,13 +385,13 @@ Tactics (specified, not optional): SoA typed-array state; pooling for nodes/laye
 
 ## 16. Explicitly out of scope (v2)
 
-PO-HTN execution semantics · temporal/durative actions · FOND/probabilistic search · visual editor · built-in pathfinding/navmesh · multiplayer netcode (we provide determinism; transport is yours) · model training of any kind.
+PO-HTN execution semantics · durative-action temporal *search* (temporal-lite **is** in scope, §4.13) · FOND/probabilistic search · visual editor · built-in pathfinding/navmesh · multiplayer netcode (we provide determinism; transport is yours) · model training of any kind · backward compatibility with v1 (§13).
 
 ---
 
 ## 17. Open decisions for sign-off
 
-- **D1 Canonical format**: JSON `DomainDocument` as source of truth with HDDL/PDDL converters (recommended) — vs HDDL-native. *Recommend JSON: web/LLM-native, supersets the standards, schema-validatable.*
+- **D1 Canonical representation & syntaxes**: canonical artifact is the **in-memory IR**; JSON is its lossless schema-validated serialization (ships M1 — near-zero cost, needed anyway for workers/devtools/LLM interchange); HDDL/PDDL converters for interop (HDDL also serves as human-readable syntax for the symbolic fragment); an optional dedicated authoring DSL (own parser + serializer) only if builder+JSON proves insufficient — decide post-M2 from real usage. *Recommend: IR-canonical, JSON serialization now, DSL deferred.*
 - **D2 Packaging**: monorepo + scoped packages as in §13 (recommended) vs single package.
 - **D3 Name**: ship v2 as `htn-ai@2` (recommended for now; revisit branding before public launch — downloads are ~19/wk, rename cost ≈ 0).
 - **D4 Numeric fluents in M1 core** (recommended — retrofitting types is worse) vs M3 add-on.
@@ -392,3 +403,4 @@ PO-HTN execution semantics · temporal/durative actions · FOND/probabilistic se
 - **D10 Determinism profile**: float64 + quantized hashing default, optional fixed-point (scaled-int) profile for lockstep (recommended) — vs fixed-point everywhere.
 - **D11 Performance numbers**: treat §11.4/§12 as provisional until M1 baselines (recommended) vs commit now.
 - **D12 Milestone order**: engine-first as tabled (recommended) vs tooling-first (M5 before M3) for demo-ability.
+- **D13 Temporal support level**: **temporal-lite in v2 core** (durations, projected-clock deadline/window pruning in search, timestamp-fluent process pattern, timeline dispatch with drift-triggered repair; IR parses-and-preserves `at-start/over-all/at-end` annotations) with durative-action *search* deferred post-v2 (recommended) — vs full PDDL 2.1-style durative search in core. *Falsifier built into §11.1: a deadline/time-window scenario suite; if temporal-lite cannot express a target scenario, revisit (escalation paths: durative TO-search, or an Aries-style CP backend).*
