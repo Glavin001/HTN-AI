@@ -1,6 +1,6 @@
 # HTN-AI — Research & Roadmap Proposal
 
-**Status: proposal, for discussion · June 2026**
+**Status: proposal, for discussion · June 2026 · Companion: [`SPEC.md`](./SPEC.md) (v2 software specification)**
 
 > How this was produced: full review of the repo and all 5 open draft PRs (+ merged-PR trajectory and issue #13), followed by a five-angle research sweep (academic planning, LLM×planner hybrids, game-industry practice, JS/TS ecosystem, browser engineering) with adversarial verification of ~36 load-bearing claims against primary sources. Claims that failed verification are listed in §3.6 and not used elsewhere. All npm download figures are weekly, measured 2026-06-05 → 06-11; GitHub stars as of 2026-06-12.
 
