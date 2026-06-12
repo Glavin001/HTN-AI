@@ -1,6 +1,22 @@
 # Implementation status vs. SPEC.md
 
-**As of v2.0.0-alpha.0.** Everything listed as *implemented* is covered by the test suite (`npm test`, 34 tests). Deferred items note where the architecture already prepares for them.
+**As of v2.0.0-alpha.0.** Everything listed as *implemented* is covered by the test suite (`npm test`, **57 tests across 9 files; 95.9% line / 87.9% branch coverage**, gated in `npm run test:coverage`). Deferred items note where the architecture already prepares for them.
+
+## Test inventory & evaluation methodology
+
+| File | Layer | What it pins down |
+|---|---|---|
+| `tests/core.ts` | unit | IR validation diagnostics, JSON round-trip, packed-state encodings (all 7 fluent kinds), COW hashing, axioms, durations/costs, clock slot |
+| `tests/unit.ts` | unit | seeded RNG, deep COW chains/collapse/materialize, formula/numeric printers, JSON error paths, type hierarchy (subtype grounding), T2 numeric/effect externals + opaque predicates, vec3/setVec, `T.hold`, encoding edge cases |
+| `tests/htn.ts` | behavioral | FluidHTN-lineage semantics kept by choice: method priority order, MTR replan-only-if-better, planOnly vs planAndExecute timing, utility selection, free-variable binding with backtracking, executing-condition aborts |
+| `tests/edges.ts` | engine edges | node-budget/depth-cap/relaxation-unreachable failures, decomposition cycle detection, failed/idle/satisfied planner statuses, async (Promise) executors incl. rejection recovery, drift detection, validatePlan over scopes/waits, scheduler edge cases |
+| `tests/exec.ts` | integration | suffix repair from the failure point, fluent-precise reactivity (irrelevant vs relevant changes), budget-sliced resumable sessions, byte-identical determinism, 25-agent scheduler |
+| `tests/temporal.ts` | integration | the four target scenarios: deadline route-flip in search, time windows + waits, maintain≥15s with cleanup-on-abort, escort abort/recover |
+| `tests/puzzles.ts` | ground truth | water jug (6), blocks world (3), river crossing (7, safety via maintain-in-search), sokoban corridor (exact plan), Tower of Hanoi (7, T2 movability), Bridge & Torch (cost-optimal 15) |
+| `tests/ipc.ts` | research canon | IPC staples hand-encoded with known optima: **Gripper** (11, h_max-admissible mode), **Logistics** (6, type hierarchy + entity-valued NumExpr effects), **Satellite** (5, HTN method with search-bound calibration target), **Transport** (HTN-IPC TO domain, achieve+operator methods, 6) |
+| `tests/scenario.ts` | scenario ports | v1 intents: bunker raid chains, dynamic-cost vehicle choice; fps-lite utility switching; nested scopes (deadline ⊃ maintain) planned + executed |
+
+**How the field evaluates (and how we map to it):** the IPC scores *coverage* (problems solved within a time limit), *plan quality* (cost ratio vs best known; optimal track requires proofs), and *agility* (time-to-first-plan); papers additionally report node expansions. Until the M4 harness imports real HDDL/PDDL suites and runs reference planners (pandaPIengine, Fast Downward, pyperplan), this suite pins the same properties at small scale: exact known optima (quality/optimality, using `heuristic: "hmax"` + `weight: 1` where admissibility is required), `PlanResult.stats` (expansions/decompositions/heuristic evals), budget-slicing tests (agility), and determinism hashes.
 
 ## Implemented (spec section → code)
 
@@ -38,6 +54,12 @@
 | §11.2 reference-planner CI (PANDA/Fast Downward/pyperplan/ENHSP) | M4 | plan format is introspectable; ground-truth asserts stand in meanwhile |
 | §12 perf hardening: node pooling, monomorphic evaluator specialization, hCache eviction, benchmark suite | M3/M4 | hot paths concentrated in `StateView`, `Heap`, `hAdd`; `stats` already reported per session |
 | Worker adapter / packages split (§13) | M4 | core is zero-dependency and isomorphic; domains/states are structured-clone-safe |
+
+## Heuristic notes
+
+- Default goal-search heuristic is **h_add** (`heuristic: "hadd"`): informative and fast, but can overestimate (inadmissible) — fine for the default greedy weight (1.4).
+- For guaranteed-optimal plans use `heuristic: "hmax"` (admissible) or `"none"` (Dijkstra) with `weight: 1` — the Gripper test demonstrates the difference (h_add yields 13 steps, h_max the optimal 11).
+- Effects that assign from runtime expressions (NumExpr sets, inc/dec, setVec, externals) are tracked as **fuzzy writes**: the relaxation treats their fluents as optimistically settable instead of unreachable (the Logistics `unload: pkgAt := vehAt(v)` pattern).
 
 ## Known divergences from FluidHTN (deliberate, per SPEC §13)
 

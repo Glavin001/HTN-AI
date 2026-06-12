@@ -271,4 +271,121 @@ test("sokoban corridor: walk + two pushes (relational adjacency, optimal 3 ops)"
   assert.equal(ops, ["walk(c1,c2)", "push(c2,c3,c4)", "push(c3,c4,c5)"], "ground-truth optimal");
 });
 
+// ---------------------------------------------------------------- tower of hanoi (3 disks → 7 moves)
+
+test("tower of hanoi: 3 disks solved in the optimal 2^n−1 = 7 moves (T2 movability predicate)", () => {
+  const disks = ["d1", "d2", "d3"]; // d1 smallest
+  const doc: DomainDoc = {
+    name: "hanoi",
+    types: [{ name: "disk" }, { name: "peg" }],
+    fluents: [
+      { name: "peg", params: [{ name: "d", type: "disk" }], kind: "entity", entityType: "peg" },
+      { name: "size", params: [{ name: "d", type: "disk" }], kind: "int" },
+    ],
+    operators: [
+      {
+        name: "move",
+        params: [
+          { name: "d", type: "disk" },
+          { name: "from", type: "peg" },
+          { name: "to", type: "peg" },
+        ],
+        pre: F.and(
+          F.lit("peg", ["?d"], "?from"),
+          F.ext("neq", ["?from", "?to"], []),
+          // no smaller disk on the source (it would be on top) or the target
+          F.ext("canMoveTo", ["?d", "?to"], ["peg", "size"]),
+        ),
+        eff: [E.set("peg", ["?d"], "?to")],
+      },
+    ],
+  };
+  const model = createModel(
+    doc,
+    {
+      entities: { d1: "disk", d2: "disk", d3: "disk", p1: "peg", p2: "peg", p3: "peg" },
+      init: (w) => {
+        disks.forEach((d, i) => {
+          w.set("peg", [d], "p1");
+          w.set("size", [d], i + 1);
+        });
+      },
+    },
+    {
+      predicates: {
+        neq: (q) => q.args[0] !== q.args[1],
+        canMoveTo: (q) => {
+          const [d, to] = q.args;
+          const dPeg = q.get("peg", d);
+          const dSize = q.get("size", d);
+          for (const other of disks) {
+            const og = q.gid(other);
+            if (og === d) continue;
+            if (q.get("size", og) < dSize) {
+              const oPeg = q.get("peg", og);
+              if (oPeg === dPeg || oPeg === to + 1) return false; // entity encoding = gid+1
+            }
+          }
+          return true;
+        },
+      },
+    },
+  );
+  const result = planOnce(model, model.createExecState(), {
+    goals: [goal(F.and(F.lit("peg", ["d1"], "p3"), F.lit("peg", ["d2"], "p3"), F.lit("peg", ["d3"], "p3")))],
+    weight: 1,
+  });
+  assert.equal(result.status, "success");
+  assert.equal(result.plan!.steps.length, 7, "ground truth: 2^3 − 1 moves");
+});
+
+// ---------------------------------------------------------------- bridge & torch (cost-optimal: 15 minutes)
+
+test("bridge & torch: crossing times 1/2/5/8 — cost-optimal total of 15 found by A*", () => {
+  const people = ["p1", "p2", "p5", "p8"];
+  const times: Record<string, number> = { p1: 1, p2: 2, p5: 5, p8: 8 };
+  const doc: DomainDoc = {
+    name: "bridge",
+    types: [{ name: "person" }],
+    fluents: [
+      { name: "side", params: [{ name: "p", type: "person" }], kind: "enum", values: ["L", "R"], initial: "L" },
+      { name: "torch", kind: "enum", values: ["L", "R"], initial: "L" },
+      { name: "time", params: [{ name: "p", type: "person" }], kind: "int" },
+    ],
+    operators: [
+      {
+        name: "crossPair",
+        params: [
+          { name: "a", type: "person" },
+          { name: "b", type: "person" },
+        ],
+        pre: F.and(F.lit("side", ["?a"], "L"), F.lit("side", ["?b"], "L"), F.lit("torch", [], "L"), F.ext("neq", ["?a", "?b"], [])),
+        cost: N.max(N.fl("time", "?a"), N.fl("time", "?b")),
+        eff: [E.set("side", ["?a"], "R"), E.set("side", ["?b"], "R"), E.set("torch", [], "R")],
+      },
+      {
+        name: "returnOne",
+        params: [{ name: "a", type: "person" }],
+        pre: F.and(F.lit("side", ["?a"], "R"), F.lit("torch", [], "R")),
+        cost: N.fl("time", "?a"),
+        eff: [E.set("side", ["?a"], "L"), E.set("torch", [], "L")],
+      },
+    ],
+  };
+  const model = createModel(
+    doc,
+    {
+      entities: Object.fromEntries(people.map((p) => [p, "person"])),
+      init: (w) => people.forEach((p) => w.set("time", [p], times[p])),
+    },
+    { predicates: { neq: (q) => q.args[0] !== q.args[1] } },
+  );
+  const result = planOnce(model, model.createExecState(), {
+    goals: [goal(F.and(...people.map((p) => F.lit("side", [p], "R"))))],
+    weight: 1,
+  });
+  assert.equal(result.status, "success");
+  assert.equal(result.plan!.cost, 15, "the famous non-greedy optimum (sending 5&8 together)");
+});
+
 test.run();

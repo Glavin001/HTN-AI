@@ -118,6 +118,8 @@ export interface PlanRequest {
   collectRejections?: boolean;
   /** novelty tie-breaking on goal-search open lists */
   novelty?: boolean;
+  /** goal-search heuristic: h_add (fast, may overestimate — default), h_max (admissible: use with weight 1 for guaranteed-optimal plans), or none (Dijkstra) */
+  heuristic?: "hadd" | "hmax" | "none";
   /** internal: plan a pre-built agenda instead of `goals` (used by plan repair) */
   agendaOverride?: Agenda;
 }
@@ -199,10 +201,12 @@ function atomKey(a: Atom): string {
 }
 
 /**
- * Additive delete-relaxation heuristic over ground operators (unit action
- * costs). Numeric/external/negative conditions are treated optimistically.
+ * Delete-relaxation heuristic over ground operators (unit action costs).
+ * mode "add": h_add — informative but may overestimate (inadmissible).
+ * mode "max": h_max — admissible; pair with weight 1 for optimal plans.
+ * Numeric/external/negative conditions are treated optimistically.
  */
-export function hAdd(model: Model, s: Snap, goalAtoms: Atom[]): number {
+export function hAdd(model: Model, s: Snap, goalAtoms: Atom[], mode: "add" | "max" = "add"): number {
   if (goalAtoms.length === 0) return 0;
   const cost = new Map<string, number>();
   let missing = 0;
@@ -212,9 +216,15 @@ export function hAdd(model: Model, s: Snap, goalAtoms: Atom[]): number {
   }
   if (missing === 0) return 0;
 
+  // fluents written non-atomically (NumExpr/inc/dec/external effects) can take
+  // any value under the relaxation — never call their atoms unreachable
+  const fuzzy = (a: Atom): boolean => model.relaxFuzzyWrites.has(model.slotOwner[a.slot]);
+
   const atomCost = (a: Atom): number => {
     if (s.get(a.slot) === a.value) return 0;
-    return cost.get(atomKey(a)) ?? Infinity;
+    const c = cost.get(atomKey(a));
+    if (c !== undefined) return c;
+    return fuzzy(a) ? 1 : Infinity;
   };
 
   let changed = true;
@@ -231,7 +241,7 @@ export function hAdd(model: Model, s: Snap, goalAtoms: Atom[]): number {
           pc = Infinity;
           break;
         }
-        pc += c;
+        pc = mode === "add" ? pc + c : Math.max(pc, c);
       }
       if (pc === Infinity) continue;
       const through = pc + 1;
@@ -250,7 +260,7 @@ export function hAdd(model: Model, s: Snap, goalAtoms: Atom[]): number {
   for (const a of goalAtoms) {
     const c = atomCost(a);
     if (c === Infinity) return Infinity;
-    h += c;
+    h = mode === "add" ? h + c : Math.max(h, c);
   }
   return h;
 }
@@ -271,7 +281,7 @@ interface SeekOutcome {
 
 export class Engine {
   private readonly model: Model;
-  private readonly req: Required<Pick<PlanRequest, "weight" | "maxNodes" | "maxDepth" | "novelty">> & PlanRequest;
+  private readonly req: Required<Pick<PlanRequest, "weight" | "maxNodes" | "maxDepth" | "novelty" | "heuristic">> & PlanRequest;
   public decompositions = 0;
   public expansions = 0;
   public heuristicEvals = 0;
@@ -290,6 +300,7 @@ export class Engine {
       maxNodes: req.maxNodes ?? 50_000,
       maxDepth: req.maxDepth ?? 400,
       novelty: req.novelty ?? true,
+      heuristic: req.heuristic ?? "hadd",
     };
     this.mtrCursor = { last: req.lastMTR && req.lastMTR.length > 0 ? req.lastMTR : null, pos: 0, stillEqual: req.lastMTR !== undefined && (req.lastMTR?.length ?? 0) > 0 };
   }
@@ -654,12 +665,12 @@ export class Engine {
   }
 
   private heuristic(state: StateView, goalAtoms: Atom[]): number {
-    if (goalAtoms.length === 0) return 0;
+    if (goalAtoms.length === 0 || this.req.heuristic === "none") return 0;
     const key = state.key();
     const cached = this.hCache.get(key);
     if (cached !== undefined) return cached;
     this.heuristicEvals++;
-    const h = hAdd(this.model, state, goalAtoms);
+    const h = hAdd(this.model, state, goalAtoms, this.req.heuristic === "hmax" ? "max" : "add");
     this.hCache.set(key, h);
     return h;
   }

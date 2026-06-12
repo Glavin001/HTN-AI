@@ -1,6 +1,6 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
-import { DomainDoc, E, F, N, achieve, createModel, doTask, planOnce, task } from "../src/index";
+import { DomainDoc, E, F, N, Planner, achieve, createModel, doTask, planOnce, scoped, task } from "../src/index";
 
 /**
  * Scenario ports — the behavioral intents of the v1 test scenarios:
@@ -134,6 +134,104 @@ test("goapVehicle: dynamic costs flip the chosen action with vehicle availabilit
     const step = r.plan!.steps[0];
     return step.k === "op" ? step.g.op.name : "?";
   }
+});
+
+test("fps-lite: utility methods switch between attack/reload/retreat as hp and ammo change", () => {
+  const doc: DomainDoc = {
+    name: "fps",
+    fluents: [
+      { name: "ammo", kind: "int", initial: 5 },
+      { name: "hp", kind: "int", initial: 10 },
+      { name: "enemyDown", kind: "boolean" },
+      { name: "reloaded", kind: "boolean" },
+      { name: "inCover", kind: "boolean" },
+    ],
+    operators: [
+      {
+        name: "shoot",
+        pre: F.gte(N.fl("ammo"), 1),
+        verify: F.gte(N.fl("hp"), 1),
+        eff: [E.dec("ammo", [], 1), E.set("enemyDown", [], true)],
+      },
+      { name: "reload", eff: [E.set("reloaded", [], true), E.inc("ammo", [], 6)] },
+      { name: "takeCover", eff: [E.set("inCover", [], true)] },
+    ],
+    methods: [
+      { name: "attack", task: "Engage", pre: F.gte(N.fl("ammo"), 1), utility: N.fl("ammo"), subtasks: [{ do: "shoot" }] },
+      { name: "rearm", task: "Engage", utility: 3, subtasks: [{ do: "reload" }, { do: "shoot" }] },
+      { name: "survive", task: "Engage", utility: N.sub(12, N.fl("hp")), subtasks: [{ do: "takeCover" }] },
+    ],
+  };
+  const model = createModel(doc, {});
+  const pick = (mutate?: (s: ReturnType<typeof model.createExecState>) => void): string[] => {
+    const s = model.createExecState();
+    mutate?.(s);
+    const r = planOnce(model, s, { goals: [task("Engage")], weight: 1 });
+    assert.equal(r.status, "success");
+    return r.plan!.steps.map((st) => (st.k === "op" ? st.g.op.name : "?"));
+  };
+  assert.equal(pick(), ["shoot"], "healthy + ammo 5 → attack (utility 5 beats rearm 3, survive 2)");
+  assert.equal(pick((s) => s.set(model.slotOf("ammo"), 1)), ["reload", "shoot"], "low ammo → rearm (3 > 1, survive 2)");
+  assert.equal(pick((s) => s.set(model.slotOf("hp"), 2)), ["takeCover"], "low hp → survive (10 > attack 5)");
+});
+
+test("nested scopes: an inner maintain inside an outer deadline, planned and executed", () => {
+  const doc: DomainDoc = {
+    name: "nested",
+    fluents: [
+      { name: "undetected", kind: "boolean", initial: true },
+      { name: "inside", kind: "boolean" },
+      { name: "extracted", kind: "boolean" },
+    ],
+    operators: [
+      { name: "infiltrate", duration: 5, pre: F.lit("undetected"), eff: [E.set("inside", [], true)], executor: "creep" },
+      { name: "exfiltrate", duration: 5, pre: F.lit("inside"), eff: [E.set("extracted", [], true)] },
+    ],
+    methods: [
+      {
+        task: "Mission",
+        subtasks: [
+          scoped(
+            { deadline: 20, label: "mission-window" },
+            scoped({ maintain: F.lit("undetected"), label: "stealth" }, { do: "infiltrate" }),
+            { do: "exfiltrate" },
+          ),
+        ],
+      },
+      {
+        task: "RushMission",
+        subtasks: [
+          scoped(
+            { deadline: 8, label: "too-tight" }, // 10s of work cannot fit
+            { do: "infiltrate" },
+            { do: "exfiltrate" },
+          ),
+        ],
+      },
+    ],
+  };
+  const model = createModel(doc, {}, {
+    executors: { creep: (api) => (api.elapsedInStep() >= 5 ? "success" : "continue") },
+  });
+  const ok = planOnce(model, model.createExecState(), { goals: [task("Mission")], weight: 1 });
+  assert.equal(ok.status, "success");
+  assert.equal(ok.plan!.makespan, 10, "5s + 5s inside a 20s window");
+  const enters = ok.plan!.steps.filter((s) => s.k === "scopeEnter").map((s) => (s.k === "scopeEnter" ? s.scope.label : "?"));
+  assert.equal(enters, ["mission-window", "stealth"], "nested scope structure preserved in the plan");
+
+  const tight = planOnce(model, model.createExecState(), { goals: [task("RushMission")], weight: 1, collectRejections: true });
+  assert.equal(tight.status, "failure", "10s of durations cannot fit an 8s deadline — caught in search");
+  assert.ok((tight.rejections ?? []).some((r) => r.reason.includes("deadline")));
+
+  // execution: detection mid-infiltration aborts the inner scope and the outer plan
+  let t = 0;
+  const events: string[] = [];
+  const planner = new Planner(model, { goals: [task("Mission")], now: () => t, trace: (e) => events.push(e.t) });
+  planner.tick({ nodes: 100000 });
+  t = 2;
+  planner.state.set(model.slotOf("undetected"), 0); // spotted!
+  planner.tick({ nodes: 100000 });
+  assert.ok(events.includes("scope.violated"), "stealth scope violation detected at execution");
 });
 
 test.run();

@@ -113,6 +113,9 @@ export interface CompiledEffects {
   apply: (target: WritableState, b: Bindings, timingMask: number) => void;
   writes: Set<number>;
   addAtoms: (b: Bindings) => Atom[];
+  /** fluents written by effects that cannot be expressed as atoms (NumExpr sets,
+   *  inc/dec, setVec, externals) — the relaxation must not call these unreachable */
+  fuzzyWrites: Set<number>;
 }
 
 export interface CompiledOperator {
@@ -222,6 +225,8 @@ export class Model {
   public readonly methodReads = new Set<number>();
 
   public groundOps: GroundOp[] = [];
+  /** fluents any operator writes non-atomically — relaxation treats them as optimistically settable */
+  public readonly relaxFuzzyWrites = new Set<number>();
 
   public slotCount = 1; // slot 0 = clock
   public slotOwner!: Int32Array;
@@ -663,6 +668,7 @@ export class Model {
 
   compileEffects(effects: EffectExpr[] | undefined, vars: Map<string, number>, context: string): CompiledEffects {
     const writes = new Set<number>();
+    const fuzzyWrites = new Set<number>();
     const appliers: ((target: WritableState, b: Bindings, mask: number) => void)[] = [];
     const atomFns: ((b: Bindings) => Atom | null)[] = [];
 
@@ -673,7 +679,10 @@ export class Model {
       if (eff.e === "external") {
         const fn = this.registry.effects[eff.name];
         if (!fn) throw new Error(`Unregistered external effect '${eff.name}' in ${context}`);
-        for (const w of eff.writes) writes.add(this.fluent(w).id);
+        for (const w of eff.writes) {
+          writes.add(this.fluent(w).id);
+          fuzzyWrites.add(this.fluent(w).id);
+        }
         appliers.push((target, b, mask) => {
           if ((mask & timingBit) === 0) return;
           fn(this.extWriter(target, b));
@@ -689,6 +698,7 @@ export class Model {
         const value = eff.value;
         if ("n" in value) {
           const cn = this.compileNum(value, vars, context);
+          fuzzyWrites.add(cf.id);
           appliers.push((target, b, mask) => {
             if ((mask & timingBit) === 0) return;
             target.set(slot(b), cn.fn(target, b));
@@ -711,6 +721,7 @@ export class Model {
           }
         }
       } else if (eff.e === "setVec") {
+        fuzzyWrites.add(cf.id);
         const xs = [eff.x, eff.y, ...(eff.z ? [eff.z] : [])].map((e) => this.compileNum(e, vars, context));
         appliers.push((target, b, mask) => {
           if ((mask & timingBit) === 0) return;
@@ -719,6 +730,7 @@ export class Model {
         });
         atomFns.push(() => null);
       } else {
+        fuzzyWrites.add(cf.id);
         const by = this.compileNum(eff.by, vars, context);
         const sign = eff.e === "inc" ? 1 : -1;
         appliers.push((target, b, mask) => {
@@ -735,6 +747,7 @@ export class Model {
         for (const a of appliers) a(target, b, mask);
       },
       writes,
+      fuzzyWrites,
       addAtoms: (b) => {
         const out: Atom[] = [];
         for (const f of atomFns) {
@@ -797,6 +810,7 @@ export class Model {
       };
       this.operators.push(op);
       this.operatorByName.set(decl.name, op);
+      for (const f of op.effects.fuzzyWrites) this.relaxFuzzyWrites.add(f);
     }
   }
 

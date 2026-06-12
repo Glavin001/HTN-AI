@@ -424,8 +424,9 @@ function checkNum(expr: NumExpr, vars: Set<string>, idx: NameIndex, path: string
         out.push({ code: "unknown-fluent", message: `unknown fluent '${expr.fluent}'`, path, severity: "error" });
         return;
       }
-      if (fl.kind !== "int" && fl.kind !== "float" && fl.kind !== "boolean" && fl.kind !== "enum") {
-        out.push({ code: "non-numeric", message: `fluent '${expr.fluent}' is not numeric`, path, severity: "error" });
+      // entity fluents are allowed: their encodings compare meaningfully for ==/!=
+      if (fl.kind === "vec2" || fl.kind === "vec3") {
+        out.push({ code: "non-numeric", message: `vec fluent '${expr.fluent}' cannot be used as a scalar (use dist())`, path, severity: "error" });
       }
       return;
     }
