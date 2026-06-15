@@ -252,6 +252,8 @@ export class Model {
   /** distinct selector slots; succSelTables[k] maps required value → gid-sorted ops */
   public succSelSlots: Int32Array = new Int32Array(0);
   public succSelTables: Map<number, GroundOp[]>[] = [];
+  /** true when candidates can come from >1 bucket and must be re-sorted into gid order */
+  public succNeedsSort = false;
 
   public slotCount = 1; // slot 0 = clock
   public slotOwner!: Int32Array;
@@ -441,10 +443,26 @@ export class Model {
     const sources = this.resolveArgSources(args, vars, context);
     if (sources.every((s) => "c" in s)) {
       const slot = this.slotOf(name, ...sources.map((s) => (s as { c: number }).c));
-      return () => slot;
+      return () => slot; // fully ground ⇒ constant slot, resolved once
     }
-    const getArgs = this.argFn(sources);
-    return (b: Bindings) => this.slotOf(name, ...getArgs(b));
+    // variable args: precompute the fluent layout + per-param index maps so the
+    // hot closure does no name lookup, no per-type map lookup, and no array
+    // allocation (the previous `slotOf(name, ...getArgs(b))` allocated two).
+    const cf = this.fluent(name);
+    const np = cf.paramTypes.length;
+    const idxMaps = cf.paramTypes.map((t) => this.indexInType.get(t) as Map<number, number>);
+    const strides = cf.strides;
+    const base = cf.base;
+    const width = cf.width;
+    return (b: Bindings) => {
+      let idx = 0;
+      for (let i = 0; i < np; i++) {
+        const src = sources[i];
+        const gid = "c" in src ? (src as { c: number }).c : b[(src as { v: number }).v];
+        idx += (idxMaps[i].get(gid) as number) * strides[i];
+      }
+      return base + idx * width;
+    };
   }
 
   private extQuery(s: Snap, args: Bindings): ExtQuery {
@@ -1021,6 +1039,9 @@ export class Model {
     }
     this.succSelSlots = Int32Array.from(tables.keys());
     this.succSelTables = Array.from(this.succSelSlots, (s) => tables.get(s) as Map<number, GroundOp[]>);
+    // a single bucket is already gid-sorted; only multiple contributing sources
+    // (≥2 selector slots, or always-ops mixed with a selector) can interleave
+    this.succNeedsSort = !(this.succAlwaysOps.length === 0 && this.succSelSlots.length <= 1);
   }
 
   /** Intern every distinct (slot,value) atom over the ground operators and emit

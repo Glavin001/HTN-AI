@@ -116,17 +116,21 @@ export class StateView implements Snap {
 
   materialize(): Float64Array {
     const flat = this.base.slice();
-    const chain: StateView[] = [];
-    // eslint-disable-next-line @typescript-eslint/no-this-alias
-    let v: StateView | null = this;
-    while (v !== null) {
-      chain.push(v);
-      v = v.parent;
-    }
-    for (let i = chain.length - 1; i >= 0; i--) {
-      for (const [slot, value] of chain[i].deltas) flat[slot] = value;
-    }
+    this.replayInto(flat);
     return flat;
+  }
+
+  /** Flatten this view into an existing buffer (no allocation). The buffer must
+   *  be at least `base.length` long; used to give hot readers O(1) slot access. */
+  materializeInto(buf: Float64Array): void {
+    buf.set(this.base);
+    this.replayInto(buf);
+  }
+
+  /** Replay the root→this delta chain onto a buffer already holding `base`. */
+  private replayInto(buf: Float64Array): void {
+    if (this.parent !== null) this.parent.replayInto(buf);
+    for (const [slot, value] of this.deltas) buf[slot] = value;
   }
 
   get clock(): number {

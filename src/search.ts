@@ -246,20 +246,21 @@ function goalDescs(model: Model, goalAtoms: Atom[]): GoalAtomDesc[] {
  * one shared atom like `agentAt` gates nearly every op; the dense round-based
  * sweep wins until domains get large and sparse.)
  */
-function relaxCore(model: Model, s: Snap, cost: Float64Array, goals: GoalAtomDesc[], add: boolean): number {
+function relaxCore(model: Model, flat: Float64Array, cost: Float64Array, goals: GoalAtomDesc[], add: boolean): number {
   const n = model.relaxAtomCount;
   const slot = model.relaxAtomSlot;
   const val = model.relaxAtomValue;
   const fuzzy = model.relaxAtomFuzzy;
 
   // seed: an atom that currently holds costs 0, everything else starts unreachable
-  for (let id = 0; id < n; id++) cost[id] = s.get(slot[id]) === val[id] ? 0 : Infinity;
+  // (reads from a flat packed buffer ⇒ O(1) per slot, no delta-chain walk)
+  for (let id = 0; id < n; id++) cost[id] = flat[slot[id]] === val[id] ? 0 : Infinity;
 
   // already satisfied? (mirrors the original missing===0 early-out)
   let allHold = true;
   for (let i = 0; i < goals.length; i++) {
     const g = goals[i];
-    if (!(g.id >= 0 ? cost[g.id] === 0 : s.get(g.slot) === g.value)) {
+    if (!(g.id >= 0 ? cost[g.id] === 0 : flat[g.slot] === g.value)) {
       allHold = false;
       break;
     }
@@ -311,7 +312,7 @@ function relaxCore(model: Model, s: Snap, cost: Float64Array, goals: GoalAtomDes
       c = cost[g.id];
       if (c === Infinity) c = g.fuzzy ? 1 : Infinity;
     } else {
-      c = s.get(g.slot) === g.value ? 0 : g.fuzzy ? 1 : Infinity;
+      c = flat[g.slot] === g.value ? 0 : g.fuzzy ? 1 : Infinity;
     }
     if (c === Infinity) return Infinity;
     h = add ? h + c : c > h ? c : h;
@@ -319,13 +320,21 @@ function relaxCore(model: Model, s: Snap, cost: Float64Array, goals: GoalAtomDes
   return h;
 }
 
+/** Flatten any Snap into a packed slot buffer for the relaxation reader. */
+function snapToFlat(model: Model, s: Snap): Float64Array {
+  if (s instanceof StateView) return s.materialize();
+  const out = new Float64Array(model.slotCount);
+  for (let i = 0; i < out.length; i++) out[i] = s.get(i);
+  return out;
+}
+
 /**
- * Public delete-relaxation heuristic (SPEC §7.3). Allocates a scratch buffer per
- * call; the Engine uses a faster path that reuses both buffer and goal descriptors.
+ * Public delete-relaxation heuristic (SPEC §7.3). Allocates scratch per call; the
+ * Engine uses a faster path that reuses its buffers and goal descriptors.
  */
 export function hAdd(model: Model, s: Snap, goalAtoms: Atom[], mode: "add" | "max" = "add"): number {
   if (goalAtoms.length === 0) return 0;
-  return relaxCore(model, s, new Float64Array(model.relaxAtomCount), goalDescs(model, goalAtoms), mode === "add");
+  return relaxCore(model, snapToFlat(model, s), new Float64Array(model.relaxAtomCount), goalDescs(model, goalAtoms), mode === "add");
 }
 
 // ---------------------------------------------------------------- engine
@@ -356,6 +365,8 @@ export class Engine {
   private readonly hCache = new Map<number, number>();
   /** reusable relaxation cost buffer (sized to model.relaxAtomCount) */
   private costBuf: Float64Array | null = null;
+  /** reusable flat state buffer for O(1) reads during heuristic evaluation */
+  private flatBuf: Float64Array | null = null;
   /** reusable candidate-op scratch for the indexed successor generator */
   private readonly succScratch: GroundOp[] = [];
 
@@ -705,7 +716,7 @@ export class Engine {
         const list = selTables[k].get(node.state.get(selSlots[k]));
         if (list !== undefined) for (let i = 0; i < list.length; i++) cand.push(list[i]);
       }
-      if (cand.length > 1) cand.sort(byGid); // restore gid order ⇒ identical search
+      if (model.succNeedsSort && cand.length > 1) cand.sort(byGid); // gid order ⇒ identical search
 
       for (let ci = 0; ci < cand.length; ci++) {
         const g = cand[ci];
@@ -765,9 +776,14 @@ export class Engine {
     const cached = this.hCache.get(key);
     if (cached !== undefined) return cached;
     this.heuristicEvals++;
-    const n = this.model.relaxAtomCount;
-    if (!this.costBuf || this.costBuf.length !== n) this.costBuf = new Float64Array(n);
-    const h = relaxCore(this.model, state, this.costBuf, descs, this.req.heuristic !== "hmax");
+    if (!this.costBuf || this.costBuf.length !== this.model.relaxAtomCount) {
+      this.costBuf = new Float64Array(this.model.relaxAtomCount);
+    }
+    if (!this.flatBuf || this.flatBuf.length !== this.model.slotCount) {
+      this.flatBuf = new Float64Array(this.model.slotCount);
+    }
+    state.materializeInto(this.flatBuf);
+    const h = relaxCore(this.model, this.flatBuf, this.costBuf, descs, this.req.heuristic !== "hmax");
     this.hCache.set(key, h);
     return h;
   }
