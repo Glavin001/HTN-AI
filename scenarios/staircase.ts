@@ -424,3 +424,42 @@ export function scavengerBigInstance(): StaircaseInstance {
 export function scavengerBigGoal(): import("../src/index").Formula {
   return F.and(F.lit("agentAt", [], "goal"), F.eq(N.fl("agentY"), N.c(SCAVENGER_BIG_GOAL_HEIGHT)));
 }
+
+/**
+ * A W×D grid scavenger world: a lane along z=0 with `start` at x=0 and the goal
+ * cell `c{W-1}_0` at the far end; every cell on rows z≥1 carries a loose block
+ * (and one 2-pillar). Used to scale the scavenger up into a HUGE stress example
+ * — search cost grows ~cells² (the h_add heuristic is evaluated over every
+ * ground op), so a 6×4 grid is roughly 10× the compute of Scavenger XL.
+ */
+export function scavengerGridInstance(w: number, d: number): StaircaseInstance {
+  const nm = (x: number, z: number) => `c${x}_${z}`;
+  const cells: CellSpec[] = [];
+  const edges: [string, string][] = [];
+  for (let z = 0; z < d; z++) {
+    for (let x = 0; x < w; x++) {
+      const c: CellSpec = { name: nm(x, z), x, z };
+      if (z >= 1) c.height = x === 1 && z === 1 ? 2 : 1; // scattered loose blocks + one 2-pillar
+      cells.push(c);
+    }
+  }
+  for (let z = 0; z < d; z++) {
+    for (let x = 0; x < w; x++) {
+      if (x + 1 < w) edges.push([nm(x, z), nm(x + 1, z)]);
+      if (z + 1 < d) edges.push([nm(x, z), nm(x, z + 1)]);
+    }
+  }
+  return { cells, edges, start: nm(0, 0) };
+}
+
+/** The HUGE stress instance: a 6×4 grid, height-3 goal. ~9s to plan (≈10× XL). */
+export const SCAVENGER_HUGE = { w: 6, d: 4, goalHeight: 3 };
+export const scavengerHugeGoalCell = `c${SCAVENGER_HUGE.w - 1}_0`;
+
+export function scavengerHugeInstance(): StaircaseInstance {
+  return scavengerGridInstance(SCAVENGER_HUGE.w, SCAVENGER_HUGE.d);
+}
+
+export function scavengerHugeGoal(): import("../src/index").Formula {
+  return F.and(F.lit("agentAt", [], scavengerHugeGoalCell), F.eq(N.fl("agentY"), N.c(SCAVENGER_HUGE.goalHeight)));
+}

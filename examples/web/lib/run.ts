@@ -16,9 +16,13 @@ import {
   quarryInstance,
   SCAVENGER_BIG_GOAL_HEIGHT,
   SCAVENGER_GOAL_HEIGHT,
+  SCAVENGER_HUGE,
   scavengerBigGoal,
   scavengerBigInstance,
   scavengerGoal,
+  scavengerHugeGoal,
+  scavengerHugeGoalCell,
+  scavengerHugeInstance,
   scavengerInstance,
   scavengerModel,
   staircaseGoal,
@@ -28,7 +32,7 @@ import {
 } from "@scenarios/staircase";
 import type { Model } from "htn-ai";
 
-export type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig";
+export type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
 
 export interface Frame {
   /** column heights per cell */
@@ -60,6 +64,10 @@ interface ScenarioCfg {
   target: { cell: string; y: number };
   /** weighted-A* weight; higher = greedier/faster search for larger instances */
   weight?: number;
+  /** hard search cap (safety net so a big instance can never run away in-browser) */
+  maxNodes?: number;
+  /** rough heads-up shown while planning, for the heavy ones */
+  heavyMs?: number;
 }
 
 const SCENARIOS: Record<ScenarioId, ScenarioCfg> = {
@@ -68,7 +76,21 @@ const SCENARIOS: Record<ScenarioId, ScenarioCfg> = {
   quarry: { instance: quarryInstance, goal: quarryGoal, model: staircaseModel, target: { cell: "pillar", y: QUARRY_GOAL_HEIGHT } },
   scavenger: { instance: scavengerInstance, goal: scavengerGoal, model: scavengerModel, target: { cell: "goal", y: SCAVENGER_GOAL_HEIGHT } },
   scavengerBig: { instance: scavengerBigInstance, goal: scavengerBigGoal, model: scavengerModel, target: { cell: "goal", y: SCAVENGER_BIG_GOAL_HEIGHT }, weight: 5 },
+  scavengerHuge: {
+    instance: scavengerHugeInstance,
+    goal: scavengerHugeGoal,
+    model: scavengerModel,
+    target: { cell: scavengerHugeGoalCell, y: SCAVENGER_HUGE.goalHeight },
+    weight: 6,
+    maxNodes: 8000,
+    heavyMs: 9000,
+  },
 };
+
+/** Rough heads-up (ms) for scenarios whose planning is slow enough to warn about. */
+export function scenarioHeavyMs(id: ScenarioId): number {
+  return SCENARIOS[id].heavyMs ?? 0;
+}
 
 export function runScenario(id: ScenarioId): RunResult {
   const cfg = SCENARIOS[id];
@@ -83,6 +105,7 @@ export function runScenario(id: ScenarioId): RunResult {
     now: () => t,
     seed: 1,
     weight: cfg.weight,
+    maxNodes: cfg.maxNodes,
     trace: (e) => trace.push(e),
   });
 

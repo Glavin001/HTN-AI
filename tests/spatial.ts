@@ -13,6 +13,9 @@ import {
   scavengerBigGoal,
   scavengerBigInstance,
   scavengerGoal,
+  scavengerHugeGoal,
+  scavengerHugeGoalCell,
+  scavengerHugeInstance,
   scavengerInstance,
   scavengerModel,
   staircaseGoal,
@@ -254,5 +257,27 @@ test("scavenger: solved through the reactive Planner", () => {
   assert.equal(model.read(planner.state, "agentAt"), "goal");
   assert.equal(model.read(planner.state, "agentY"), SCAVENGER_GOAL_HEIGHT);
 });
+
+// HUGE stress benchmark — ~9s of compute, so it's opt-in (HTN_BENCH=1) to keep
+// the default suite/CI fast. Bounded by maxNodes so it can never run away.
+if (process.env.HTN_BENCH === "1") {
+  test("scavenger HUGE (benchmark): solves a 24-cell height-3 grid (~10× XL compute)", () => {
+    const model = scavengerModel(scavengerHugeInstance());
+    const start = model.createExecState();
+    const t0 = Date.now();
+    const result = planOnce(model, start, {
+      goals: [goal(scavengerHugeGoal())],
+      weight: 6,
+      heuristic: "hadd",
+      maxNodes: 200_000, // safety cap; the greedy search solves in ≈1.7k expansions
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[HUGE] ${result.status} in ${Date.now() - t0}ms, ${result.stats.expansions} expansions`);
+    assert.equal(result.status, "success");
+    const end = endOf(model, start, result.plan!);
+    assert.equal(model.read(end, "agentAt"), scavengerHugeGoalCell);
+    assert.equal(model.read(end, "agentY"), 3);
+  });
+}
 
 test.run();

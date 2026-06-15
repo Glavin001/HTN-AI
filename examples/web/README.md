@@ -34,6 +34,11 @@ reactive `Planner`** in the browser (the app never re-implements planning):
   insufficient, so the planner harvests the pillar — using loose blocks as
   stepping stones to reach its top — and stacks a 3-level structure to climb up.
   Solved with a greedier search weight (~0.5s).
+- **Scavenger HUGE (stress · ~9s)** — a 6×4 grid (24 cells) littered with blocks;
+  a deliberate stress test, ≈10× the compute of the others (~9s to plan, the page
+  is busy while it searches). Demonstrates the planner solving a large symbolic
+  problem from a position-only goal. Search is hard-capped (`maxNodes`) so it can
+  never run away. (Benchmarkable headless via `HTN_BENCH=1 npm test`.)
 - **Blocks World (Sussman)** ([`../../scenarios/blocks.ts`](../../scenarios/blocks.ts)) —
   the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
   The naive order deadlocks, so the planner interleaves subgoals.
