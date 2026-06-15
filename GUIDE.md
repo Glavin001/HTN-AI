@@ -231,9 +231,29 @@ fluents: [
   { name: "pos", params: [{ name: "a", type: "agent" }], kind: "vec2" },
 
   // a relation: a 2-arg boolean table (graph edges, adjacency, …)
-  { name: "road", params: [{ name: "a", type: "node" }, { name: "b", type: "node" }], kind: "boolean" },
+  // `static: true` ⇒ immutable after init (see below) — a big planning speedup
+  { name: "road", params: [{ name: "a", type: "node" }, { name: "b", type: "node" }], kind: "boolean", static: true },
 ]
 ```
+
+### Static fluents (immutable relations) — declare them, it's a major speedup
+
+Maps, adjacency, alignment, type tables, recipe tables — relations that are set
+once at init and never change — should be declared `static: true`. The compiler
+then treats precondition lits over them as **compile-time constants** and **drops
+every ground operator whose static precondition can never hold** (e.g. `move(a,b)`
+where `road(a,b)` is false), so they never enter search *or* the heuristic. On a
+grid this turns the operator set from O(cells²) into O(edges):
+
+```ts
+{ name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", static: true }
+//   nav 10×10: 10 000 ground move ops → 360;  Scavenger HUGE: 6.1 s → 0.08 s
+```
+
+It is a **promise**: a `static` fluent must never be written — not by an operator
+(validated: declaring it and writing it is a compile error) *and not by the host*
+at runtime (e.g. don't `state.set` it between plans). Use it only for genuinely
+fixed structure; leave host-controlled inputs (like `has_vehicle`) non-static.
 
 ### The seven kinds and how they encode
 

@@ -184,6 +184,30 @@ Profiling sorts the scenarios into three regimes, each with a different next mov
 
 ## Remaining opportunities (ranked)
 
+### Landed since: static-fluent pruning
+
+Fluents declared `static: true` (immutable after init — adjacency, maps,
+alignment) have their precondition lits treated as compile-time constants, so
+ground operators whose static precondition can never hold are **dropped at
+grounding** — out of both search and the relaxation. Sound (a static-false lit is
+unreachable in the relaxation too, so h is unchanged) and validated (writing a
+static fluent is a compile error). Static must be *declared*, not inferred: a
+fluent no operator writes can still be set by the host (e.g. `has_vehicle`), and
+grounding is shared across plans.
+
+| | before | after |
+|---|--:|--:|
+| nav grid 10×10 — ground move ops | 10 000 | **360** |
+| nav grid K=12 — solve | 168.9 ms | **4.4 ms** (38×) |
+| Scavenger HUGE — solve | 305 ms | **81 ms** (now **76× vs the original baseline**) |
+| quarry (adj+buildable static) | 14.0 ms | **10.9 ms** (~16× vs baseline) |
+
+This **captures most of the relational successor-generation win** for static
+relations (adjacency/maps/alignment) — the nav O(K⁴) wall is gone. A full
+join/match-tree successor generator remains relevant only for **dynamic**
+relational preconditions (two changing relations joined per node), which no
+current benchmark exercises; it's demoted to "build when a domain needs it."
+
 ### Landed since: symbolic relaxation hints
 
 External/opaque predicates were invisible to the heuristic. A predicate can now

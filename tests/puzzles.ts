@@ -213,6 +213,7 @@ test("sokoban corridor: walk + two pushes (relational adjacency, optimal 3 ops)"
           { name: "b", type: "cell" },
         ],
         kind: "boolean",
+        static: true,
       },
       {
         name: "aligned",
@@ -222,6 +223,7 @@ test("sokoban corridor: walk + two pushes (relational adjacency, optimal 3 ops)"
           { name: "c", type: "cell" },
         ],
         kind: "boolean",
+        static: true,
       },
     ],
     operators: [
