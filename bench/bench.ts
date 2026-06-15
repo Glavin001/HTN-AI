@@ -16,6 +16,7 @@ import {
   navGrid,
   htnTour,
   schedulerRun,
+  scavengerGrid,
   staircaseModel,
   goal,
   planOnce,
@@ -54,5 +55,6 @@ printRow(measure("staircase (hmax,w=1)", staircase));
 printRow(measure("blocks reverse 6", blocksReverse(6)));
 printRow(measure("hanoi 5", hanoi(5)));
 printRow(measure("nav grid 6x6", navGrid(6)));
+printRow(measure("scavenger grid 4x3 (hadd)", scavengerGrid(4, 3)));
 printRow(measure("htn tour 16", htnTour(16)));
 printRow(measure("scheduler x8", schedulerRun(8)));

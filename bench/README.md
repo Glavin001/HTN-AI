@@ -37,6 +37,8 @@ per-node cost, independent of problem size.
   - **htn tour** — HTN decomposition width (free-variable binding)
   - **scheduler** — multi-agent round-robin
   - **weight** — heuristic informativeness → expansions (fixed problem)
+- `huge.ts` — the larger pushed Scavenger instances (XL 4×3, HUGE 6×4); a
+  before/after gauge for the heuristic/successor optimizations on big grids.
 - `profile.ts` — single-scenario driver for `--cpu-prof` (set `SCEN`, `ITERS`).
 
 See [`../PERFORMANCE.md`](../PERFORMANCE.md) for the analysis.

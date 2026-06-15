@@ -14,7 +14,7 @@
  *   scheduler     — multi-agent round-robin planning
  *   weight        — heuristic informativeness → expansions (same problem)
  */
-import { measure, blocksReverse, hanoi, navGrid, htnTour, schedulerRun, staircaseModel, goal, planOnce, type Run, type Sample } from "./workloads";
+import { measure, blocksReverse, hanoi, navGrid, htnTour, schedulerRun, scavengerGrid, staircaseModel, goal, planOnce, type Run, type Sample } from "./workloads";
 import { quarryInstance, quarryGoal } from "../scenarios/staircase";
 
 function sweep(title: string, axis: string, sizes: number[], make: (n: number) => Run, opts = {}): void {
@@ -57,6 +57,22 @@ sweep("Blocks — grounding O(n³) + state size", "blocks", [4, 6, 8, 10, 12], b
 sweep("Nav grid — relational adjacency / branching", "K", [4, 6, 8, 10, 12], navGrid, { targetMs: 30 });
 sweep("HTN tour — decomposition width", "locs", [8, 16, 32, 64, 128], htnTour);
 sweep("Scheduler — multi-agent round-robin", "agents", [1, 2, 4, 8, 16, 32], schedulerRun, { targetMs: 30 });
+
+// Pushed "big/huge" scavenger family: larger spatial GOAP, grounding grows ~cells²
+console.log("\nScavenger grid — large spatial GOAP (greedy hadd w=6, h3 goal); cells = W×D");
+console.log(`${"W×D".padEnd(8)}${"cells".padStart(7)}${"min ms".padStart(11)}${"µs/node".padStart(11)}${"exp".padStart(8)}${"×prev".padStart(9)}  status`);
+console.log("-".repeat(60));
+let prevSg = 0;
+for (const [w, d] of [[3, 3], [4, 3], [5, 3], [6, 3], [6, 4]] as const) {
+  const s = measure(`${w}x${d}`, scavengerGrid(w, d), { targetMs: 40, trials: 5 });
+  const ratio = prevSg > 0 ? s.minMs / prevSg : 0;
+  console.log(
+    `${w}×${d}`.padEnd(8) + String(w * d).padStart(7) + s.minMs.toFixed(2).padStart(11) +
+      (s.perNodeUs?.toFixed(2) ?? "—").padStart(11) + String(s.expansions).padStart(8) +
+      (ratio ? `${ratio.toFixed(2)}×` : "—").padStart(9) + `  [${s.status}]`,
+  );
+  prevSg = s.minMs;
+}
 
 // heuristic informativeness on a fixed problem (expansions move, not size)
 console.log("\nQuarry — heuristic / weight (fixed problem; expansions vary)");

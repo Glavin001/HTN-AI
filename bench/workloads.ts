@@ -14,7 +14,10 @@
  *    fall outside the timed window.
  */
 import { DomainDoc, E, F, N, Planner, Scheduler, createModel, doTask, goal, planOnce, task, type PlanResult } from "../src/index";
-import { staircaseInstance, staircaseGoal, staircaseModel } from "../scenarios/staircase";
+import {
+  staircaseInstance, staircaseGoal, staircaseModel,
+  scavengerModel, scavengerGridInstance,
+} from "../scenarios/staircase";
 
 export type Run = () => PlanResult;
 
@@ -271,6 +274,15 @@ export function schedulerRun(m: number): Run {
     const done = planners.every((p) => p.getStatus() === "succeeded");
     return { status: done ? "success" : "failure", stats: { decompositions: 0, expansions: 0, heuristicEvals: 0 } } as PlanResult;
   };
+}
+
+/** Scavenger on a W×D grid (the pushed "big/huge" spatial GOAP family). Greedy
+ *  hadd. Search cost grows ~ground-ops (heuristic sweeps every op), so this is a
+ *  realistic large-domain scaling axis. */
+export function scavengerGrid(w: number, d: number, goalHeight = 3, weight = 6): Run {
+  const model = scavengerModel(scavengerGridInstance(w, d));
+  const goalF = F.and(F.lit("agentAt", [], `c${w - 1}_0`), F.eq(N.fl("agentY"), N.c(goalHeight)));
+  return () => planOnce(model, model.createExecState(), { goals: [goal(goalF)], weight, heuristic: "hadd", maxNodes: 500_000 });
 }
 
 export { staircaseModel, staircaseInstance, staircaseGoal, goal, planOnce, N };

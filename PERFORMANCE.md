@@ -52,6 +52,30 @@ Two clear next targets fall out: a **join/match-tree successor generator** for
 relational preconditions (nav is O(K⁴) today), and **relevance-pruning the
 heuristic** so it doesn't sweep every ground op when grounding is large (blocks).
 
+### Validation on the larger pushed examples (`bench/huge.ts`)
+
+Same-machine before/after on the bigger Scavenger instances (the baseline is the
+pre-optimization engine on its own branch; planning only, model built once;
+**identical expansion counts** ⇒ identical search, just faster nodes):
+
+| Instance | baseline | optimized | speedup | expansions |
+|---|--:|--:|--:|--:|
+| Scavenger XL (4×3, h3, hadd w=5) | 448 ms | **35 ms** | **12.8×** | 1608 |
+| Scavenger HUGE (6×4, h3, hadd w=6) | 6150 ms | **305 ms** | **20.2×** | 1716 |
+
+The speedup is *larger* on the bigger grid — exactly the prediction: more cells ⇒
+more ground ops ⇒ the per-node heuristic cost (what these optimizations cut
+hardest) dominates more. The `scavengerGrid(W,D)` sweep shows that per-node cost
+still grows with grounding even after the wins, motivating the static-pruning /
+relevance work:
+
+| W×D | cells | min ms | µs/node |
+|---|--:|--:|--:|
+| 4×3 | 12 | 65 | 43 |
+| 5×3 | 15 | 113 | 61 |
+| 6×3 | 18 | 181 | 105 |
+| 6×4 | 24 | 319 | 186 |
+
 ## Baseline: where the time went
 
 Baseline per-node cost was **~116 µs** on quarry — for a planner that advertises
