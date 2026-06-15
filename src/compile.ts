@@ -129,6 +129,9 @@ export interface CompiledOperator {
   cost: CompiledNum;
   duration: CompiledNum;
   executor: string | undefined;
+  /** precondition checks over arg-only externals (declared empty read set ⇒
+   *  constant per ground binding); evaluated once at grounding to prune ops */
+  argOnlyChecks: ((b: Bindings) => boolean)[];
 }
 
 export interface GroundOp {
@@ -901,6 +904,8 @@ export class Model {
       const params = decl.params ?? [];
       const vars = new Map(params.map((p, i) => [varKey(p.name), i]));
       const ctxName = `operators/${decl.name}`;
+      const argOnlyChecks: ((b: Bindings) => boolean)[] = [];
+      if (decl.pre) this.collectArgOnlyChecks(decl.pre, vars, `${ctxName}/pre`, argOnlyChecks);
       const op: CompiledOperator = {
         id: this.operators.length,
         name: decl.name,
@@ -915,10 +920,38 @@ export class Model {
             ? this.compileNum(num(decl.duration), vars, `${ctxName}/duration`)
             : { fn: () => 0, reads: new Set() },
         executor: decl.executor,
+        argOnlyChecks,
       };
       this.operators.push(op);
       this.operatorByName.set(decl.name, op);
       for (const f of op.effects.fuzzyWrites) this.relaxFuzzyWrites.add(f);
+    }
+  }
+
+  /** Snap over the (post-init) base world, for evaluating arg-only externals. */
+  private baseSnap(): Snap {
+    if (!this._baseSnap) this._baseSnap = { get: (slot: number) => this.baseState[slot] };
+    return this._baseSnap;
+  }
+  private _baseSnap: Snap | null = null;
+
+  /**
+   * Collect prunable precondition checks: an external predicate with a declared
+   * **empty read set** is a pure function of its arguments, so it is constant per
+   * ground binding and can be evaluated once at grounding. Only sound in
+   * conjunctive position (top-level `and` / bare external) — never under
+   * `not`/`or`, and never for opaque predicates (which declare nothing).
+   */
+  private collectArgOnlyChecks(f: Formula, vars: Map<string, number>, ctx: string, out: ((b: Bindings) => boolean)[]): void {
+    if (f.f === "and") {
+      for (const p of f.parts) this.collectArgOnlyChecks(p, vars, ctx, out);
+      return;
+    }
+    if (f.f === "external" && f.reads.length === 0) {
+      const fn = this.registry.predicates[f.name] as ExternalPredicate | undefined;
+      if (!fn) return;
+      const argFn = this.argFn(this.resolveArgSources(f.args, vars, ctx));
+      out.push((b) => fn(this.queryFor(this.baseSnap(), argFn(b))));
     }
   }
 
@@ -1055,7 +1088,20 @@ export class Model {
   private groundOperators(): void {
     this.groundOps = [];
     for (const op of this.operators) {
+      const checks = op.argOnlyChecks;
       for (const b of this.enumerateBindings(op.paramTypes)) {
+        // metadata-driven prune: skip bindings an arg-only external rejects (e.g.
+        // neq(x,x)) — they can never apply, so they enter neither search nor the
+        // relaxation. The relaxation already treats externals optimistically, so
+        // dropping these invalid groundings leaves the heuristic unchanged.
+        let ok = true;
+        for (let i = 0; i < checks.length; i++) {
+          if (!checks[i](b)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
         this.groundOps.push({
           gid: this.groundOps.length,
           op,
