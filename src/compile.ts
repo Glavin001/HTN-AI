@@ -259,6 +259,13 @@ export class Model {
   public slotOwner!: Int32Array;
   public baseState!: Float64Array;
 
+  // reusable ExtQuery/ExtWriter so external/opaque predicate & numeric
+  // evaluation allocates nothing per call (was: a fresh 5-closure object each time)
+  private extState: Snap = undefined as unknown as Snap;
+  private extTarget: WritableState = undefined as unknown as WritableState;
+  private reuseQ: ExtQuery | null = null;
+  private reuseW: ExtWriter | null = null;
+
   constructor(doc: DomainDoc, setup: WorldSetup = {}, registry: Registry = {}) {
     const errors = validateDomain(doc).filter((d) => d.severity === "error");
     if (errors.length > 0) throw new DomainError(errors);
@@ -493,6 +500,64 @@ export class Model {
     };
   }
 
+  /** Slot for a dynamic (user-supplied) fluent ref, without the spread/rest +
+   *  `.map()` allocations of `slotOf` — for the reusable ExtQuery hot path. */
+  private slotOfArgs(name: string, a: (number | string)[]): number {
+    const cf = this.fluent(name);
+    let idx = 0;
+    for (let i = 0; i < cf.paramTypes.length; i++) {
+      const raw = a[i];
+      const gid = typeof raw === "string" ? this.entityId(raw) : raw;
+      const within = this.indexInType.get(cf.paramTypes[i])?.get(gid);
+      if (within === undefined) {
+        throw new Error(`Entity '${this.entityName(gid)}' is not of type '${cf.paramTypes[i]}' (fluent '${name}')`);
+      }
+      idx += within * cf.strides[i];
+    }
+    return cf.base + idx * cf.width;
+  }
+
+  /** Reusable ExtQuery bound to mutable model state (no per-call allocation).
+   *  External/opaque evaluation is a synchronous leaf call, so one shared,
+   *  re-pointed instance is safe. */
+  private queryFor(s: Snap, args: Bindings): ExtQuery {
+    this.extState = s;
+    let q = this.reuseQ;
+    if (q === null) {
+      q = this.reuseQ = {
+        args,
+        get: (fluent, ...a) => this.extState.get(this.slotOfArgs(fluent, a)),
+        vec: (fluent, ...a) => {
+          const cf = this.fluent(fluent);
+          const slot = this.slotOfArgs(fluent, a);
+          const out: number[] = [];
+          for (let i = 0; i < cf.width; i++) out.push(this.extState.get(slot + i));
+          return out;
+        },
+        clock: () => this.extState.get(CLOCK_SLOT),
+        gid: (name) => this.entityId(name),
+        name: (gid) => this.entityName(gid),
+      };
+    }
+    q.args = args;
+    return q;
+  }
+
+  /** Reusable ExtWriter (reads see the target being written). */
+  private writerFor(target: WritableState, args: Bindings): ExtWriter {
+    const q = this.queryFor(target, args); // sets extState = target ⇒ reads see writes
+    this.extTarget = target;
+    let w = this.reuseW;
+    if (w === null) {
+      w = this.reuseW = {
+        ...q,
+        set: (fluent, a, value) => this.extTarget.set(this.slotOfArgs(fluent, a), this.encodeValue(fluent, value)),
+      };
+    }
+    w.args = args;
+    return w;
+  }
+
   // ---------------- numeric expression compilation
 
   compileNum(expr: NumExpr, vars: Map<string, number>, context: string): CompiledNum {
@@ -551,7 +616,7 @@ export class Model {
         if (!fn) throw new Error(`Unregistered external numeric '${expr.name}' in ${context}`);
         for (const r of expr.reads) reads.add(this.fluent(r).id);
         const getArgs = this.argFn(this.resolveArgSources(expr.args, vars, context));
-        return (s, b) => fn(this.extQuery(s, getArgs(b)));
+        return (s, b) => fn(this.queryFor(s, getArgs(b)));
       }
     }
     throw new Error(`Unreachable numeric expression in ${context}`);
@@ -637,12 +702,12 @@ export class Model {
         if (!fn) throw new Error(`Unregistered external predicate '${formula.name}' in ${context}`);
         for (const r of formula.reads) reads.add(this.fluent(r).id);
         const getArgs = this.argFn(this.resolveArgSources(formula.args, vars, context));
-        return (s, b) => fn(this.extQuery(s, getArgs(b)));
+        return (s, b) => fn(this.queryFor(s, getArgs(b)));
       }
       case "opaque": {
         const fn = this.registry.predicates[formula.name];
         if (!fn) throw new Error(`Unregistered opaque predicate '${formula.name}' in ${context}`);
-        return (s, b) => fn(this.extQuery(s, b));
+        return (s, b) => fn(this.queryFor(s, b));
       }
     }
     throw new Error(`Unreachable formula in ${context}`);
@@ -728,7 +793,7 @@ export class Model {
         }
         appliers.push((target, b, mask) => {
           if ((mask & timingBit) === 0) return;
-          fn(this.extWriter(target, b));
+          fn(this.writerFor(target, b));
         });
         continue;
       }
