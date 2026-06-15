@@ -1,13 +1,13 @@
 "use client";
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
-import { runScenario, traceSummary, type RunResult } from "../lib/run";
+import { runScenario, scenarioHeavyMs, traceSummary, type RunResult } from "../lib/run";
 import { runBlocks, type BlocksRun } from "../lib/runBlocks";
 
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
 
-type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "blocks";
+type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge" | "blocks";
 
 type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun };
 
@@ -32,6 +32,16 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string }> = {
     blurb:
       "Blocks lie scattered on the ground — no depots. You can only take the TOP of a stack, and only if you're high enough to reach it: a 2-pillar's top block is out of reach from the ground. So the planner grabs a loose block, builds a step, climbs it, harvests the pillar's top, and uses the blocks to reach a position up in the air.",
   },
+  scavengerBig: {
+    name: "Scavenger XL (taller, harder)",
+    blurb:
+      "A bigger 4×3 grid with a taller height-3 goal and seven blocks scattered around (five loose + a 2-pillar). Loose blocks alone aren't enough, so the planner must harvest the pillar — cleverly standing on loose blocks as stepping stones to reach its top — and stack a 3-level structure to climb up.",
+  },
+  scavengerHuge: {
+    name: "Scavenger HUGE (stress · ~9s)",
+    blurb:
+      "A 6×4 grid (24 cells) littered with blocks — a deliberate stress test, ≈10× the compute of the others (~9s to plan; the page is busy while it searches). It shows the planner solving a large symbolic problem from a position-only goal. Search is hard-capped so it can't run away.",
+  },
   blocks: {
     name: "Blocks World (Sussman)",
     blurb:
@@ -47,14 +57,25 @@ function buildRun(id: ScenarioId): Run {
 export default function Page() {
   const [scenario, setScenario] = useState<ScenarioId>("staircase");
   const [run, setRun] = useState<Run | null>(null);
+  const [computing, setComputing] = useState(true);
   const [step, setStep] = useState(0);
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(750);
 
   useEffect(() => {
-    setRun(buildRun(scenario));
+    setComputing(true);
+    setRun(null);
     setStep(0);
-    setPlaying(true);
+    // Defer the (possibly heavy, synchronous) plan+rollout so React paints the
+    // "Planning…" state first. The big stress scenario blocks for ~9s; search is
+    // hard-capped (maxNodes) so it can never run away.
+    const id = setTimeout(() => {
+      const r = buildRun(scenario);
+      setRun(r);
+      setComputing(false);
+      setPlaying(true);
+    }, 30);
+    return () => clearTimeout(id);
   }, [scenario]);
 
   const frameCount = run ? run.data.frames.length : 0;
@@ -94,6 +115,30 @@ export default function Page() {
         )}
         {run?.kind === "blocks" && (
           <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={reached} />
+        )}
+        {computing && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexDirection: "column",
+              gap: 8,
+              color: "var(--muted)",
+              background: "rgba(11,14,20,0.55)",
+              zIndex: 3,
+            }}
+          >
+            <div style={{ fontSize: 16, color: "var(--text)" }}>⏳ Planning…</div>
+            {scenarioHeavyMs(scenario) > 0 && (
+              <div style={{ fontSize: 12 }}>
+                heavy stress scenario — the planner is searching (~{Math.round(scenarioHeavyMs(scenario) / 1000)}s); the
+                page is busy meanwhile
+              </div>
+            )}
+          </div>
         )}
       </div>
 

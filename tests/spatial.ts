@@ -4,12 +4,18 @@ import { F, Planner, goal, planOnce, simulatePlan, type Model, type Plan, type S
 import {
   GOAL_HEIGHT,
   QUARRY_GOAL_HEIGHT,
+  SCAVENGER_BIG_GOAL_HEIGHT,
   SCAVENGER_GOAL_HEIGHT,
   ledgeGoal,
   ledgeInstance,
   quarryGoal,
   quarryInstance,
+  scavengerBigGoal,
+  scavengerBigInstance,
   scavengerGoal,
+  scavengerHugeGoal,
+  scavengerHugeGoalCell,
+  scavengerHugeInstance,
   scavengerInstance,
   scavengerModel,
   staircaseGoal,
@@ -221,6 +227,24 @@ test("scavenger: a 2-pillar's top block is unreachable from the ground", () => {
   assert.equal(result.status, "failure", "can't grab a 2-high top block from the ground with nothing to step on");
 });
 
+test("scavenger XL: taller height-3 goal, more blocks, harvests the pillar (greedy weight)", () => {
+  // bigger 4×3 grid, height-3 goal, 5 loose blocks + a 2-pillar. Uses the same
+  // fast settings the web demo runs (hadd, weight 5) — assert it solves, reaches
+  // the goal, and harvests the pillar (loose blocks alone are insufficient).
+  const model = scavengerModel(scavengerBigInstance());
+  const start = model.createExecState();
+  const result = planOnce(model, start, { goals: [goal(scavengerBigGoal())], weight: 5, heuristic: "hadd", maxNodes: 500_000 });
+  assert.equal(result.status, "success");
+  const end = endOf(model, start, result.plan!);
+  assert.equal(model.read(end, "agentAt"), "goal");
+  assert.equal(model.read(end, "agentY"), SCAVENGER_BIG_GOAL_HEIGHT);
+  const towerGid = model.entityId("tower");
+  const harvested = (result.plan!.steps ?? []).some(
+    (s) => s.k === "op" && s.g.op.name === "grab" && s.g.b[s.g.b.length - 1] === towerGid,
+  );
+  assert.ok(harvested, "5 loose blocks can't supply a height-3 goal — the pillar must be harvested");
+});
+
 test("scavenger: solved through the reactive Planner", () => {
   const model = scavengerModel(scavengerInstance());
   let t = 0;
@@ -233,5 +257,27 @@ test("scavenger: solved through the reactive Planner", () => {
   assert.equal(model.read(planner.state, "agentAt"), "goal");
   assert.equal(model.read(planner.state, "agentY"), SCAVENGER_GOAL_HEIGHT);
 });
+
+// HUGE stress benchmark — ~9s of compute, so it's opt-in (HTN_BENCH=1) to keep
+// the default suite/CI fast. Bounded by maxNodes so it can never run away.
+if (process.env.HTN_BENCH === "1") {
+  test("scavenger HUGE (benchmark): solves a 24-cell height-3 grid (~10× XL compute)", () => {
+    const model = scavengerModel(scavengerHugeInstance());
+    const start = model.createExecState();
+    const t0 = Date.now();
+    const result = planOnce(model, start, {
+      goals: [goal(scavengerHugeGoal())],
+      weight: 6,
+      heuristic: "hadd",
+      maxNodes: 200_000, // safety cap; the greedy search solves in ≈1.7k expansions
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[HUGE] ${result.status} in ${Date.now() - t0}ms, ${result.stats.expansions} expansions`);
+    assert.equal(result.status, "success");
+    const end = endOf(model, start, result.plan!);
+    assert.equal(model.read(end, "agentAt"), scavengerHugeGoalCell);
+    assert.equal(model.read(end, "agentY"), 3);
+  });
+}
 
 test.run();
