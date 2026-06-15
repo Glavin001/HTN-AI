@@ -200,6 +200,10 @@ Profiling sorts the scenarios into three regimes, each with a different next mov
 
 ## Remaining opportunities (ranked)
 
+> A fuller, research-grounded decision document with impact/risk/effort per item
+> lives in [`PERF-ROADMAP.md`](./PERF-ROADMAP.md). The summary below is kept for
+> quick reference.
+
 ### Landed since: static-fluent pruning
 
 Fluents declared `static: true` (immutable after init — adjacency, maps,
