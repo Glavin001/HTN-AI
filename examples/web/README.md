@@ -16,6 +16,12 @@ reactive `Planner`** in the browser (the app never re-implements planning):
   blocks from the supply depot, build a staircase, and climb it.
 - **Climb the ledge** — a 2-high wall the agent can't scale directly (you ascend
   one level at a time); the planner builds a single support step and walks over.
+- **Quarry (advanced)** — a grid world: reach the top of a **height-4 pillar**.
+  Six blocks are **scattered across two depots**, a **wall pillar** is impassable,
+  and the agent can only climb one level at a time. From a position-only goal the
+  planner finds the optimal route to collect from both depots and build a 3-step
+  staircase (1→2→3) to climb up — solved optimally by pure GOAP (~1.5k node
+  expansions; see [`../../tests/spatial.ts`](../../tests/spatial.ts)).
 - **Blocks World (Sussman)** ([`../../scenarios/blocks.ts`](../../scenarios/blocks.ts)) —
   the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
   The naive order deadlocks, so the planner interleaves subgoals.

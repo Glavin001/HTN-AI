@@ -7,7 +7,7 @@ import { runBlocks, type BlocksRun } from "../lib/runBlocks";
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
 
-type ScenarioId = "staircase" | "ledge" | "blocks";
+type ScenarioId = "staircase" | "ledge" | "quarry" | "blocks";
 
 type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun };
 
@@ -21,6 +21,11 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string }> = {
     name: "Climb the ledge",
     blurb:
       "A 2-high wall the agent can't climb directly (you ascend one level at a time). The planner figures out it must build a single step, then walk up and over.",
+  },
+  quarry: {
+    name: "Quarry (advanced)",
+    blurb:
+      "A grid world: reach the top of a height-4 pillar. Blocks are scattered across two depots and a wall blocks the way. The planner finds the optimal route to collect from both depots and build a 3-step staircase (1→2→3) to climb up — all from a position-only goal.",
   },
   blocks: {
     name: "Blocks World (Sussman)",

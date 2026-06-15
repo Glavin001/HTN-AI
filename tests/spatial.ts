@@ -3,8 +3,11 @@ import * as assert from "uvu/assert";
 import { F, Planner, goal, planOnce, simulatePlan, type Model, type Plan, type Snap, type TraceEvent } from "../src/index";
 import {
   GOAL_HEIGHT,
+  QUARRY_GOAL_HEIGHT,
   ledgeGoal,
   ledgeInstance,
+  quarryGoal,
+  quarryInstance,
   staircaseGoal,
   staircaseInstance,
   staircaseModel,
@@ -119,6 +122,54 @@ test("nearer supply is preferred: N.dist cost steers the plan", () => {
   // the cheaper plan mines `near`, so `far` should be untouched (supply intact)
   assert.equal(model.read(end, "supply", "far"), 1, "should not have walked to the far depot");
   assert.equal(model.read(end, "supply", "near"), 0, "should have mined the near depot");
+});
+
+// ---------------------------------------------------------------- quarry: the advanced grid world
+
+test("quarry: optimal collect/place/build/climb to a height-4 pillar (search stays tiny)", () => {
+  const model = staircaseModel(quarryInstance());
+  const start = model.createExecState();
+  const result = planOnce(model, start, { goals: [goal(quarryGoal())], weight: 1, heuristic: "hmax" });
+  assert.equal(result.status, "success");
+  const end = endOf(model, start, result.plan!);
+  // reached the 3D position on top of the pillar
+  assert.equal(model.read(end, "agentAt"), "pillar");
+  assert.equal(model.read(end, "agentY"), QUARRY_GOAL_HEIGHT);
+  // discovered the 3-step staircase (heights 1,2,3) — emergent, not prescribed
+  assert.equal(model.read(end, "height", "step1"), 1);
+  assert.equal(model.read(end, "height", "step2"), 2);
+  assert.equal(model.read(end, "height", "step3"), 3);
+  // collected from BOTH scattered depots (6 blocks needed, 3+3 available)
+  assert.equal(model.read(end, "supply", "depotA"), 0);
+  assert.equal(model.read(end, "supply", "depotB"), 0);
+  // the buildable constraint + topology keep optimal search tractable
+  assert.ok(result.stats.expansions < 50_000, `search should stay small, got ${result.stats.expansions} expansions`);
+});
+
+test("quarry: never enters the impassable wall pillar", () => {
+  const model = staircaseModel(quarryInstance());
+  const start = model.createExecState();
+  const result = planOnce(model, start, { goals: [goal(quarryGoal())], weight: 1, heuristic: "hmax" });
+  assert.equal(result.status, "success");
+  // no goto step may target the wall (height 6 ≫ the +1 climb limit)
+  const wallGid = model.entityId("wall");
+  const enteredWall = (result.plan!.steps ?? []).some(
+    (s) => s.k === "op" && s.g.op.name === "goto" && s.g.b[s.g.b.length - 1] === wallGid,
+  );
+  assert.not(enteredWall, "the agent must route around the wall, never into it");
+});
+
+test("quarry: solved through the reactive Planner", () => {
+  const model = staircaseModel(quarryInstance());
+  let t = 0;
+  const planner = new Planner(model, { goals: [goal(quarryGoal())], now: () => t, seed: 5 });
+  for (let i = 0; i < 4000 && planner.getStatus() !== "succeeded" && planner.getStatus() !== "failed"; i++) {
+    t += 1;
+    planner.tick({ ms: 20 });
+  }
+  assert.equal(planner.getStatus(), "succeeded");
+  assert.equal(model.read(planner.state, "agentAt"), "pillar");
+  assert.equal(model.read(planner.state, "agentY"), QUARRY_GOAL_HEIGHT);
 });
 
 test.run();

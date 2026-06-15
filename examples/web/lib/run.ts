@@ -9,15 +9,18 @@
 import { Planner, goal, type TraceEvent } from "htn-ai";
 import {
   GOAL_HEIGHT,
+  QUARRY_GOAL_HEIGHT,
   ledgeGoal,
   ledgeInstance,
+  quarryGoal,
+  quarryInstance,
   staircaseGoal,
   staircaseInstance,
   staircaseModel,
   type StaircaseInstance,
 } from "@scenarios/staircase";
 
-export type ScenarioId = "staircase" | "ledge";
+export type ScenarioId = "staircase" | "ledge" | "quarry";
 
 export interface Frame {
   /** column heights per cell */
@@ -45,6 +48,7 @@ export interface RunResult {
 const SCENARIOS: Record<ScenarioId, { instance: () => StaircaseInstance; goal: () => ReturnType<typeof staircaseGoal>; target: { cell: string; y: number } }> = {
   staircase: { instance: staircaseInstance, goal: staircaseGoal, target: { cell: "goal", y: GOAL_HEIGHT } },
   ledge: { instance: () => ledgeInstance(1), goal: ledgeGoal, target: { cell: "ledge", y: 2 } },
+  quarry: { instance: quarryInstance, goal: quarryGoal, target: { cell: "pillar", y: QUARRY_GOAL_HEIGHT } },
 };
 
 export function runScenario(id: ScenarioId): RunResult {
@@ -73,12 +77,12 @@ export function runScenario(id: ScenarioId): RunResult {
 
   const frames: Frame[] = [snap("start")];
 
-  for (let i = 0; i < 2000; i++) {
+  for (let i = 0; i < 4000; i++) {
     const status = planner.getStatus();
     if (status === "succeeded" || status === "failed") break;
     t += 1;
     const before = trace.length;
-    planner.tick({ ms: 5 });
+    planner.tick({ ms: 30 }); // generous budget; this loop runs offline, not per-frame
     const done = trace.slice(before).find((e) => e.t === "step.done");
     if (done && done.t === "step.done") frames.push(snap(done.label));
   }

@@ -25,6 +25,9 @@ import {
   createModel,
 } from "../src/index";
 
+/** default height of a wall/obstacle pillar — far above the +1 climb limit */
+export const WALL_HEIGHT = 6;
+
 export const staircaseDomain: DomainDoc = {
   name: "staircase-world",
   types: [{ name: "cell" }],
@@ -38,6 +41,10 @@ export const staircaseDomain: DomainDoc = {
     // ONLY observable the goal constrains: "be up in the air at coordinate Y".
     { name: "agentY", kind: "int", initial: 0 },
     { name: "holding", kind: "boolean", initial: false },
+    // only designated cells can be built up — keeps the search focused on the
+    // staircase (and lets walls/obstacles be no-build). Defaults to true so
+    // simple instances need not set it.
+    { name: "buildable", params: [{ name: "c", type: "cell" }], kind: "boolean", initial: true },
   ],
   operators: [
     {
@@ -67,6 +74,7 @@ export const staircaseDomain: DomainDoc = {
       params: [{ name: "stand", type: "cell" }, { name: "at", type: "cell" }],
       pre: F.and(
         F.lit("holding"),
+        F.lit("buildable", ["?at"]),
         F.lit("agentAt", [], "?stand"),
         F.lit("adj", ["?stand", "?at"]),
         F.gte(N.fl("height", "?stand"), N.fl("height", "?at")),
@@ -83,6 +91,10 @@ export interface CellSpec {
   z: number;
   height?: number;
   supply?: number;
+  /** if false, blocks cannot be placed here (walls, depots, the goal pillar) */
+  buildable?: boolean;
+  /** a tall fixed obstacle the agent can neither climb nor build on */
+  wall?: boolean;
 }
 
 export interface StaircaseInstance {
@@ -101,8 +113,10 @@ export function staircaseModel(inst: StaircaseInstance): Model {
     init: (w) => {
       for (const c of inst.cells) {
         w.set("pos", [c.name], [c.x, c.z]);
-        if (c.height) w.set("height", [c.name], c.height);
+        const h = c.wall ? (c.height ?? WALL_HEIGHT) : c.height;
+        if (h) w.set("height", [c.name], h);
         if (c.supply) w.set("supply", [c.name], c.supply);
+        if (c.buildable === false || c.wall) w.set("buildable", [c.name], false);
       }
       for (const [a, b] of inst.edges) {
         w.set("adj", [a, b], true);
@@ -174,4 +188,53 @@ export function staircaseGoal(): import("../src/index").Formula {
 /** The ledge goal: be at the ledge coordinate, elevation 2 (atop the wall). */
 export function ledgeGoal(): import("../src/index").Formula {
   return F.and(F.lit("agentAt", [], "ledge"), F.eq(N.fl("agentY"), N.c(2)));
+}
+
+/**
+ * "Quarry" — the advanced grid world. A tall fixed goal pillar (height
+ * QUARRY_GOAL_HEIGHT = 4) the agent must stand on top of, reachable only by
+ * building a 3-step staircase (heights 1→2→3) beside it. The six blocks are
+ * scattered across two depots with limited supply, so the agent must collect
+ * from BOTH and shuttle them to the build front; a wall pillar is an impassable
+ * obstacle. The goal is position-only — the planner works out the optimal route
+ * to collect, place, build the staircase, and climb. Solved optimally by pure
+ * GOAP search (≈1.5k node expansions, see tests/spatial.ts).
+ *
+ *      z=1   depotA(3)   wall       depotB(3)
+ *      z=0   start - step1 - step2 - step3 - pillar(goal, h4)
+ *             x=0     x=1     x=2     x=3      x=4
+ */
+export const QUARRY_GOAL_HEIGHT = 4;
+
+export function quarryInstance(): StaircaseInstance {
+  return {
+    cells: [
+      { name: "start", x: 0, z: 0 },
+      { name: "step1", x: 1, z: 0 }, // built to 1
+      { name: "step2", x: 2, z: 0 }, // built to 2
+      { name: "step3", x: 3, z: 0 }, // built to 3
+      { name: "pillar", x: 4, z: 0, height: QUARRY_GOAL_HEIGHT, buildable: false }, // the goal
+      { name: "depotA", x: 0, z: 1, supply: 3, buildable: false },
+      { name: "depotB", x: 2, z: 1, supply: 3, buildable: false },
+      { name: "wall", x: 1, z: 1, wall: true },
+    ],
+    edges: [
+      ["start", "step1"],
+      ["step1", "step2"],
+      ["step2", "step3"],
+      ["step3", "pillar"],
+      ["start", "depotA"],
+      ["step2", "depotB"],
+      // wall edges: present in the grid but impassable (height 6 ≫ climb limit)
+      ["step1", "wall"],
+      ["depotA", "wall"],
+      ["depotB", "wall"],
+    ],
+    start: "start",
+  };
+}
+
+/** Quarry goal: stand on top of the pillar — a pure 3D position, elevation 4. */
+export function quarryGoal(): import("../src/index").Formula {
+  return F.and(F.lit("agentAt", [], "pillar"), F.eq(N.fl("agentY"), N.c(QUARRY_GOAL_HEIGHT)));
 }

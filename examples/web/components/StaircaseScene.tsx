@@ -63,9 +63,23 @@ function TargetMarker({ pos, reached }: { pos: THREE.Vector3; reached: boolean }
   );
 }
 
-function Column({ x, z, height, isTarget, isSupply }: { x: number; z: number; height: number; isTarget: boolean; isSupply: boolean }) {
-  const tile = isTarget ? "#3b2f12" : isSupply ? "#3a2a10" : "#1b2333";
-  const block = isTarget ? "#6366f1" : "#3f7cc4";
+function Column({
+  x,
+  z,
+  height,
+  isTarget,
+  isSupply,
+  isWall,
+}: {
+  x: number;
+  z: number;
+  height: number;
+  isTarget: boolean;
+  isSupply: boolean;
+  isWall: boolean;
+}) {
+  const tile = isWall ? "#0c0f16" : isTarget ? "#3b2f12" : isSupply ? "#3a2a10" : "#1b2333";
+  const block = isWall ? "#2b3140" : isTarget ? "#6366f1" : "#3f7cc4";
   return (
     <group position={[x, 0, z]}>
       {/* cell tile on the ground */}
@@ -73,11 +87,11 @@ function Column({ x, z, height, isTarget, isSupply }: { x: number; z: number; he
         <boxGeometry args={[0.96, 0.04, 0.96]} />
         <meshStandardMaterial color={tile} />
       </mesh>
-      {/* stacked unit blocks */}
+      {/* stacked unit blocks (a tall dark pillar for walls) */}
       {Array.from({ length: height }).map((_, k) => (
         <mesh key={k} position={[0, k + 0.5, 0]} castShadow receiveShadow>
           <boxGeometry args={[0.9, 0.96, 0.9]} />
-          <meshStandardMaterial color={block} roughness={0.7} metalness={0.05} />
+          <meshStandardMaterial color={block} roughness={isWall ? 0.95 : 0.7} metalness={0.05} />
         </mesh>
       ))}
       {isSupply && height === 0 && (
@@ -97,11 +111,12 @@ function Scene({ frame, instance, target, reached }: SceneProps) {
     return m;
   }, [instance]);
   const supplyCells = useMemo(() => new Set(instance.cells.filter((c) => (c.supply ?? 0) > 0).map((c) => c.name)), [instance]);
+  const wallCells = useMemo(() => new Set(instance.cells.filter((c) => c.wall).map((c) => c.name)), [instance]);
 
   const center = useMemo<[number, number, number]>(() => {
     const xs = instance.cells.map((c) => c.x);
     const zs = instance.cells.map((c) => c.z);
-    return [(Math.min(...xs) + Math.max(...xs)) / 2, 0.8, (Math.min(...zs) + Math.max(...zs)) / 2];
+    return [(Math.min(...xs) + Math.max(...xs)) / 2, 1.2, (Math.min(...zs) + Math.max(...zs)) / 2];
   }, [instance]);
 
   const [ax, az] = cellPos.get(frame.agentCell) ?? [0, 0];
@@ -110,7 +125,7 @@ function Scene({ frame, instance, target, reached }: SceneProps) {
 
   return (
     <>
-      <PerspectiveCamera makeDefault position={[center[0] + 4.5, 4.8, center[2] + 6]} fov={42} />
+      <PerspectiveCamera makeDefault position={[center[0] + 5, 6, center[2] + 7.5]} fov={42} />
       <OrbitControls target={center} enablePan minDistance={3} maxDistance={30} maxPolarAngle={Math.PI / 2.1} />
       <ambientLight intensity={0.55} />
       <directionalLight position={[6, 10, 4]} intensity={1.1} castShadow shadow-mapSize={[1024, 1024]} />
@@ -133,6 +148,7 @@ function Scene({ frame, instance, target, reached }: SceneProps) {
           height={frame.heights[c.name] ?? 0}
           isTarget={c.name === target.cell}
           isSupply={supplyCells.has(c.name)}
+          isWall={wallCells.has(c.name)}
         />
       ))}
 
