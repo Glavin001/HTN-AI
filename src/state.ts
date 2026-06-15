@@ -46,7 +46,17 @@ export function hashBase(base: Float64Array): number {
 
 // ---------------------------------------------------------------- copy-on-write views
 
-const MAX_CHAIN_DEPTH = 24;
+/**
+ * Adaptive copy-on-write collapse threshold. `get()` walks the delta chain via
+ * Map lookups (tens of ns each); `materialize()` is a flat typed-array copy
+ * (~0.5 ns/element). So collapsing the chain shallowly keeps reads near-O(1) and
+ * wins for small states, while large states tolerate deeper chains because the
+ * full copy would dominate. ≈ slotCount/32, clamped to [2, 32].
+ */
+function collapseDepth(slotCount: number): number {
+  const d = slotCount >> 5;
+  return d < 2 ? 2 : d > 32 ? 32 : d;
+}
 
 /**
  * Immutable-after-build copy-on-write state. Create children with `child()`,
@@ -57,6 +67,7 @@ export class StateView implements Snap {
   private readonly parent: StateView | null;
   private readonly deltas: Map<number, number>;
   private readonly depth: number;
+  private readonly maxDepth: number;
   /** xor-composed hash over all (slot,value≠0) pairs */
   public hash: number;
 
@@ -65,6 +76,7 @@ export class StateView implements Snap {
     this.parent = parent;
     this.deltas = new Map();
     this.depth = depth;
+    this.maxDepth = collapseDepth(base.length);
     this.hash = hash;
   }
 
@@ -74,7 +86,7 @@ export class StateView implements Snap {
 
   /** Create a writable child view. */
   child(): StateView {
-    if (this.depth >= MAX_CHAIN_DEPTH) {
+    if (this.depth >= this.maxDepth) {
       // collapse the chain into a fresh base copy
       const flat = this.materialize();
       return new StateView(flat, null, this.hash, 1);

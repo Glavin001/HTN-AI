@@ -6,7 +6,20 @@
  * expansions / heuristicEvals) so we can see *where* the cost is and how it
  * scales. Run: `tsx --tsconfig tsconfig.tests.json bench/bench.ts`.
  */
-import { DomainDoc, E, F, N, createModel, goal, planOnce, scoped, achieve, task, type PlanResult } from "../src/index";
+import {
+  DomainDoc,
+  E,
+  F,
+  N,
+  Planner,
+  Scheduler,
+  createModel,
+  doTask,
+  goal,
+  planOnce,
+  task,
+  type PlanResult,
+} from "../src/index";
 import {
   quarryInstance,
   quarryGoal,
@@ -168,6 +181,67 @@ function hanoi(nDisks: number): () => PlanResult {
   return () => planOnce(model, model.createExecState(), { goals: [goal(F.and(...goalLits))], weight: 1 });
 }
 
+// ---------------------------------------------------------------- HTN decomposition (free-variable methods)
+
+// "Tour": visit every location once. The recursive method `tour` has a free
+// parameter `next: loc`, so each expansion enumerates K bindings (most pruned by
+// the not-visited precondition) — stresses freeBindings, method-pre eval, deep
+// seek recursion, agenda cycle detection and MTR. Pure decomposition, no goal search.
+function htnTour(k: number): () => PlanResult {
+  const locs = Array.from({ length: k }, (_, i) => `l${i}`);
+  const doc: DomainDoc = {
+    name: "tour",
+    types: [{ name: "loc" }],
+    fluents: [{ name: "visited", params: [{ name: "l", type: "loc" }], kind: "boolean", initial: false }],
+    compounds: [{ name: "Tour" }],
+    operators: [
+      {
+        name: "visit",
+        params: [{ name: "l", type: "loc" }],
+        pre: F.not(F.lit("visited", ["?l"])),
+        eff: [E.set("visited", ["?l"], true)],
+      },
+    ],
+    methods: [
+      {
+        name: "more",
+        task: "Tour",
+        params: [{ name: "next", type: "loc" }],
+        pre: F.not(F.lit("visited", ["?next"])),
+        subtasks: [doTask("visit", "?next"), doTask("Tour")],
+      },
+      { name: "done", task: "Tour", subtasks: [] },
+    ],
+  };
+  const model = createModel(doc, { entities: Object.fromEntries(locs.map((l) => [l, "loc"])) });
+  return () => planOnce(model, model.createExecState(), { goals: [task("Tour")] });
+}
+
+// ---------------------------------------------------------------- multi-agent scheduler
+
+// M independent agents each solving the staircase, driven round-robin to
+// completion through the Scheduler — stresses staggered budgeted planning.
+function schedulerRun(m: number): () => PlanResult {
+  return () => {
+    const sched = new Scheduler();
+    const planners: Planner[] = [];
+    let t = 0;
+    for (let i = 0; i < m; i++) {
+      const model = staircaseModel(staircaseInstance());
+      const p = new Planner(model, { goals: [goal(staircaseGoal())], now: () => t, seed: i });
+      planners.push(p);
+      sched.add(p);
+    }
+    for (let i = 0; i < 2000 && planners.some((p) => p.getStatus() !== "succeeded" && p.getStatus() !== "failed"); i++) {
+      t += 1;
+      sched.tick(5);
+    }
+    // shape a PlanResult-ish summary for the harness
+    const done = planners.every((p) => p.getStatus() === "succeeded");
+    return { status: done ? "success" : "failure", stats: { decompositions: 0, expansions: 0, heuristicEvals: 0 } } as PlanResult;
+  };
+}
+
 // ---------------------------------------------------------------- scenarios
 
 const quarry = (() => {
@@ -206,3 +280,6 @@ bench("blocks reverse 6 (w=1)", blocksReverse(6), 20);
 bench("hanoi 3 (w=1)", hanoi(3), 500);
 bench("hanoi 4 (w=1)", hanoi(4), 100);
 bench("hanoi 5 (w=1)", hanoi(5), 20);
+bench("htn tour 8 (decomposition)", htnTour(8), 2000);
+bench("htn tour 16 (decomposition)", htnTour(16), 500);
+bench("scheduler x8 (staircase)", schedulerRun(8), 100);

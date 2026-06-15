@@ -172,6 +172,8 @@ export interface CompiledMethod {
   pre: CompiledFormula | null;
   utility: CompiledNum | null;
   subtasks: CompiledSubtask[];
+  /** memoized free-parameter binding enumeration (types are fixed at compile time) */
+  freeBindingsCache?: Bindings[];
 }
 
 interface CompiledFluent {
@@ -241,6 +243,15 @@ export class Model {
   public relaxAtomValue: Float64Array = new Float64Array(0);
   public relaxAtomFuzzy: Uint8Array = new Uint8Array(0);
   private readonly relaxAtomIndex = new Map<string, number>();
+
+  // ---- successor generator: index each ground op by its most-selective
+  //      precondition atom so search considers only plausibly-applicable ops
+  //      (selector holds) instead of scanning all ground operators per node.
+  /** ops with no positive-lit precondition — always candidates */
+  public succAlwaysOps: GroundOp[] = [];
+  /** distinct selector slots; succSelTables[k] maps required value → gid-sorted ops */
+  public succSelSlots: Int32Array = new Int32Array(0);
+  public succSelTables: Map<number, GroundOp[]>[] = [];
 
   public slotCount = 1; // slot 0 = clock
   public slotOwner!: Int32Array;
@@ -972,6 +983,44 @@ export class Model {
       }
     }
     this.buildRelaxTables();
+    this.buildSuccessorIndex();
+  }
+
+  /** Index ground ops by their most-selective precondition atom. Positive-lit
+   *  preconditions are necessary conditions, so an op whose selector atom does
+   *  not hold is inapplicable — letting search skip it without an evaluation. */
+  private buildSuccessorIndex(): void {
+    // distinct required values per slot ≈ selectivity (positional fluents
+    // partition finely; booleans shared by every binding do not)
+    const valuesBySlot = new Map<number, Set<number>>();
+    for (const g of this.groundOps) {
+      for (const a of g.preAtoms) {
+        let s = valuesBySlot.get(a.slot);
+        if (!s) valuesBySlot.set(a.slot, (s = new Set()));
+        s.add(a.value);
+      }
+    }
+    const selectivity = (slot: number): number => valuesBySlot.get(slot)?.size ?? 0;
+
+    this.succAlwaysOps = [];
+    const tables = new Map<number, Map<number, GroundOp[]>>();
+    for (const g of this.groundOps) {
+      if (g.preAtoms.length === 0) {
+        this.succAlwaysOps.push(g); // no indexable precondition — always consider
+        continue;
+      }
+      let sel = g.preAtoms[0];
+      for (let i = 1; i < g.preAtoms.length; i++) {
+        if (selectivity(g.preAtoms[i].slot) > selectivity(sel.slot)) sel = g.preAtoms[i];
+      }
+      let table = tables.get(sel.slot);
+      if (!table) tables.set(sel.slot, (table = new Map()));
+      let list = table.get(sel.value);
+      if (!list) table.set(sel.value, (list = []));
+      list.push(g); // groundOps iterated in gid order ⇒ each bucket stays gid-sorted
+    }
+    this.succSelSlots = Int32Array.from(tables.keys());
+    this.succSelTables = Array.from(this.succSelSlots, (s) => tables.get(s) as Map<number, GroundOp[]>);
   }
 
   /** Intern every distinct (slot,value) atom over the ground operators and emit
@@ -1011,9 +1060,14 @@ export class Model {
     return id === undefined ? -1 : id;
   }
 
-  /** Enumerate bindings for a method's free parameters. */
+  /** Enumerate bindings for a method's free parameters (memoized — fixed types). */
   freeBindings(method: CompiledMethod): Bindings[] {
-    return this.enumerateBindings(method.freeParams.map((p) => p.type));
+    let cache = method.freeBindingsCache;
+    if (cache === undefined) {
+      cache = this.enumerateBindings(method.freeParams.map((p) => p.type));
+      method.freeBindingsCache = cache;
+    }
+    return cache;
   }
 
   // ---------------- introspection helpers

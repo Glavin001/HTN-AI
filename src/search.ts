@@ -55,6 +55,10 @@ export function cons(head: AgendaItem, tail: Agenda): Agenda {
   return { head, tail };
 }
 
+function byGid(a: GroundOp, b: GroundOp): number {
+  return a.gid - b.gid;
+}
+
 export function agendaFrom(items: AgendaItem[], tail: Agenda = null): Agenda {
   let a = tail;
   for (let i = items.length - 1; i >= 0; i--) a = cons(items[i], a);
@@ -158,7 +162,9 @@ class Heap {
     while (i > 0) {
       const p = (i - 1) >> 1;
       if (Heap.less(a[i], a[p])) {
-        [a[i], a[p]] = [a[p], a[i]];
+        const t = a[i];
+        a[i] = a[p];
+        a[p] = t;
         i = p;
       } else break;
     }
@@ -179,7 +185,9 @@ class Heap {
         if (l < a.length && Heap.less(a[l], a[m])) m = l;
         if (r < a.length && Heap.less(a[r], a[m])) m = r;
         if (m === i) break;
-        [a[i], a[m]] = [a[m], a[i]];
+        const t = a[i];
+        a[i] = a[m];
+        a[m] = t;
         i = m;
       }
     }
@@ -232,6 +240,11 @@ function goalDescs(model: Model, goalAtoms: Atom[]): GoalAtomDesc[] {
  * Numeric/external/negative conditions are treated optimistically: a "fuzzy"
  * atom (written non-atomically by some operator) can take any value at cost 1 and
  * is never called unreachable. Semantics match the original Map-based version.
+ *
+ * (A worklist variant — re-enqueue only the ops that read a decreased atom — was
+ * tried and is slower on these small, densely-connected relaxation graphs, where
+ * one shared atom like `agentAt` gates nearly every op; the dense round-based
+ * sweep wins until domains get large and sparse.)
  */
 function relaxCore(model: Model, s: Snap, cost: Float64Array, goals: GoalAtomDesc[], add: boolean): number {
   const n = model.relaxAtomCount;
@@ -307,13 +320,12 @@ function relaxCore(model: Model, s: Snap, cost: Float64Array, goals: GoalAtomDes
 }
 
 /**
- * Public delete-relaxation heuristic (SPEC §7.3). Builds goal descriptors and a
- * scratch buffer per call; the Engine uses a faster path that reuses both.
+ * Public delete-relaxation heuristic (SPEC §7.3). Allocates a scratch buffer per
+ * call; the Engine uses a faster path that reuses both buffer and goal descriptors.
  */
 export function hAdd(model: Model, s: Snap, goalAtoms: Atom[], mode: "add" | "max" = "add"): number {
   if (goalAtoms.length === 0) return 0;
-  const cost = new Float64Array(model.relaxAtomCount);
-  return relaxCore(model, s, cost, goalDescs(model, goalAtoms), mode === "add");
+  return relaxCore(model, s, new Float64Array(model.relaxAtomCount), goalDescs(model, goalAtoms), mode === "add");
 }
 
 // ---------------------------------------------------------------- engine
@@ -344,6 +356,8 @@ export class Engine {
   private readonly hCache = new Map<number, number>();
   /** reusable relaxation cost buffer (sized to model.relaxAtomCount) */
   private costBuf: Float64Array | null = null;
+  /** reusable candidate-op scratch for the indexed successor generator */
+  private readonly succScratch: GroundOp[] = [];
 
   constructor(model: Model, req: PlanRequest) {
     this.model = model;
@@ -678,7 +692,33 @@ export class Engine {
         return { state: node.state, steps, cost: node.g };
       }
 
-      for (const g of model.groundOps) {
+      // indexed successor generation: gather only ops whose most-selective
+      // precondition atom holds (plus the always-consider bucket), in gid order
+      // so the search is byte-identical to scanning every ground op.
+      const cand = this.succScratch;
+      cand.length = 0;
+      const always = model.succAlwaysOps;
+      for (let i = 0; i < always.length; i++) cand.push(always[i]);
+      const selSlots = model.succSelSlots;
+      const selTables = model.succSelTables;
+      for (let k = 0; k < selSlots.length; k++) {
+        const list = selTables[k].get(node.state.get(selSlots[k]));
+        if (list !== undefined) for (let i = 0; i < list.length; i++) cand.push(list[i]);
+      }
+      if (cand.length > 1) cand.sort(byGid); // restore gid order ⇒ identical search
+
+      for (let ci = 0; ci < cand.length; ci++) {
+        const g = cand[ci];
+        // fast reject on the cheap atom preconditions before the full closure
+        const pre = g.preAtoms;
+        let preOk = true;
+        for (let i = 0; i < pre.length; i++) {
+          if (node.state.get(pre[i].slot) !== pre[i].value) {
+            preOk = false;
+            break;
+          }
+        }
+        if (!preOk) continue;
         if (g.op.pre && !g.op.pre.fn(node.state, g.b)) continue;
         const child = node.state.child();
         g.op.effects.apply(child, g.b, TIMINGS_PLANNING);
