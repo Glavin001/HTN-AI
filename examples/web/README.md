@@ -6,19 +6,23 @@ implementation of "Task 4" in [`../../PLAN-web-demo-and-block-stacking.md`](../.
 
 ## What it shows
 
-The flagship scene is **Staircase World** (shared domain in
-[`../../scenarios/staircase.ts`](../../scenarios/staircase.ts)):
+Three scenes, selectable from the scenario dropdown, each driving the **real
+reactive `Planner`** in the browser (the app never re-implements planning):
 
-- The goal is a pure **3D coordinate** — *"be up in the air at (x, y, z)"*. It
-  does **not** tell the agent to place blocks or build anything.
-- The only way to gain height is to stand on blocks, and the only way to go
-  higher is to stack more — so the planner **discovers** it must carry blocks
-  from the supply depot, build a staircase, and climb it.
-- The app drives the **real reactive `Planner`** tick-by-tick (it does not
-  re-implement planning), captures a world snapshot after every executed step,
-  and animates the agent through them. The right-hand panel shows the live world
-  state, the **plan the search discovered**, and the planner's **`TraceEvent`
-  stream** (so repair/replan show up when they happen).
+- **Staircase** (flagship, [`../../scenarios/staircase.ts`](../../scenarios/staircase.ts)) —
+  the goal is a pure **3D coordinate** (*"be up in the air at (x, y, z)"*). It does
+  **not** tell the agent to place blocks or build anything; because the only way
+  to gain height is to stand on blocks, the planner **discovers** it must carry
+  blocks from the supply depot, build a staircase, and climb it.
+- **Climb the ledge** — a 2-high wall the agent can't scale directly (you ascend
+  one level at a time); the planner builds a single support step and walks over.
+- **Blocks World (Sussman)** ([`../../scenarios/blocks.ts`](../../scenarios/blocks.ts)) —
+  the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
+  The naive order deadlocks, so the planner interleaves subgoals.
+
+The right-hand panel shows the live world state, the **plan the search
+discovered**, and the planner's **`TraceEvent` stream** (so repair/replan show up
+when they happen).
 
 ## Run it
 
