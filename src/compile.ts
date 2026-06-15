@@ -90,6 +90,9 @@ export interface CompiledFormula {
   readsClock: boolean;
   /** positive conjunctive lit atoms (for h_add); skipped parts make h more optimistic */
   atoms: (b: Bindings) => Atom[];
+  /** like `atoms`, but also folds in external/opaque `relax` over-approximations —
+   *  used only by the relaxation heuristic, never for search applicability */
+  relaxAtoms: (b: Bindings) => Atom[];
   ir: Formula;
 }
 
@@ -631,12 +634,14 @@ export class Model {
     const reads = new Set<number>();
     const readsClock = { v: false };
     const fn = this.buildFormula(formula, vars, context, reads, readsClock);
-    const atomFns = this.collectAtomFns(formula, vars, context);
+    const atomFns = this.collectAtomFns(formula, vars, context, false);
+    const relaxAtomFns = this.collectAtomFns(formula, vars, context, true);
     return {
       fn,
       reads,
       readsClock: readsClock.v,
       atoms: (b: Bindings) => atomFns.map((f) => f(b)),
+      relaxAtoms: (b: Bindings) => relaxAtomFns.map((f) => f(b)),
       ir: formula,
     };
   }
@@ -745,12 +750,17 @@ export class Model {
     }
   }
 
-  /** positive conjunctive lits → atom extractors (for heuristics); other parts skipped (optimistic) */
-  private collectAtomFns(formula: Formula, vars: Map<string, number>, context: string): ((b: Bindings) => Atom)[] {
+  /** positive conjunctive lits → atom extractors (for heuristics); other parts skipped (optimistic).
+   *  With includeHints, descends into external/opaque `relax` over-approximations. */
+  private collectAtomFns(formula: Formula, vars: Map<string, number>, context: string, includeHints: boolean): ((b: Bindings) => Atom)[] {
     const out: ((b: Bindings) => Atom)[] = [];
     const walk = (f: Formula): void => {
       if (f.f === "and") {
         f.parts.forEach(walk);
+        return;
+      }
+      if (includeHints && (f.f === "external" || f.f === "opaque")) {
+        if (f.relax) walk(f.relax); // fold the sound necessary condition into h
         return;
       }
       if (f.f !== "lit") return;
@@ -1173,7 +1183,10 @@ export class Model {
       return id;
     };
     for (const g of this.groundOps) {
-      g.preIds = Int32Array.from(g.preAtoms, intern);
+      // the relaxation sees real precondition lits *plus* any `relax`
+      // over-approximation atoms (preAtoms — used for search — stay real-only)
+      const relaxPre = g.op.pre ? g.op.pre.relaxAtoms(g.b) : [];
+      g.preIds = Int32Array.from(relaxPre, intern);
       g.addIds = Int32Array.from(g.addAtoms, intern);
     }
     this.relaxAtomCount = slots.length;

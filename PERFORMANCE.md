@@ -160,6 +160,15 @@ Profiling sorts the scenarios into three regimes, each with a different next mov
 
 ## Remaining opportunities (ranked)
 
+### Landed since: symbolic relaxation hints
+
+External/opaque predicates were invisible to the heuristic. A predicate can now
+carry a `relax` over-approximation — a T1 necessary condition the relaxation
+folds in (feeds the heuristic only; search applicability is untouched, so a hint
+can't make search incorrect, and a *sound* hint keeps `hmax` admissible). On an
+opaque-gated benchmark this cut expansions **14376 → 23 at K=6** (and Hanoi-class
+predicate domains can hint `canMoveTo`). See `tests/hints.ts`, GUIDE §22.
+
 ### A. Help most scenarios more
 
 1. **Incremental / landmark heuristic** — the real ceiling for the *slowest*
