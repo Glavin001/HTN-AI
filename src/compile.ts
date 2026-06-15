@@ -93,6 +93,10 @@ export interface CompiledFormula {
   /** like `atoms`, but also folds in external/opaque `relax` over-approximations —
    *  used only by the relaxation heuristic, never for search applicability */
   relaxAtoms: (b: Bindings) => Atom[];
+  /** true when `atoms` fully captures the formula (a conjunction of encodable,
+   *  non-axiom positive lits) — so an atom-level check is the whole precondition
+   *  and the compiled closure can be skipped once the atoms hold */
+  atomsComplete: boolean;
   ir: Formula;
 }
 
@@ -644,8 +648,24 @@ export class Model {
       readsClock: readsClock.v,
       atoms: (b: Bindings) => atomFns.map((f) => f(b)),
       relaxAtoms: (b: Bindings) => relaxAtomFns.map((f) => f(b)),
+      atomsComplete: this.formulaAtomsComplete(formula, vars, context),
       ir: formula,
     };
+  }
+
+  /** Does `atoms()` fully capture this formula? True iff it's a conjunction of
+   *  encodable, non-axiom positive lits (no not/or/cmp/external/opaque/axiom). */
+  private formulaAtomsComplete(f: Formula, vars: Map<string, number>, context: string): boolean {
+    if (f.f === "and") return f.parts.every((p) => this.formulaAtomsComplete(p, vars, context));
+    if (f.f !== "lit" || this.axioms.has(f.fluent)) return false;
+    const cf = this.fluentByName.get(f.fluent);
+    if (!cf) return false;
+    try {
+      this.encodeLitValue(cf, f.value, vars, context); // must be representable as an atom
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   private buildFormula(

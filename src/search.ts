@@ -730,7 +730,9 @@ export class Engine {
           }
         }
         if (!preOk) continue;
-        if (g.op.pre && !g.op.pre.fn(node.state, g.b)) continue;
+        // when the atoms ARE the whole precondition, the fast-reject above already
+        // proved applicability — skip the compiled closure entirely
+        if (g.op.pre && !g.op.pre.atomsComplete && !g.op.pre.fn(node.state, g.b)) continue;
         const child = node.state.child();
         g.op.effects.apply(child, g.b, TIMINGS_PLANNING);
         const dur = g.op.duration.fn(node.state, g.b);
