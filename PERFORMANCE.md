@@ -6,23 +6,39 @@
 
 ## TL;DR
 
-The planner was **~10–20× slower than it needed to be**, dominated by the
-delete-relaxation heuristic and by re-doing per-node work the compiler could
-do once. A stack of semantics-preserving optimizations (all **80 tests pass
-unchanged**, expansion counts identical) brought:
+The planner was **~10–80× slower than it needed to be**, dominated by the
+delete-relaxation heuristic, by re-doing per-node work the compiler could do
+once, and by grounding/searching operators that can never apply. A stack of
+semantics-preserving optimizations (all tests pass unchanged, **expansion counts
+identical**) brought:
 
 | Workload | baseline | now | speedup |
 |---|--:|--:|--:|
-| quarry (hmax, w=1, optimal GOAP) | 176.3 ms | **14.1 ms** | **12.5×** |
-| quarry (hadd, w=2, greedy) | 178.9 ms | **13.2 ms** | 13.6× |
-| scavenger (hmax, w=1) | 14.1 ms | **1.55 ms** | 9.1× |
-| staircase (hmax, w=1) | 0.78 ms | **0.21 ms** | 3.7× |
-| blocks reverse-6 (w=1) | 4.14 ms | **0.20 ms** | **20.3×** |
-| blocks reverse-5 (w=1) | 1.87 ms | **0.18 ms** | 10.2× |
-| hanoi-5 (w=1) | 6.72 ms | **2.42 ms** | 2.8× |
+| quarry (hmax, w=1, optimal GOAP) | 176.3 ms | **~11 ms** | **~16×** |
+| scavenger (hmax, w=1) | 14.1 ms | **1.34 ms** | 10.5× |
+| blocks reverse-6 (w=1) | 4.14 ms | **0.24 ms** | **17×** |
+| hanoi-5 (w=1) | 6.72 ms | **2.4 ms** | 2.8× |
+| nav grid K=12 (relational) | 168.9 ms | **4.4 ms** | **38×** |
+| Scavenger XL (4×3, pushed) | 448 ms | **22 ms** | **20×** |
+| Scavenger HUGE (6×4, pushed) | 6150 ms | **78 ms** | **79×** |
 
-**Per-node cost on quarry: 116 µs → 9.2 µs (12.6×).** The uvu suite went
-707 ms → ~145 ms. (Node 22, single machine; ratios are stable, absolute ms vary.)
+**Per-node cost on quarry: 116 µs → ~8 µs.** The uvu suite went 707 ms → ~150 ms
+(now 84 tests incl. Scavenger XL). The biggest single wins: the allocation-free
+interned heuristic (≈4–9×), and **static-fluent pruning** (nav 38×, HUGE another
+4×). (Node 22, single machine; ratios stable, absolute ms vary ±10%.)
+
+### Optimizations landed (each preserves the search exactly)
+
+1. Allocation-free relaxation heuristic via compile-time interned atom ids
+2. Indexed successor generation (most-selective precondition atom)
+3. Adaptive copy-on-write state collapse (≈ slotCount/32)
+4. Flat-buffer heuristic reads (`materializeInto`)
+5. Grounding-time slot specialization (no per-eval lookups/allocs)
+6. Reusable `ExtQuery` for external/opaque predicate evaluation
+7. Arg-only external folding (empty read set ⇒ prune at grounding)
+8. Symbolic relaxation hints (`relax` over-approximations)
+9. **Static-fluent pruning** (`static: true` ⇒ drop dead groundings)
+10. Pure-atom precondition skip; heap/`freeBindings`/sort allocation cleanups
 
 ## How this was measured
 
