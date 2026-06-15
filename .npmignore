@@ -1,4 +1,7 @@
 .git*
 coverage/*
 tests/*
+scenarios/*
+examples/*
 .eslint*
+PLAN-*.md

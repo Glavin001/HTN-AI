@@ -19,7 +19,7 @@
   "unpkg": "./dist/index.global.js",
   "scripts": {
     "build": "tsup",
-    "lint": "eslint src tests --max-warnings=0",
+    "lint": "eslint src tests scenarios --max-warnings=0",
     "typecheck": "tsc --noEmit --project tsconfig.tests.json",
     "prepublishOnly": "npm run typecheck",
     "test": "tsx --tsconfig tsconfig.tests.json node_modules/uvu/bin.js tests",

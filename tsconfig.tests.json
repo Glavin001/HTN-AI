@@ -6,6 +6,6 @@
     "esModuleInterop": true,
     "rootDir": "."
   },
-  "include": ["tests/**/*.ts", "src/**/*.ts", "tsup.config.ts"],
+  "include": ["tests/**/*.ts", "src/**/*.ts", "scenarios/**/*.ts", "tsup.config.ts"],
   "exclude": []
 }
