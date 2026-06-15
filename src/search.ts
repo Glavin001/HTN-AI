@@ -194,75 +194,126 @@ class Heap {
   }
 }
 
-// ---------------------------------------------------------------- h_add relaxation heuristic
+// ---------------------------------------------------------------- h_add / h_max relaxation heuristic
 
-function atomKey(a: Atom): string {
-  return `${a.slot}:${a.value}`;
+/** A goal atom resolved against the model's interned relaxation atoms. */
+interface GoalAtomDesc {
+  /** interned relaxation-atom id, or -1 if no ground operator references this atom */
+  id: number;
+  slot: number;
+  value: number;
+  fuzzy: boolean;
+}
+
+/** Resolve goal atoms to interned descriptors once (cold path, per goal search). */
+function goalDescs(model: Model, goalAtoms: Atom[]): GoalAtomDesc[] {
+  const out: GoalAtomDesc[] = new Array(goalAtoms.length);
+  for (let i = 0; i < goalAtoms.length; i++) {
+    const a = goalAtoms[i];
+    const owner = model.slotOwner[a.slot];
+    out[i] = {
+      id: model.relaxAtomId(a.slot, a.value),
+      slot: a.slot,
+      value: a.value,
+      fuzzy: owner >= 0 && model.relaxFuzzyWrites.has(owner),
+    };
+  }
+  return out;
 }
 
 /**
- * Delete-relaxation heuristic over ground operators (unit action costs).
- * mode "add": h_add — informative but may overestimate (inadmissible).
- * mode "max": h_max — admissible; pair with weight 1 for optimal plans.
- * Numeric/external/negative conditions are treated optimistically.
+ * Delete-relaxation heuristic over ground operators (unit action costs), computed
+ * over compile-time interned atom ids into a reusable numeric cost buffer — no
+ * per-atom string keys or maps on the hot path.
+ *
+ *   add=true  → h_add (informative, may overestimate / inadmissible)
+ *   add=false → h_max (admissible; pair with weight 1 for optimal plans)
+ *
+ * Numeric/external/negative conditions are treated optimistically: a "fuzzy"
+ * atom (written non-atomically by some operator) can take any value at cost 1 and
+ * is never called unreachable. Semantics match the original Map-based version.
  */
-export function hAdd(model: Model, s: Snap, goalAtoms: Atom[], mode: "add" | "max" = "add"): number {
-  if (goalAtoms.length === 0) return 0;
-  const cost = new Map<string, number>();
-  let missing = 0;
-  for (const a of goalAtoms) {
-    if (s.get(a.slot) === a.value) cost.set(atomKey(a), 0);
-    else missing++;
+function relaxCore(model: Model, s: Snap, cost: Float64Array, goals: GoalAtomDesc[], add: boolean): number {
+  const n = model.relaxAtomCount;
+  const slot = model.relaxAtomSlot;
+  const val = model.relaxAtomValue;
+  const fuzzy = model.relaxAtomFuzzy;
+
+  // seed: an atom that currently holds costs 0, everything else starts unreachable
+  for (let id = 0; id < n; id++) cost[id] = s.get(slot[id]) === val[id] ? 0 : Infinity;
+
+  // already satisfied? (mirrors the original missing===0 early-out)
+  let allHold = true;
+  for (let i = 0; i < goals.length; i++) {
+    const g = goals[i];
+    if (!(g.id >= 0 ? cost[g.id] === 0 : s.get(g.slot) === g.value)) {
+      allHold = false;
+      break;
+    }
   }
-  if (missing === 0) return 0;
+  if (allHold) return 0;
 
-  // fluents written non-atomically (NumExpr/inc/dec/external effects) can take
-  // any value under the relaxation — never call their atoms unreachable
-  const fuzzy = (a: Atom): boolean => model.relaxFuzzyWrites.has(model.slotOwner[a.slot]);
-
-  const atomCost = (a: Atom): number => {
-    if (s.get(a.slot) === a.value) return 0;
-    const c = cost.get(atomKey(a));
-    if (c !== undefined) return c;
-    return fuzzy(a) ? 1 : Infinity;
-  };
-
+  // relaxed fixpoint: an op fires once all its preconditions are reachable,
+  // lifting its add atoms to (combined precondition cost) + 1
+  const ops = model.groundOps;
   let changed = true;
   let rounds = 0;
   while (changed && rounds < 64) {
     changed = false;
     rounds++;
-    for (const g of model.groundOps) {
-      if (g.addAtoms.length === 0) continue;
+    for (let oi = 0; oi < ops.length; oi++) {
+      const addIds = ops[oi].addIds as Int32Array;
+      if (addIds.length === 0) continue;
+      const preIds = ops[oi].preIds as Int32Array;
       let pc = 0;
-      for (const p of g.preAtoms) {
-        const c = atomCost(p);
+      let inf = false;
+      for (let i = 0; i < preIds.length; i++) {
+        const pid = preIds[i];
+        let c = cost[pid];
+        if (c === Infinity) c = fuzzy[pid] ? 1 : Infinity;
         if (c === Infinity) {
-          pc = Infinity;
+          inf = true;
           break;
         }
-        pc = mode === "add" ? pc + c : Math.max(pc, c);
+        pc = add ? pc + c : c > pc ? c : pc;
       }
-      if (pc === Infinity) continue;
+      if (inf) continue;
       const through = pc + 1;
-      for (const add of g.addAtoms) {
-        const k = atomKey(add);
-        const prev = cost.get(k);
-        if (prev === undefined || through < prev) {
-          cost.set(k, through);
+      for (let i = 0; i < addIds.length; i++) {
+        const aid = addIds[i];
+        if (through < cost[aid]) {
+          cost[aid] = through;
           changed = true;
         }
       }
     }
   }
 
+  // combine the (effective) cost of each goal atom
   let h = 0;
-  for (const a of goalAtoms) {
-    const c = atomCost(a);
+  for (let i = 0; i < goals.length; i++) {
+    const g = goals[i];
+    let c: number;
+    if (g.id >= 0) {
+      c = cost[g.id];
+      if (c === Infinity) c = g.fuzzy ? 1 : Infinity;
+    } else {
+      c = s.get(g.slot) === g.value ? 0 : g.fuzzy ? 1 : Infinity;
+    }
     if (c === Infinity) return Infinity;
-    h = mode === "add" ? h + c : Math.max(h, c);
+    h = add ? h + c : c > h ? c : h;
   }
   return h;
+}
+
+/**
+ * Public delete-relaxation heuristic (SPEC §7.3). Builds goal descriptors and a
+ * scratch buffer per call; the Engine uses a faster path that reuses both.
+ */
+export function hAdd(model: Model, s: Snap, goalAtoms: Atom[], mode: "add" | "max" = "add"): number {
+  if (goalAtoms.length === 0) return 0;
+  const cost = new Float64Array(model.relaxAtomCount);
+  return relaxCore(model, s, cost, goalDescs(model, goalAtoms), mode === "add");
 }
 
 // ---------------------------------------------------------------- engine
@@ -291,6 +342,8 @@ export class Engine {
   private scopeIds = 0;
   private readonly pathKeys = new Set<string>();
   private readonly hCache = new Map<number, number>();
+  /** reusable relaxation cost buffer (sized to model.relaxAtomCount) */
+  private costBuf: Float64Array | null = null;
 
   constructor(model: Model, req: PlanRequest) {
     this.model = model;
@@ -591,10 +644,11 @@ export class Engine {
     const weight = this.req.weight;
     const open = new Heap();
     const closed = new Map<number, number>();
-    const seenPairs = new Set<string>();
+    const seenAtoms = new Set<number>();
+    const descs = goalDescs(model, item.atoms);
     let seq = 0;
 
-    const h0 = this.heuristic(start, item.atoms);
+    const h0 = this.heuristic(start, descs);
     if (h0 === Infinity && item.atoms.length > 0) {
       this.reject(item.label, "goal unreachable under relaxation");
       return null;
@@ -637,14 +691,15 @@ export class Engine {
         const known = closed.get(key);
         if (known !== undefined && known <= g2) continue;
         closed.set(key, g2);
-        const h = this.heuristic(child, item.atoms);
+        const h = this.heuristic(child, descs);
         if (h === Infinity) continue;
         let novelty = 1;
         if (this.req.novelty) {
-          for (const a of g.addAtoms) {
-            const k = atomKey(a);
-            if (!seenPairs.has(k)) {
-              seenPairs.add(k);
+          const addIds = g.addIds as Int32Array;
+          for (let i = 0; i < addIds.length; i++) {
+            const aid = addIds[i];
+            if (!seenAtoms.has(aid)) {
+              seenAtoms.add(aid);
               novelty = 0;
             }
           }
@@ -664,13 +719,15 @@ export class Engine {
     return true;
   }
 
-  private heuristic(state: StateView, goalAtoms: Atom[]): number {
-    if (goalAtoms.length === 0 || this.req.heuristic === "none") return 0;
+  private heuristic(state: StateView, descs: GoalAtomDesc[]): number {
+    if (descs.length === 0 || this.req.heuristic === "none") return 0;
     const key = state.key();
     const cached = this.hCache.get(key);
     if (cached !== undefined) return cached;
     this.heuristicEvals++;
-    const h = hAdd(this.model, state, goalAtoms, this.req.heuristic === "hmax" ? "max" : "add");
+    const n = this.model.relaxAtomCount;
+    if (!this.costBuf || this.costBuf.length !== n) this.costBuf = new Float64Array(n);
+    const h = relaxCore(this.model, state, this.costBuf, descs, this.req.heuristic !== "hmax");
     this.hCache.set(key, h);
     return h;
   }

@@ -137,6 +137,10 @@ export interface GroundOp {
   b: Bindings;
   preAtoms: Atom[];
   addAtoms: Atom[];
+  /** compile-time interned relaxation-atom ids (parallel to pre/addAtoms); drive
+   *  the allocation-free h_add/h_max core. Filled by Model.buildRelaxTables(). */
+  preIds?: Int32Array;
+  addIds?: Int32Array;
 }
 
 export interface CompiledScopeTmpl {
@@ -227,6 +231,16 @@ export class Model {
   public groundOps: GroundOp[] = [];
   /** fluents any operator writes non-atomically — relaxation treats them as optimistically settable */
   public readonly relaxFuzzyWrites = new Set<number>();
+
+  // ---- relaxation heuristic tables: distinct (slot,value) atoms interned to
+  //      dense ids at compile time so h_add/h_max runs over typed arrays with no
+  //      per-atom string keys or maps on the hot path (see search.ts/relaxCore).
+  /** number of distinct atoms appearing in any ground op's pre/add sets */
+  public relaxAtomCount = 0;
+  public relaxAtomSlot: Int32Array = new Int32Array(0);
+  public relaxAtomValue: Float64Array = new Float64Array(0);
+  public relaxAtomFuzzy: Uint8Array = new Uint8Array(0);
+  private readonly relaxAtomIndex = new Map<string, number>();
 
   public slotCount = 1; // slot 0 = clock
   public slotOwner!: Int32Array;
@@ -957,6 +971,44 @@ export class Model {
         });
       }
     }
+    this.buildRelaxTables();
+  }
+
+  /** Intern every distinct (slot,value) atom over the ground operators and emit
+   *  the typed-array tables + per-op id arrays the relaxation heuristic runs on. */
+  private buildRelaxTables(): void {
+    const slots: number[] = [];
+    const values: number[] = [];
+    const index = this.relaxAtomIndex;
+    const intern = (a: Atom): number => {
+      const key = `${a.slot}:${a.value}`;
+      let id = index.get(key);
+      if (id === undefined) {
+        id = slots.length;
+        index.set(key, id);
+        slots.push(a.slot);
+        values.push(a.value);
+      }
+      return id;
+    };
+    for (const g of this.groundOps) {
+      g.preIds = Int32Array.from(g.preAtoms, intern);
+      g.addIds = Int32Array.from(g.addAtoms, intern);
+    }
+    this.relaxAtomCount = slots.length;
+    this.relaxAtomSlot = Int32Array.from(slots);
+    this.relaxAtomValue = Float64Array.from(values);
+    this.relaxAtomFuzzy = new Uint8Array(this.relaxAtomCount);
+    for (let id = 0; id < this.relaxAtomCount; id++) {
+      const owner = this.slotOwner[slots[id]];
+      this.relaxAtomFuzzy[id] = owner >= 0 && this.relaxFuzzyWrites.has(owner) ? 1 : 0;
+    }
+  }
+
+  /** interned relaxation-atom id for (slot,value), or -1 if no ground op references it */
+  relaxAtomId(slot: number, value: number): number {
+    const id = this.relaxAtomIndex.get(`${slot}:${value}`);
+    return id === undefined ? -1 : id;
   }
 
   /** Enumerate bindings for a method's free parameters. */
