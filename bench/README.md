@@ -1,25 +1,42 @@
 # Benchmarks
 
-Micro-benchmarks for the planning core. Run with:
-
 ```bash
-npm run bench
+npm run bench          # representative set, robust stats
+npm run bench:scale    # scaling sweeps across axes
+# lowest noise: prefix either with NODE_OPTIONS=--expose-gc
 ```
 
-- `bench.ts` — wall-clock + engine counters (decompositions / expansions /
-  heuristicEvals) across the heaviest GOAP/HTN workloads, including
-  scalable blocks-world and Towers-of-Hanoi instances. The
-  `ms/iter ÷ expansions` ratio is the headline number: it is the *per-node*
-  cost, which is what determines whether a domain fits a frame budget.
-- `profile.ts` — focused driver for the quarry search, for use under a CPU
-  profiler:
+## Methodology (signal over noise)
 
-  ```bash
-  NODE_OPTIONS="--cpu-prof --cpu-prof-dir=/tmp/prof --cpu-prof-interval=200" \
-    ITERS=300 npx tsx --tsconfig tsconfig.tests.json bench/profile.ts
-  ```
+`measure()` in `workloads.ts`:
 
-  (tsx runs the workload in a worker thread, so pick the largest
-  `.cpuprofile` — the others are the loader/main process.)
+- **warms up** so the JIT has settled before timing;
+- **auto-calibrates** the inner loop so each timed trial runs ≳ `targetMs`
+  (timer resolution & per-batch overhead become negligible);
+- runs **several independent trials** and reports the **min ms/iter** as the
+  headline — all interference (GC, scheduler preemption, CPU-freq dips) only
+  *adds* time, so the minimum is the sample least contaminated by it;
+- also prints **median** and **spread% = (median−min)/min** so the noise is
+  visible rather than hidden (tiny sub-0.1 ms workloads show large spread —
+  trust the min);
+- calls `global.gc()` between trials when run with `--expose-gc`, so GC pauses
+  fall outside the timed window.
 
-See [`../PERFORMANCE.md`](../PERFORMANCE.md) for the analysis these drive.
+The number that matters for a frame budget is **µs/node = min ÷ expansions** —
+per-node cost, independent of problem size.
+
+## Files
+
+- `workloads.ts` — shared, parametric workload builders + `measure()`.
+- `bench.ts` — representative set with min/median/spread/µs-node columns.
+- `scale.ts` — sweeps each workload along one axis (`×prev` = growth factor of
+  min-ms vs the previous size, so super-linear scaling is obvious):
+  - **hanoi disks** — exponential search depth + external predicate per node
+  - **blocks** — grounding O(n³) + state size, shallow search
+  - **nav grid** — relational adjacency: candidates/node grow with cells
+  - **htn tour** — HTN decomposition width (free-variable binding)
+  - **scheduler** — multi-agent round-robin
+  - **weight** — heuristic informativeness → expansions (fixed problem)
+- `profile.ts` — single-scenario driver for `--cpu-prof` (set `SCEN`, `ITERS`).
+
+See [`../PERFORMANCE.md`](../PERFORMANCE.md) for the analysis.

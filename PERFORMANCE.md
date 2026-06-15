@@ -26,13 +26,31 @@ unchanged**, expansion counts identical) brought:
 
 ## How this was measured
 
-- `npm run bench` — wall-clock per solve **plus engine counters** (`decompositions`
-  / `expansions` / `heuristicEvals`). The decisive metric is **ms ÷ expansions =
-  per-node cost**: a "real-time, frame-budget" planner lives or dies on it.
+- `npm run bench` — robust stats: warm up, auto-calibrate the inner loop, run
+  several trials and report the **min** ms/iter (least contaminated by
+  GC/scheduler/CPU-freq noise), plus median and **spread%** so the noise is
+  visible, and **µs/node = min ÷ expansions** (size-normalized cost — what a
+  frame budget cares about). `--expose-gc` collects between trials for less
+  noise. *(Earlier single-batch means undersold the noise; medians ran ~40%
+  above the min on the heavier GOAP solves.)*
+- `npm run bench:scale` — sweeps each workload along one axis (hanoi disks,
+  blocks count, nav-grid size, HTN width, agent count, search weight) so
+  super-linear scaling is visible (`×prev` growth factor per step).
 - `bench/profile.ts` under V8 `--cpu-prof`, parsed for self-time per function.
-- Scalable instances (blocks reverse-a-tower N=4/5/6, Hanoi 3/4/5) to watch cost
-  grow with the ground-operator count, and HTN-decomposition + multi-agent
-  `Scheduler` workloads so the non-GOAP paths are covered too.
+
+### Scaling findings (`bench:scale`)
+
+| Axis | What scales | Observed |
+|---|---|---|
+| Hanoi disks 3→8 | exponential search | expansions ×~4/disk, **µs/node ~flat (7→15)** ✓ |
+| Blocks 4→12 | grounding O(n³) | search trivial, but **µs/node 10→239** — heuristic sweeps all ground ops |
+| **Nav grid K 4→12** | relational adjacency | **µs/node 18→7342 (~O(K⁴))** — successor generation can't index `adj(from,to)`; gathers all `K²` moves/node |
+| HTN tour 8→128 | decomposition width | ~linear ✓ |
+| Scheduler 1→32 | multi-agent | ~linear ✓ |
+
+Two clear next targets fall out: a **join/match-tree successor generator** for
+relational preconditions (nav is O(K⁴) today), and **relevance-pruning the
+heuristic** so it doesn't sweep every ground op when grounding is large (blocks).
 
 ## Baseline: where the time went
 

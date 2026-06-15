@@ -24,6 +24,7 @@
     "prepublishOnly": "npm run typecheck",
     "test": "tsx --tsconfig tsconfig.tests.json node_modules/uvu/bin.js tests",
     "bench": "tsx --tsconfig tsconfig.tests.json bench/bench.ts",
+    "bench:scale": "tsx --tsconfig tsconfig.tests.json bench/scale.ts",
     "test:coverage": "c8 --check-coverage --lines 92 --branches 82 --reporter=html --reporter=text tsx --tsconfig tsconfig.tests.json node_modules/uvu/bin.js tests",
     "test:report": "c8 report --reporter=text-lcov > coverage/tests.lcov",
     "test:watch": "chokidar \"**/*.ts\" -c \"npm test\""
