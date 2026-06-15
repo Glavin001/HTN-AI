@@ -1,9 +1,15 @@
 # Plan: Web App Preview + 3D Block-Stacking Battle-Test
 
-> Status: **Proposal for review.** Produced from analysis of this repo (htn-ai v2) and the
-> external [`Glavin001/vibe-city`](https://github.com/Glavin001/vibe-city) repo on both `main`
-> and `feat/htn-block-stacking`. Covers tasks 3–4: *what scenarios to add to core tests* and
-> *what the web app should look like*. Nothing here is built yet; this is the design + phasing.
+> Status: **Implemented on this branch.** Produced from analysis of this repo (htn-ai v2) and
+> the external [`Glavin001/vibe-city`](https://github.com/Glavin001/vibe-city) repo on both
+> `main` and `feat/htn-block-stacking`. Covers tasks 3–4: *what scenarios to add to core tests*
+> and *what the web app should look like*.
+>
+> **Shipped:** `scenarios/` (shared blocks + staircase domains), Tier A tests (`tests/blocks.ts`)
+> and Tier B tests (`tests/spatial.ts`) — suite now 67 tests — and the web preview
+> (`examples/web/`, Next.js static export + react-three-fiber). The block-stacking **goal was
+> refined to be a pure 3D position** (see §2 Tier B): the planner must *discover* it has to build
+> a staircase; the goal never prescribes block placement or any structure.
 
 ## 0. TL;DR
 
@@ -146,7 +152,13 @@ discovered by the planner*, not scripted. This is the scenario the web app rende
 - Keep the first instance small (≈5×5, 3–4 stair steps, 2–3 supply crates) with a known optimal
   step/cost count for assertions; scale up as a perf/anytime case.
 
-**Goal:** conjunction `height(step_i)=target_i ∀i  ∧  agentAt(goalTop) ∧ agentLevel=GOAL_HEIGHT`.
+**Goal (position-only — the planner discovers the "how"):** the goal is purely a **3D position** —
+`agentAt = targetCell ∧ agentY = TARGET_Y` (be at the target's x,z, up in the air at elevation
+TARGET_Y). It deliberately does **not** mention block placement or any column height. Because the
+only way to raise `agentY` is to stand on a column, and the only way to build higher is to first
+stand higher, the staircase + its build order *emerge from search*. (The shipped domain expresses
+the climb/place constraints as operator preconditions over `height`; reachability is local
+adjacency + a one-level climb limit rather than a transitive-path axiom, which keeps it tractable.)
 
 ### Where the code lives
 - Battle-tests: new `tests/blocks.ts` (Tier A) and `tests/spatial.ts` (Tier B), `uvu`-style,
