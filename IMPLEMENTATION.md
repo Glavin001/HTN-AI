@@ -1,6 +1,6 @@
 # Implementation status vs. SPEC.md
 
-**As of v2.0.0-alpha.0.** Everything listed as *implemented* is covered by the test suite (`npm test`, **57 tests across 9 files; 95.9% line / 87.9% branch coverage**, gated in `npm run test:coverage`). Deferred items note where the architecture already prepares for them.
+**As of v2.0.0-alpha.0.** Everything listed as *implemented* is covered by the test suite (`npm test`, **64 tests across 12 files; 96% line / 88% branch coverage**, gated in `npm run test:coverage`). Deferred items note where the architecture already prepares for them.
 
 ## Test inventory & evaluation methodology
 
@@ -15,6 +15,11 @@
 | `tests/puzzles.ts` | ground truth | water jug (6), blocks world (3), river crossing (7, safety via maintain-in-search), sokoban corridor (exact plan), Tower of Hanoi (7, T2 movability), Bridge & Torch (cost-optimal 15) |
 | `tests/ipc.ts` | research canon | IPC staples hand-encoded with known optima: **Gripper** (11, h_max-admissible mode), **Logistics** (6, type hierarchy + entity-valued NumExpr effects), **Satellite** (5, HTN method with search-bound calibration target), **Transport** (HTN-IPC TO domain, achieve+operator methods, 6) |
 | `tests/scenario.ts` | scenario ports | v1 intents: bunker raid chains, dynamic-cost vehicle choice; fps-lite utility switching; nested scopes (deadline ⊃ maintain) planned + executed |
+| `tests/classics.ts` | search scenarios | remaining PR #14 puzzles as real planning: **word ladder** (dictionary graph search, 3 steps), **crafting** (numeric resource production, optimal 7), **treasure hunt** (clue-gated navigation) |
+| `tests/csp.ts` | constraint search | PR #14 constraint puzzles as backtracking search with first-unfilled ordering + forward checks: **sudoku 4×4** (verified valid completion), **logic grid** (unique seating from relational clues), **crossword** (intersecting slots with letter agreement) |
+| `tests/scheduling.ts` | temporal scenario | PR #14 **scheduling**: sequence jobs on one machine meeting per-job deadlines + precedence, with projected-clock pruning of infeasible orderings (and an infeasibility proof) |
+
+**On the PR #14 puzzle canon:** all 15 titles were reviewed; the ones that are genuine action-planning or constraint problems are now solved *by the planner* (blocks world, sokoban, river crossing, Tower of Hanoi, water jug, bridge & torch in `puzzles.ts`; word ladder, crafting, treasure hunt in `classics.ts`; sudoku, logic grid, crossword in `csp.ts`; scheduling in `scheduling.ts`). Two are deliberately omitted because they are not planning problems the engine should solve: **bridge-math** (an arithmetic word problem, no action structure) and **full scrambled Rubik's cube** (search-infeasible without pattern-database heuristics — a 2–3 move scramble is blind-solvable but would add large, brittle sticker-permutation encoding for coverage that sudoku already provides).
 
 **How the field evaluates (and how we map to it):** the IPC scores *coverage* (problems solved within a time limit), *plan quality* (cost ratio vs best known; optimal track requires proofs), and *agility* (time-to-first-plan); papers additionally report node expansions. Until the M4 harness imports real HDDL/PDDL suites and runs reference planners (pandaPIengine, Fast Downward, pyperplan), this suite pins the same properties at small scale: exact known optima (quality/optimality, using `heuristic: "hmax"` + `weight: 1` where admissibility is required), `PlanResult.stats` (expansions/decompositions/heuristic evals), budget-slicing tests (agility), and determinism hashes.
 
