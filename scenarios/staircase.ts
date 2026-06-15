@@ -372,3 +372,55 @@ export function scavengerInstance(): StaircaseInstance {
 export function scavengerGoal(): import("../src/index").Formula {
   return F.and(F.lit("agentAt", [], "goal"), F.eq(N.fl("agentY"), N.c(SCAVENGER_GOAL_HEIGHT)));
 }
+
+export const SCAVENGER_BIG_GOAL_HEIGHT = 3;
+
+/**
+ * A bigger, harder scavenger puzzle: a 4×3 grid, a height-3 goal (a real 3-level
+ * climb), and seven blocks scattered as five loose blocks + one 2-pillar. The
+ * goal needs six blocks, so the pillar must be harvested, and the planner makes
+ * richer decisions — it uses existing loose blocks as stepping stones to reach
+ * the pillar's top and as platforms to stack the goal. Solved with a greedier
+ * weight (hadd, weight≈5) in ~0.5s; see tests/spatial.ts and the web preview.
+ *
+ *      z=2  L4(1) - L5(1)
+ *      z=1  L1(1) - tower(2) - L2(1) - L3(1)
+ *      z=0  start -    A     -   B    -  goal
+ */
+export function scavengerBigInstance(): StaircaseInstance {
+  return {
+    cells: [
+      { name: "start", x: 0, z: 0 },
+      { name: "A", x: 1, z: 0 },
+      { name: "B", x: 2, z: 0 },
+      { name: "goal", x: 3, z: 0 },
+      { name: "L1", x: 0, z: 1, height: 1 },
+      { name: "tower", x: 1, z: 1, height: 2 },
+      { name: "L2", x: 2, z: 1, height: 1 },
+      { name: "L3", x: 3, z: 1, height: 1 },
+      { name: "L4", x: 0, z: 2, height: 1 },
+      { name: "L5", x: 1, z: 2, height: 1 },
+    ],
+    edges: [
+      ["start", "A"],
+      ["A", "B"],
+      ["B", "goal"],
+      ["start", "L1"],
+      ["A", "tower"],
+      ["B", "L2"],
+      ["goal", "L3"],
+      ["L1", "tower"],
+      ["tower", "L2"],
+      ["L2", "L3"],
+      ["L1", "L4"],
+      ["tower", "L5"],
+      ["L4", "L5"],
+    ],
+    start: "start",
+  };
+}
+
+/** Big scavenger goal: stand atop `goal` at elevation 3. */
+export function scavengerBigGoal(): import("../src/index").Formula {
+  return F.and(F.lit("agentAt", [], "goal"), F.eq(N.fl("agentY"), N.c(SCAVENGER_BIG_GOAL_HEIGHT)));
+}

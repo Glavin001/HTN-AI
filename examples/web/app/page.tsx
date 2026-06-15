@@ -7,7 +7,7 @@ import { runBlocks, type BlocksRun } from "../lib/runBlocks";
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
 
-type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "blocks";
+type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "blocks";
 
 type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun };
 
@@ -31,6 +31,11 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string }> = {
     name: "Scavenger (collect & harvest)",
     blurb:
       "Blocks lie scattered on the ground — no depots. You can only take the TOP of a stack, and only if you're high enough to reach it: a 2-pillar's top block is out of reach from the ground. So the planner grabs a loose block, builds a step, climbs it, harvests the pillar's top, and uses the blocks to reach a position up in the air.",
+  },
+  scavengerBig: {
+    name: "Scavenger XL (taller, harder)",
+    blurb:
+      "A bigger 4×3 grid with a taller height-3 goal and seven blocks scattered around (five loose + a 2-pillar). Loose blocks alone aren't enough, so the planner must harvest the pillar — cleverly standing on loose blocks as stepping stones to reach its top — and stack a 3-level structure to climb up.",
   },
   blocks: {
     name: "Blocks World (Sussman)",

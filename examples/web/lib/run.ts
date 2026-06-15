@@ -14,7 +14,10 @@ import {
   ledgeInstance,
   quarryGoal,
   quarryInstance,
+  SCAVENGER_BIG_GOAL_HEIGHT,
   SCAVENGER_GOAL_HEIGHT,
+  scavengerBigGoal,
+  scavengerBigInstance,
   scavengerGoal,
   scavengerInstance,
   scavengerModel,
@@ -25,7 +28,7 @@ import {
 } from "@scenarios/staircase";
 import type { Model } from "htn-ai";
 
-export type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger";
+export type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig";
 
 export interface Frame {
   /** column heights per cell */
@@ -55,6 +58,8 @@ interface ScenarioCfg {
   goal: () => ReturnType<typeof staircaseGoal>;
   model: (inst: StaircaseInstance) => Model;
   target: { cell: string; y: number };
+  /** weighted-A* weight; higher = greedier/faster search for larger instances */
+  weight?: number;
 }
 
 const SCENARIOS: Record<ScenarioId, ScenarioCfg> = {
@@ -62,6 +67,7 @@ const SCENARIOS: Record<ScenarioId, ScenarioCfg> = {
   ledge: { instance: () => ledgeInstance(1), goal: ledgeGoal, model: staircaseModel, target: { cell: "ledge", y: 2 } },
   quarry: { instance: quarryInstance, goal: quarryGoal, model: staircaseModel, target: { cell: "pillar", y: QUARRY_GOAL_HEIGHT } },
   scavenger: { instance: scavengerInstance, goal: scavengerGoal, model: scavengerModel, target: { cell: "goal", y: SCAVENGER_GOAL_HEIGHT } },
+  scavengerBig: { instance: scavengerBigInstance, goal: scavengerBigGoal, model: scavengerModel, target: { cell: "goal", y: SCAVENGER_BIG_GOAL_HEIGHT }, weight: 5 },
 };
 
 export function runScenario(id: ScenarioId): RunResult {
@@ -76,6 +82,7 @@ export function runScenario(id: ScenarioId): RunResult {
     goals: [goal(cfg.goal())],
     now: () => t,
     seed: 1,
+    weight: cfg.weight,
     trace: (e) => trace.push(e),
   });
 
