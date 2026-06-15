@@ -22,6 +22,13 @@ reactive `Planner`** in the browser (the app never re-implements planning):
   planner finds the optimal route to collect from both depots and build a 3-step
   staircase (1→2→3) to climb up — solved optimally by pure GOAP (~1.5k node
   expansions; see [`../../tests/spatial.ts`](../../tests/spatial.ts)).
+- **Scavenger (collect & harvest)** — blocks lie **scattered on the ground**
+  (no depots). You can only take the **top** of a stack, and only if you're high
+  enough to reach it (`stand ≥ height−1`), so a 2-pillar's top block is out of
+  reach from the ground. From a position-only goal the planner grabs a loose
+  block, **builds a step, climbs it, harvests the pillar's top block**, and uses
+  the blocks to reach a coordinate up in the air. Placement is free — the planner
+  decides where the steps go.
 - **Blocks World (Sussman)** ([`../../scenarios/blocks.ts`](../../scenarios/blocks.ts)) —
   the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
   The naive order deadlocks, so the planner interleaves subgoals.

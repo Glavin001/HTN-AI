@@ -238,3 +238,137 @@ export function quarryInstance(): StaircaseInstance {
 export function quarryGoal(): import("../src/index").Formula {
   return F.and(F.lit("agentAt", [], "pillar"), F.eq(N.fl("agentY"), N.c(QUARRY_GOAL_HEIGHT)));
 }
+
+// ============================================================================
+// Scavenger — collect blocks scattered on the ground (no depots), top-first.
+// ============================================================================
+
+/**
+ * The Scavenger domain. Same grid world, but blocks are not drawn from depots:
+ * they lie around as column heights (a loose block = height 1, a 2-pillar =
+ * height 2, …) and the agent collects them with `grab`. Two new rules vs the
+ * staircase domain:
+ *
+ *   • Top-first: `grab` removes the TOP block of a column (height−−), so you
+ *     can never pull a block out from under a stack.
+ *   • Reach: you can only grab the top block of an adjacent column of height H
+ *     if your standing elevation ≥ H − 1. So a 2-pillar's top block is out of
+ *     reach from the ground — you must place a block in front, climb onto it,
+ *     and THEN grab it. (Mirror of `place`, which needs stand ≥ height(at).)
+ *
+ * Placement is free: a held block may be placed on any reachable adjacent grid
+ * cell, so the planner decides where to build steps and the goal staircase.
+ */
+export const scavengerDomain: DomainDoc = {
+  name: "scavenger-world",
+  types: [{ name: "cell" }],
+  fluents: [
+    { name: "height", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 },
+    { name: "pos", params: [{ name: "c", type: "cell" }], kind: "vec2" },
+    { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false },
+    { name: "agentAt", kind: "entity", entityType: "cell" },
+    { name: "agentY", kind: "int", initial: 0 },
+    { name: "holding", kind: "boolean", initial: false },
+  ],
+  operators: [
+    {
+      name: "goto",
+      params: [{ name: "from", type: "cell" }, { name: "to", type: "cell" }],
+      pre: F.and(
+        F.lit("agentAt", [], "?from"),
+        F.lit("adj", ["?from", "?to"]),
+        F.lte(N.fl("height", "?to"), N.add(N.fl("height", "?from"), N.c(1))),
+      ),
+      eff: [E.set("agentAt", [], "?to"), E.set("agentY", [], N.fl("height", "?to"))],
+      cost: N.add(N.dist("pos", ["?from"], "pos", ["?to"]), N.c(0.01)),
+    },
+    {
+      // grab the TOP block of an adjacent column; reachable iff stand ≥ height(at) − 1
+      name: "grab",
+      params: [{ name: "stand", type: "cell" }, { name: "at", type: "cell" }],
+      pre: F.and(
+        F.not(F.lit("holding")),
+        F.lit("agentAt", [], "?stand"),
+        F.lit("adj", ["?stand", "?at"]),
+        F.gte(N.fl("height", "?at"), N.c(1)),
+        F.gte(N.fl("height", "?stand"), N.sub(N.fl("height", "?at"), N.c(1))),
+      ),
+      eff: [E.set("holding", [], true), E.dec("height", ["?at"], N.c(1))],
+      cost: 1,
+    },
+    {
+      // place the held block on any reachable adjacent cell (free placement)
+      name: "place",
+      params: [{ name: "stand", type: "cell" }, { name: "at", type: "cell" }],
+      pre: F.and(
+        F.lit("holding"),
+        F.lit("agentAt", [], "?stand"),
+        F.lit("adj", ["?stand", "?at"]),
+        F.gte(N.fl("height", "?stand"), N.fl("height", "?at")),
+      ),
+      eff: [E.set("holding", [], false), E.inc("height", ["?at"], N.c(1))],
+      cost: 1,
+    },
+  ],
+};
+
+/** Build a model for a Scavenger instance (reuses the StaircaseInstance shape). */
+export function scavengerModel(inst: StaircaseInstance): Model {
+  const entities: Record<string, string> = {};
+  for (const c of inst.cells) entities[c.name] = "cell";
+  return createModel(scavengerDomain, {
+    entities,
+    init: (w) => {
+      for (const c of inst.cells) {
+        w.set("pos", [c.name], [c.x, c.z]);
+        if (c.height) w.set("height", [c.name], c.height);
+      }
+      for (const [a, b] of inst.edges) {
+        w.set("adj", [a, b], true);
+        w.set("adj", [b, a], true);
+      }
+      w.set("agentAt", [], inst.start);
+    },
+  });
+}
+
+export const SCAVENGER_GOAL_HEIGHT = 2;
+
+/**
+ * A scavenger puzzle on a 3×2 grid. Two loose ground blocks and one 2-pillar are
+ * scattered around; the goal is the 3D position atop `goal` at elevation 2. The
+ * goal column needs 2 blocks plus a height-1 support to place the second and to
+ * climb — 3 blocks total, but only 2 loose blocks exist, so the agent MUST
+ * harvest the 2-pillar. Harvesting its top block is impossible from the ground,
+ * so the planner discovers it has to build a step, climb it, then grab.
+ *
+ *      z=1  loose1(1) ---- goal ------- loose2(1)
+ *      z=0  start ------- s ----------- tower(2)
+ */
+export function scavengerInstance(): StaircaseInstance {
+  return {
+    cells: [
+      { name: "start", x: 0, z: 0 },
+      { name: "s", x: 1, z: 0 },
+      { name: "tower", x: 2, z: 0, height: 2 },
+      { name: "loose1", x: 0, z: 1, height: 1 },
+      { name: "goal", x: 1, z: 1 },
+      { name: "loose2", x: 2, z: 1, height: 1 },
+    ],
+    edges: [
+      ["start", "s"],
+      ["s", "tower"],
+      ["loose1", "goal"],
+      ["goal", "loose2"],
+      ["start", "loose1"],
+      ["s", "goal"],
+      ["tower", "loose2"],
+    ],
+    start: "start",
+  };
+}
+
+/** Scavenger goal: stand on top of `goal` at elevation 2 — a pure 3D position. */
+export function scavengerGoal(): import("../src/index").Formula {
+  return F.and(F.lit("agentAt", [], "goal"), F.eq(N.fl("agentY"), N.c(SCAVENGER_GOAL_HEIGHT)));
+}

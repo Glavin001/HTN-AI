@@ -7,7 +7,7 @@ import { runBlocks, type BlocksRun } from "../lib/runBlocks";
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
 
-type ScenarioId = "staircase" | "ledge" | "quarry" | "blocks";
+type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger" | "blocks";
 
 type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun };
 
@@ -26,6 +26,11 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string }> = {
     name: "Quarry (advanced)",
     blurb:
       "A grid world: reach the top of a height-4 pillar. Blocks are scattered across two depots and a wall blocks the way. The planner finds the optimal route to collect from both depots and build a 3-step staircase (1→2→3) to climb up — all from a position-only goal.",
+  },
+  scavenger: {
+    name: "Scavenger (collect & harvest)",
+    blurb:
+      "Blocks lie scattered on the ground — no depots. You can only take the TOP of a stack, and only if you're high enough to reach it: a 2-pillar's top block is out of reach from the ground. So the planner grabs a loose block, builds a step, climbs it, harvests the pillar's top, and uses the blocks to reach a position up in the air.",
   },
   blocks: {
     name: "Blocks World (Sussman)",

@@ -4,10 +4,14 @@ import { F, Planner, goal, planOnce, simulatePlan, type Model, type Plan, type S
 import {
   GOAL_HEIGHT,
   QUARRY_GOAL_HEIGHT,
+  SCAVENGER_GOAL_HEIGHT,
   ledgeGoal,
   ledgeInstance,
   quarryGoal,
   quarryInstance,
+  scavengerGoal,
+  scavengerInstance,
+  scavengerModel,
   staircaseGoal,
   staircaseInstance,
   staircaseModel,
@@ -170,6 +174,64 @@ test("quarry: solved through the reactive Planner", () => {
   assert.equal(planner.getStatus(), "succeeded");
   assert.equal(model.read(planner.state, "agentAt"), "pillar");
   assert.equal(model.read(planner.state, "agentY"), QUARRY_GOAL_HEIGHT);
+});
+
+// ---------------------------------------------------------------- scavenger: collect scattered blocks, top-first
+
+test("scavenger: must build a step to harvest a 2-pillar's top block, then reach the goal", () => {
+  const model = scavengerModel(scavengerInstance());
+  const start = model.createExecState();
+  const result = planOnce(model, start, { goals: [goal(scavengerGoal())], weight: 1, heuristic: "hmax" });
+  assert.equal(result.status, "success");
+  const end = endOf(model, start, result.plan!);
+  // reached the 3D position atop the goal
+  assert.equal(model.read(end, "agentAt"), "goal");
+  assert.equal(model.read(end, "agentY"), SCAVENGER_GOAL_HEIGHT);
+  // only 2 loose blocks exist but 3 are needed, so the 2-pillar MUST be harvested
+  assert.ok((model.read(end, "height", "tower") as number) < 2, "the 2-pillar's top block must be taken");
+
+  // the mechanic: a block had to be PLACED (a step) before the tower's top could be grabbed
+  const towerGid = model.entityId("tower");
+  const ops = (result.plan!.steps ?? []).flatMap((s) => (s.k === "op" ? [{ name: s.g.op.name, at: s.g.b[s.g.b.length - 1] }] : []));
+  const firstPlace = ops.findIndex((o) => o.name === "place");
+  const firstGrabTower = ops.findIndex((o) => o.name === "grab" && o.at === towerGid);
+  assert.ok(firstGrabTower >= 0, "must grab from the tower");
+  assert.ok(firstPlace >= 0 && firstPlace < firstGrabTower, "must build a step before grabbing the tower's top block");
+});
+
+test("scavenger: a 2-pillar's top block is unreachable from the ground", () => {
+  // standing on flat ground (level 0), grabbing the top of a height-2 column is
+  // blocked by the reach rule (0 ≥ 2−1 is false) — proven by making it the only
+  // option: no loose blocks, goal is simply to be holding a block.
+  const model = scavengerModel({
+    cells: [
+      { name: "g", x: 0, z: 0 },
+      { name: "tower", x: 1, z: 0, height: 2 },
+    ],
+    edges: [["g", "tower"]],
+    start: "g",
+  });
+  const result = planOnce(model, model.createExecState(), {
+    goals: [goal(F.lit("holding"))],
+    weight: 1,
+    heuristic: "hmax",
+    maxNodes: 50_000,
+  });
+  // no loose block to build a step with ⇒ the top block can never be reached
+  assert.equal(result.status, "failure", "can't grab a 2-high top block from the ground with nothing to step on");
+});
+
+test("scavenger: solved through the reactive Planner", () => {
+  const model = scavengerModel(scavengerInstance());
+  let t = 0;
+  const planner = new Planner(model, { goals: [goal(scavengerGoal())], now: () => t, seed: 9 });
+  for (let i = 0; i < 2000 && planner.getStatus() !== "succeeded" && planner.getStatus() !== "failed"; i++) {
+    t += 1;
+    planner.tick({ ms: 20 });
+  }
+  assert.equal(planner.getStatus(), "succeeded");
+  assert.equal(model.read(planner.state, "agentAt"), "goal");
+  assert.equal(model.read(planner.state, "agentY"), SCAVENGER_GOAL_HEIGHT);
 });
 
 test.run();

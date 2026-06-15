@@ -14,13 +14,18 @@ import {
   ledgeInstance,
   quarryGoal,
   quarryInstance,
+  SCAVENGER_GOAL_HEIGHT,
+  scavengerGoal,
+  scavengerInstance,
+  scavengerModel,
   staircaseGoal,
   staircaseInstance,
   staircaseModel,
   type StaircaseInstance,
 } from "@scenarios/staircase";
+import type { Model } from "htn-ai";
 
-export type ScenarioId = "staircase" | "ledge" | "quarry";
+export type ScenarioId = "staircase" | "ledge" | "quarry" | "scavenger";
 
 export interface Frame {
   /** column heights per cell */
@@ -45,16 +50,25 @@ export interface RunResult {
   trace: TraceEvent[];
 }
 
-const SCENARIOS: Record<ScenarioId, { instance: () => StaircaseInstance; goal: () => ReturnType<typeof staircaseGoal>; target: { cell: string; y: number } }> = {
-  staircase: { instance: staircaseInstance, goal: staircaseGoal, target: { cell: "goal", y: GOAL_HEIGHT } },
-  ledge: { instance: () => ledgeInstance(1), goal: ledgeGoal, target: { cell: "ledge", y: 2 } },
-  quarry: { instance: quarryInstance, goal: quarryGoal, target: { cell: "pillar", y: QUARRY_GOAL_HEIGHT } },
+interface ScenarioCfg {
+  instance: () => StaircaseInstance;
+  goal: () => ReturnType<typeof staircaseGoal>;
+  model: (inst: StaircaseInstance) => Model;
+  target: { cell: string; y: number };
+}
+
+const SCENARIOS: Record<ScenarioId, ScenarioCfg> = {
+  staircase: { instance: staircaseInstance, goal: staircaseGoal, model: staircaseModel, target: { cell: "goal", y: GOAL_HEIGHT } },
+  ledge: { instance: () => ledgeInstance(1), goal: ledgeGoal, model: staircaseModel, target: { cell: "ledge", y: 2 } },
+  quarry: { instance: quarryInstance, goal: quarryGoal, model: staircaseModel, target: { cell: "pillar", y: QUARRY_GOAL_HEIGHT } },
+  scavenger: { instance: scavengerInstance, goal: scavengerGoal, model: scavengerModel, target: { cell: "goal", y: SCAVENGER_GOAL_HEIGHT } },
 };
 
 export function runScenario(id: ScenarioId): RunResult {
   const cfg = SCENARIOS[id];
   const instance = cfg.instance();
-  const model = staircaseModel(instance);
+  const model = cfg.model(instance);
+  const hasSupply = model.doc.fluents.some((f) => f.name === "supply");
 
   const trace: TraceEvent[] = [];
   let t = 0;
@@ -68,7 +82,9 @@ export function runScenario(id: ScenarioId): RunResult {
   const cellNames = instance.cells.map((c) => c.name);
   const snap = (action: string): Frame => ({
     heights: Object.fromEntries(cellNames.map((c) => [c, model.read(planner.state, "height", c) as number])),
-    supplies: Object.fromEntries(cellNames.map((c) => [c, model.read(planner.state, "supply", c) as number])),
+    supplies: hasSupply
+      ? Object.fromEntries(cellNames.map((c) => [c, model.read(planner.state, "supply", c) as number]))
+      : {},
     agentCell: model.read(planner.state, "agentAt") as string,
     agentY: model.read(planner.state, "agentY") as number,
     holding: model.read(planner.state, "holding") as boolean,
