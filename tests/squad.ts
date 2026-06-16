@@ -267,7 +267,7 @@ test("squad: a player 'regroup' order swaps the ally's goal and it obeys (setGoa
 
 test("squad: a fire-team breaches in sync inside a deadline window (temporal-lite)", () => {
   const sim = new SquadSim(breachInstance(), { seed: 8 });
-  sim.run(500);
+  const frames = sim.run(500);
 
   for (const u of ["R1", "R2"]) {
     const scopes = sim.trace.filter((t) => t.unit === u && t.e.t === "scope.enter");
@@ -276,8 +276,14 @@ test("squad: a fire-team breaches in sync inside a deadline window (temporal-lit
       `${u} entered the timed breach window`,
     );
     assert.ok(stepStarts(sim, u).some((l) => l.startsWith("moveToBreach")), `${u} stacked on the door`);
-    assert.ok(stepStarts(sim, u).some((l) => l.startsWith("breach")), `${u} breached`);
   }
+  // the breachers used DISTINCT door slots (no piling onto one spot)
+  const claimedEver = new Set<string>();
+  for (const f of frames) for (const [c, o] of Object.entries(f.reservations)) if (o) claimedEver.add(c);
+  assert.ok(claimedEver.has("stackL") && claimedEver.has("stackR"), "the breachers stacked on distinct door slots");
+  // the door was breached (one kick opens it for the team)
+  assert.ok(sim.world.doorBroken, "the door was breached open");
+  assert.ok(sim.trace.some((t) => t.e.t === "step.start" && (t.e as { label: string }).label.startsWith("breach")), "a breach action fired");
   // nobody blew the deadline — the window was met
   const blown = sim.trace.filter((t) => t.e.t === "scope.violated" && (t.e as { reason: string }).reason === "deadline");
   assert.equal(blown.length, 0, "the breach completed within the window (no deadline violation)");

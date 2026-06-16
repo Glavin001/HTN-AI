@@ -94,12 +94,14 @@ export interface CoverSpec {
   rally?: boolean;
 }
 
-/** Axis-aligned obstacle that blocks line of sight (and is rendered as a wall). */
+/** Axis-aligned obstacle that blocks line of sight AND movement (a wall / crate). */
 export interface WallSpec {
   x: number;
   z: number;
   w: number;
   d: number;
+  /** a breachable door: blocks sight + movement until a breach action breaks it */
+  door?: boolean;
 }
 
 export interface SquadInstance {
@@ -183,6 +185,34 @@ function segHitsBox(ax: number, az: number, bx: number, bz: number, w: WallSpec)
   return t0 <= t1;
 }
 
+/** Roughly the agent's body radius — obstacle corners are padded by it so paths clear walls. */
+const UNIT_RADIUS = 0.6;
+
+/** The four padded corners of a box, as candidate path waypoints. */
+function boxCorners(w: WallSpec, pad: number): Vec2[] {
+  return [
+    { x: w.x - pad, z: w.z - pad },
+    { x: w.x + w.w + pad, z: w.z - pad },
+    { x: w.x - pad, z: w.z + w.d + pad },
+    { x: w.x + w.w + pad, z: w.z + w.d + pad },
+  ];
+}
+
+/** Position reached by walking `dist` along a polyline; `done` once past the end. */
+function walkPolyline(path: Vec2[], dist: number): { x: number; z: number; done: boolean } {
+  let rem = dist;
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = dist2(path[i].x, path[i].z, path[i + 1].x, path[i + 1].z);
+    if (rem <= seg) {
+      const t = seg > 0 ? rem / seg : 1;
+      return { x: lerp(path[i].x, path[i + 1].x, t), z: lerp(path[i].z, path[i + 1].z, t), done: false };
+    }
+    rem -= seg;
+  }
+  const last = path[path.length - 1];
+  return { x: last.x, z: last.z, done: true };
+}
+
 /**
  * The shared world: ground-truth actor kinematics + vitals, the static cover
  * geometry, line-of-sight obstacles, and a coordination blackboard. Belief lives
@@ -239,9 +269,49 @@ export class SquadWorld {
     }
   }
 
+  /** the breach door has been broken — it no longer blocks sight or movement */
+  public doorBroken = false;
+
+  /** obstacles currently blocking sight + movement (the door drops once breached) */
+  activeWalls(): WallSpec[] {
+    return this.doorBroken ? this.walls.filter((w) => !w.door) : this.walls;
+  }
+
   losClear(ax: number, az: number, bx: number, bz: number): boolean {
-    for (const w of this.walls) if (segHitsBox(ax, az, bx, bz, w)) return false;
+    for (const w of this.activeWalls()) if (segHitsBox(ax, az, bx, bz, w)) return false;
     return true;
+  }
+
+  /** Shortest walkable path from (ax,az) to (bx,bz) around obstacles (visibility
+   *  graph over padded box corners + Dijkstra). Returns waypoints incl. the goal. */
+  findPath(ax: number, az: number, bx: number, bz: number): Vec2[] {
+    const walls = this.activeWalls();
+    if (walls.every((w) => !segHitsBox(ax, az, bx, bz, w))) return [{ x: bx, z: bz }];
+    const inside = (p: Vec2) => walls.some((w) => p.x > w.x - 0.01 && p.x < w.x + w.w + 0.01 && p.z > w.z - 0.01 && p.z < w.z + w.d + 0.01);
+    const nodes: Vec2[] = [{ x: ax, z: az }, ...walls.flatMap((w) => boxCorners(w, UNIT_RADIUS)).filter((c) => !inside(c)), { x: bx, z: bz }];
+    const n = nodes.length;
+    const clear = (i: number, j: number) => walls.every((w) => !segHitsBox(nodes[i].x, nodes[i].z, nodes[j].x, nodes[j].z, w));
+    const adj: number[][] = nodes.map(() => []);
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (clear(i, j)) { adj[i].push(j); adj[j].push(i); }
+    const dist = new Array(n).fill(Infinity);
+    const prev = new Array(n).fill(-1);
+    const done = new Array(n).fill(false);
+    dist[0] = 0;
+    for (let it = 0; it < n; it++) {
+      let u = -1;
+      let best = Infinity;
+      for (let k = 0; k < n; k++) if (!done[k] && dist[k] < best) { best = dist[k]; u = k; }
+      if (u < 0) break;
+      done[u] = true;
+      for (const v of adj[u]) {
+        const d = dist[u] + dist2(nodes[u].x, nodes[u].z, nodes[v].x, nodes[v].z);
+        if (d < dist[v]) { dist[v] = d; prev[v] = u; }
+      }
+    }
+    if (dist[n - 1] === Infinity) return [{ x: bx, z: bz }]; // unreachable → straight (best effort)
+    const path: Vec2[] = [];
+    for (let cur = n - 1; cur > 0; cur = prev[cur]) path.unshift({ x: nodes[cur].x, z: nodes[cur].z });
+    return path;
   }
 
   /** the nearest hostile actor to `self`; optionally requiring line of sight */
@@ -365,10 +435,12 @@ export const squadDomain: DomainDoc = {
       executor: "move",
     },
     {
-      // stack up at the breach point (E4 synchronized assault)
+      // stack up at the breach point (E4 synchronized assault); distinct slots so
+      // the breachers don't pile onto the same spot at the door
       name: "moveToBreach",
       params: [{ name: "c", type: "cover" }],
-      pre: F.lit("coverBreach", ["?c"]),
+      pre: F.and(F.lit("coverBreach", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
+      verify: F.not(F.lit("coverTaken", ["?c"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -451,7 +523,7 @@ export const squadDomain: DomainDoc = {
       name: "breachAssault",
       task: "Fight",
       params: [{ name: "bp", type: "cover" }],
-      pre: F.and(F.lit("tactic", [], "breach"), F.lit("coverBreach", ["?bp"])),
+      pre: F.and(F.lit("tactic", [], "breach"), F.lit("coverBreach", ["?bp"]), F.not(F.lit("coverTaken", ["?bp"]))),
       subtasks: [
         {
           scope: { deadline: BREACH_WINDOW, label: "breach-window" },
@@ -604,15 +676,15 @@ function moveExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => Ta
     const mem = api.remember(() => {
       // commit the reservation the instant the move starts (so rivals replan away)
       world.claimCover(self, coverName);
-      return { sx: a.x, sz: a.z, t0: api.clock() };
-    }) as { sx: number; sz: number; t0: number };
-    const d = dist2(mem.sx, mem.sz, cover.x, cover.z);
-    const dur = Math.max(0.001, (d + 0.1) / MOVE_SPEED);
-    const f = (api.clock() - mem.t0) / dur;
-    a.x = lerp(mem.sx, cover.x, f);
-    a.z = lerp(mem.sz, cover.z, f);
+      // route AROUND obstacles (so units don't walk through walls)
+      return { path: [{ x: a.x, z: a.z }, ...world.findPath(a.x, a.z, cover.x, cover.z)], t0: api.clock() };
+    }) as { path: Vec2[]; t0: number };
+    const traveled = (api.clock() - mem.t0) * MOVE_SPEED;
+    const at = walkPolyline(mem.path, traveled);
+    a.x = at.x;
+    a.z = at.z;
     a.elevation = cover.high ? 1 : 0;
-    if (f >= 1) {
+    if (at.done) {
       a.x = cover.x;
       a.z = cover.z;
       if (cover.flank) world.team(a.side).flankerReady = true;
@@ -662,6 +734,7 @@ function breachExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => 
   return (_api) => {
     const a = world.actors.get(self);
     if (!a || !a.alive) return "failure";
+    world.doorBroken = true; // the door is down — sight + movement open into the room
     const target = world.nearestHostile(self, false);
     if (target) {
       target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
@@ -1115,21 +1188,26 @@ export function barkFor(e: TraceEvent): string | null {
 export function skirmishInstance(): SquadInstance {
   return {
     units: [
-      { name: "R1", side: "enemy", x: -9, z: -1, role: "suppressor" },
-      { name: "R2", side: "enemy", x: -9, z: 2, role: "flanker" },
-      { name: "B1", side: "ally", x: 9, z: 1, role: "suppressor" },
-      { name: "B2", side: "ally", x: 9, z: -2, role: "flanker" },
+      { name: "R1", side: "enemy", x: -10, z: -2, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -10, z: 3, role: "flanker" },
+      { name: "B1", side: "ally", x: 10, z: 2, role: "suppressor" },
+      { name: "B2", side: "ally", x: 10, z: -3, role: "flanker" },
     ],
     covers: [
-      { name: "cW", x: -4, z: 0 },
-      { name: "cE", x: 4, z: 0 },
-      { name: "fNW", x: -3, z: -7, flank: true },
-      { name: "fSW", x: -3, z: 7, flank: true },
-      { name: "fNE", x: 3, z: -7, flank: true },
-      { name: "fSE", x: 3, z: 7, flank: true },
-      { name: "rRally", x: -11, z: 0, rally: true },
-      { name: "bRally", x: 11, z: 0, rally: true },
+      // peek positions around the central building (corner cover)
+      { name: "cNW", x: -5, z: -5 },
+      { name: "cSW", x: -5, z: 5 },
+      { name: "cNE", x: 5, z: -5 },
+      { name: "cSE", x: 5, z: 5 },
+      // wide flanks (clear line of fire around the building)
+      { name: "fN", x: 0, z: -9, flank: true },
+      { name: "fS", x: 0, z: 9, flank: true },
+      { name: "rRally", x: -12, z: 0, rally: true },
+      { name: "bRally", x: 12, z: 0, rally: true },
     ],
+    // a central building breaks the direct line of fire — squads must use it for
+    // cover and flank around it (routing handled by pathfinding)
+    walls: [{ x: -3.5, z: -2.5, w: 7, d: 5 }],
   };
 }
 
@@ -1139,22 +1217,29 @@ export function breachInstance(): SquadInstance {
   return {
     breach: true,
     units: [
-      { name: "R1", side: "enemy", x: -4, z: 0, role: "assault" },
-      { name: "R2", side: "enemy", x: 4, z: 0, role: "assault" },
-      { name: "B1", side: "ally", x: -2, z: 9, role: "assault" }, // defenders in the room
-      { name: "B2", side: "ally", x: 2, z: 9, role: "assault" },
+      { name: "R1", side: "enemy", x: -3, z: -1, role: "assault" },
+      { name: "R2", side: "enemy", x: 3, z: -1, role: "assault" },
+      { name: "B1", side: "ally", x: -3, z: 10, role: "assault" }, // defenders holding the room
+      { name: "B2", side: "ally", x: 3, z: 10, role: "assault" },
     ],
     covers: [
-      { name: "door", x: 0, z: 4, breach: true }, // Red's stack-up / breach point
-      { name: "cW", x: -5, z: 2 },
-      { name: "cE", x: 5, z: 2 },
-      { name: "rN", x: -3, z: 11 },
-      { name: "rNE", x: 3, z: 11 },
+      // Red stacks on EITHER side of the door (distinct slots), then breaches
+      { name: "stackL", x: -1.4, z: 3.4, breach: true },
+      { name: "stackR", x: 1.4, z: 3.4, breach: true },
+      // positions inside the room to push to once the door is down
+      { name: "roomW", x: -4, z: 8 },
+      { name: "roomE", x: 4, z: 8 },
+      { name: "roomN", x: 0, z: 12 },
     ],
-    // a wall with a central doorway: Red must breach to reach the room
+    // a room: solid walls north, with a central DOOR that blocks sight + movement
+    // until Red breaches it
     walls: [
-      { x: -7, z: 5, w: 6, d: 1 },
-      { x: 1, z: 5, w: 6, d: 1 },
+      { x: -8, z: 5, w: 6.5, d: 1 }, // left wall
+      { x: 1.5, z: 5, w: 6.5, d: 1 }, // right wall
+      { x: -1.5, z: 5, w: 3, d: 1, door: true }, // the breachable door (fills the gap)
+      { x: -8, z: 5, w: 1, d: 9 }, // west wall
+      { x: 7, z: 5, w: 1, d: 9 }, // east wall
+      { x: -8, z: 13, w: 16, d: 1 }, // back wall
     ],
   };
 }
