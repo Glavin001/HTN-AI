@@ -3,7 +3,7 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, Grid, Html, Line, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
-import type { SquadFrame, SquadInstance, UnitFrame } from "@scenarios/squad-combat";
+import { SquadWorld, evaluateSpot, type SquadFrame, type SquadInstance, type UnitFrame, type SpotEval } from "@scenarios/squad-combat";
 
 const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
 const COVER_COLOR = { free: "#4b463d", flank: "#b45309", high: "#6d28d9", breach: "#7c2d12", rally: "#15803d" };
@@ -19,7 +19,7 @@ function actionIcon(action: string): string {
   if (action.includes("stacking")) return "▮";
   if (action === "breaching") return "💥";
   if (action === "reloading") return "⟳";
-  if (action === "falling back") return "⮌";
+  if (action === "falling back" || action === "breaking contact") return "⮌";
   if (action === "down") return "✖";
   if (action === "thinking…") return "…";
   return "•";
@@ -28,8 +28,67 @@ function actionIcon(action: string): string {
 interface SceneProps {
   frame: SquadFrame;
   instance: SquadInstance;
+  /** the discrete tactical positions the planner scores + chooses among */
+  spots?: { name: string; x: number; z: number }[];
+  /** score spots against the unit's BELIEF (what it knows) or ground TRUTH */
+  heatMode?: "belief" | "truth";
   selected: string | null;
   onSelect: (name: string) => void;
+}
+
+/** green (good / cheap & safe) → red (bad / exposed) for a normalized cost t∈[0,1]. */
+function heatColor(t: number): string {
+  return new THREE.Color().setHSL((1 - t) * 0.33, 0.85, 0.5).getStyle();
+}
+
+interface Heat {
+  evals: Map<string, SpotEval>;
+  lo: number;
+  hi: number;
+}
+
+/** The candidate positions the spot search considers, drawn as floor markers. When a
+ *  unit is selected they become a POTENTIAL FIELD: each dot is tinted by that unit's
+ *  risk/reward at that spot (green = cheap, safe firing position → red = exposed),
+ *  grey = no line of fire. The dot the unit is moving to lights up cyan — the choice
+ *  the search just made. The field shifts live as enemies move. */
+function TacticalSpots({ spots, chosen, heat }: { spots: { name: string; x: number; z: number }[]; chosen: string | null; heat: Heat | null }) {
+  return (
+    <group>
+      {spots.map((s) => {
+        if (s.name === chosen) {
+          return (
+            <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.02, s.z]}>
+              <circleGeometry args={[0.34, 24]} />
+              <meshBasicMaterial color="#38bdf8" transparent opacity={0.9} side={THREE.DoubleSide} />
+            </mesh>
+          );
+        }
+        let color = "#3b4763";
+        let opacity = 0.26;
+        let r = 0.12;
+        const e = heat?.evals.get(s.name);
+        if (e) {
+          if (!e.firing) {
+            color = "#2b3447";
+            opacity = 0.2;
+            r = 0.11;
+          } else {
+            const t = heat && heat.hi > heat.lo ? (e.cost - heat.lo) / (heat.hi - heat.lo) : 0;
+            color = heatColor(t);
+            opacity = 0.82;
+            r = 0.22;
+          }
+        }
+        return (
+          <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.015, s.z]}>
+            <circleGeometry args={[r, 12]} />
+            <meshBasicMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      })}
+    </group>
+  );
 }
 
 function unitPos(u: UnitFrame): THREE.Vector3 {
@@ -197,7 +256,7 @@ function Wall({ x, z, w, d, door, broken }: { x: number; z: number; w: number; d
   );
 }
 
-function Scene({ frame, instance, selected, onSelect }: SceneProps) {
+function Scene({ frame, instance, spots = [], heatMode = "belief", selected, onSelect }: SceneProps) {
   const center = useMemo<[number, number, number]>(() => {
     const xs = instance.units.map((u) => u.x).concat(instance.covers.map((c) => c.x));
     const zs = instance.units.map((u) => u.z).concat(instance.covers.map((c) => c.z));
@@ -229,6 +288,46 @@ function Scene({ frame, instance, selected, onSelect }: SceneProps) {
     return best;
   }, [sel, frame]);
 
+  // geometry-only world (walls + crates) for scoring spots from the view — pure LOS /
+  // cover / exposure math, rebuilt only when the map changes.
+  const world = useMemo(() => new SquadWorld(instance), [instance]);
+
+  // the potential field FOR THE SELECTED UNIT: score every candidate spot by its
+  // risk/reward. "belief" = against what the unit KNOWS (the positions it's actually
+  // planning against); "truth" = against the enemies' real positions this frame. Either
+  // way it shifts as the fight moves.
+  const heat = useMemo<Heat | null>(() => {
+    if (!sel || !sel.alive || spots.length === 0) return null;
+    const threat = heatMode === "belief" ? sel.believedThreat : selTarget ? { x: selTarget.x, z: selTarget.z } : null;
+    if (!threat) return null; // belief: the unit knows of no threat → no field to paint
+    const foes =
+      heatMode === "belief"
+        ? sel.believedFoes
+        : frame.units.filter((u) => u.alive && (HOSTILE[sel.side] ?? []).includes(u.side)).map((u) => ({ x: u.x, z: u.z }));
+    const evals = new Map<string, SpotEval>();
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const s of spots) {
+      const e = evaluateSpot(world, s.x, s.z, threat, foes);
+      evals.set(s.name, e);
+      if (e.firing) { lo = Math.min(lo, e.cost); hi = Math.max(hi, e.cost); }
+    }
+    return { evals, lo, hi };
+  }, [sel, selTarget, spots, frame, world, heatMode]);
+
+  // the spot the selected unit is currently moving to — parsed from its plan step
+  // (e.g. "moveFree(spot12)" / "moveToSpot(crNW)"). This is the search's live choice.
+  const chosenSpot = useMemo(() => {
+    if (!sel || !sel.alive) return null;
+    const m = /\((\w+)\)/.exec(sel.step ?? "");
+    return m ? m[1] : null;
+  }, [sel]);
+  const chosenPos = useMemo(() => {
+    if (!chosenSpot) return null;
+    const s = spots.find((p) => p.name === chosenSpot) ?? instance.covers.find((c) => c.name === chosenSpot);
+    return s ? new THREE.Vector3(s.x, 0.05, s.z) : null;
+  }, [chosenSpot, spots, instance]);
+
   return (
     <>
       <PerspectiveCamera makeDefault position={[center[0], 20, center[2] + 13]} fov={40} />
@@ -247,6 +346,14 @@ function Scene({ frame, instance, selected, onSelect }: SceneProps) {
       {(instance.walls ?? []).map((w, i) => (
         <Wall key={i} {...w} broken={frame.doorBroken} />
       ))}
+
+      {/* the discrete candidate positions the planner scores each beat */}
+      <TacticalSpots spots={spots} chosen={chosenSpot} heat={heat} />
+
+      {/* the move the SELECTED unit's search just committed to (unit → chosen spot) */}
+      {sel && sel.alive && chosenPos && (
+        <Line points={[unitPos(sel).setY(0.05), chosenPos]} color="#38bdf8" lineWidth={1.5} dashed dashSize={0.3} gapSize={0.2} transparent opacity={0.8} />
+      )}
 
       {instance.covers.map((c) => {
         const owner = frame.reservations[c.name] ?? null;

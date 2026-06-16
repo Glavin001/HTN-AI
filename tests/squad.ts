@@ -26,7 +26,7 @@ function stepStarts(sim: SquadSim, unit: string): string[] {
 }
 
 function moved(labels: string[]): boolean {
-  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo|moveToSpot)/.test(l));
+  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo|moveToSpot|moveFree)/.test(l));
 }
 
 // a unit "fired" if it took a shot or ran an engage-from-position burst (the macro)
@@ -486,6 +486,229 @@ test("squad: with NO cover available the unit still engages and resolves the fig
   sim.run(400);
   assert.ok(fired(stepStarts(sim, "E")), "it engaged the target");
   assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized it without any cover to use");
+});
+
+// ---------------------------------------------------------------- F: engine custom-heuristic hook
+
+test("squad: the engine consults a domain customHeuristic on a numeric goal (potential-field hook)", () => {
+  // a numeric goal (threatHp ≤ 0) yields no symbolic atoms, so the relaxation heuristic
+  // is 0 (uninformed). The engine must instead consult the domain-supplied heuristic.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0 },
+      { name: "player", side: "player", x: 5, z: 0 },
+    ],
+    covers: [{ name: "c", x: 0, z: 0 }],
+  };
+  const model = squadModel(inst, "E");
+  const state = model.createExecState();
+  state.set(model.slotOf("hasThreat"), 1);
+  state.buffer[model.slotOf("threatPos")] = 5; // player at (5,0): E has a clear shot
+  let calls = 0;
+  const result = planOnce(model, state, {
+    goals: [goal(F.lte(N.fl("threatHp"), N.c(0)))],
+    customHeuristic: (s) => {
+      calls++;
+      void s;
+      return 0;
+    },
+    maxNodes: 5000,
+  });
+  assert.ok(calls > 0, "the engine consulted the domain heuristic");
+  assert.equal(result.status, "success", "and found a plan for the numeric goal");
+});
+
+test("squad: spatialDedup makes a spatial kill-goal tractable (vs clock-polluted blowup)", () => {
+  // E already has a clear shot, so the optimal plan is a single engageFrom. But the
+  // move space is fine and every move advances the clock, so WITHOUT spatialDedup the
+  // uniform-cost search treats each position-at-a-different-time as a fresh node and
+  // never settles — it can't even find the 1-step plan inside a generous budget. WITH
+  // spatialDedup those time-equivalent positions collapse and it solves it at once.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: -8, z: 0 },
+      { name: "player", side: "player", x: 8, z: 0 },
+    ],
+    covers: [
+      { name: "a", x: 0, z: 3 },
+      { name: "b", x: 0, z: -3 },
+      { name: "c", x: 4, z: 2 },
+      { name: "d", x: -4, z: 2 },
+    ],
+  };
+  const model = squadModel(inst, "E");
+  const mkState = () => {
+    const s = model.createExecState();
+    s.set(model.slotOf("hasThreat"), 1);
+    s.buffer[model.slotOf("threatPos")] = 8; // player at (8,0): E has a clear shot
+    s.set(model.slotOf("useGoap"), 1);
+    return s;
+  };
+  const plan = (spatialDedup: boolean) =>
+    planOnce(model, mkState(), {
+      goals: [goal(F.lte(N.fl("threatHp"), N.c(0)))],
+      customHeuristic: () => 0, // uniform-cost: isolates the dedup effect
+      spatialDedup,
+      weight: 1,
+      maxNodes: 20000,
+    });
+  const on = plan(true);
+  assert.equal(on.status, "success", "spatialDedup solves the spatial goal");
+  assert.equal(on.plan!.steps.length, 1, "and finds the optimum: engage from here (already has a line of fire)");
+  const off = plan(false);
+  assert.equal(off.status, "failure", "without it, the clock-polluted state space exhausts the budget");
+  assert.ok(off.stats.expansions > on.stats.expansions * 4, `dedup explores far less (off=${off.stats.expansions} on=${on.stats.expansions})`);
+});
+
+// ---------------------------------------------------------------- F: GOAP positioning mode (engine search)
+
+test("squad: GOAP positioning (generic search + potential-field heuristic) also fights from cover", () => {
+  // the SAME 1v1-with-a-crate fight, but positioning is decided by the generic planner
+  // search guided by the spatial heuristic instead of the bespoke spot-graph route.
+  // The heuristic is what keeps it from wandering — it reaches cover and neutralizes.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -8, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 8 },
+    ],
+    covers: [{ name: "crate", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 3, positioning: "goap" });
+  const world = sim.world as SquadWorld;
+  let covered = 0;
+  let exposed = 0;
+  for (let i = 0; i < 140 && sim.world.actors.get("P")!.alive; i++) {
+    const f = sim.step();
+    const e = f.units.find((u) => u.name === "E")!;
+    if (e.action.startsWith("firing")) {
+      const a = world.actors.get("E")!;
+      if (world.exposureAt(a.x, a.z, [{ x: 0, z: 8 }]) === 0) covered++;
+      else exposed++;
+    }
+  }
+  assert.equal(sim.positioning, "goap", "running the GOAP positioning engine");
+  assert.ok(moved(stepStarts(sim, "E")), "the search relocated the unit (move op fired)");
+  assert.ok(covered > exposed, `it fought mostly from cover (covered=${covered} exposed=${exposed})`);
+  assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized the target");
+});
+
+// ---------------------------------------------------------------- F: spot-graph multi-hop routing
+
+test("squad: the spot-graph route composes a multi-hop path around a barricade to earn a line of fire", () => {
+  // a wall sits between E and P; no single straight hop reaches a firing angle, so the
+  // route must STAGE through an intermediate spot then push to the spot that sees P.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 12 },
+    ],
+    covers: [
+      { name: "cNear", x: 0, z: 2 },
+      { name: "fSide", x: 8, z: 8, flank: true },
+    ],
+    walls: [{ x: -3, z: 5, w: 6, d: 1 }],
+  };
+  const sim = new SquadSim(inst, { seed: 3 });
+  const hops = new Set<string>();
+  for (let i = 0; i < 300 && sim.world.actors.get("P")!.alive; i++) {
+    const f = sim.step();
+    const e = f.units.find((u) => u.name === "E")!;
+    if (e.step.startsWith("moveToSpot")) hops.add(e.step);
+  }
+  assert.ok(hops.size >= 2, `the route staged through ≥2 distinct spots around the wall (saw ${hops.size}: ${[...hops]})`);
+  assert.equal(sim.world.actors.get("P")!.alive, false, "and reached a firing angle to neutralize the target");
+});
+
+// --------------------------------------------------- F: survival / attrition model (push vs flee)
+
+/** A flank scenario whose open approaches are dangerous to cross. */
+function attritionFlankInstance(): SquadInstance {
+  return {
+    units: [
+      { name: "R1", side: "enemy", x: -10, z: -1, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -10, z: 2, role: "flanker" },
+      { name: "B1", side: "ally", x: 10, z: 1, role: "suppressor" },
+      { name: "B2", side: "ally", x: 10, z: -2, role: "flanker" },
+    ],
+    covers: [
+      { name: "cW", x: -5, z: 0 }, { name: "cE", x: 5, z: 0 },
+      { name: "crNW", x: -3.5, z: -7 }, { name: "crNE", x: 3.5, z: -7 },
+      { name: "crSW", x: -3.5, z: 7 }, { name: "crSE", x: 3.5, z: 7 },
+      { name: "fNW", x: -3, z: -9.5, flank: true }, { name: "fSW", x: -3, z: 9.5, flank: true },
+      { name: "fNE", x: 3, z: -9.5, flank: true }, { name: "fSE", x: 3, z: 9.5, flank: true },
+    ],
+    walls: [{ x: -2, z: -5, w: 4, d: 10 }],
+  };
+}
+
+test("squad: the attrition model stops suicidal advances — nobody dies charging into fire", () => {
+  // With myHp projected onto move + engage and the survival gates, a unit no longer
+  // commits to a reposition-to-fight whose crossing/engagement kills it. We assert the
+  // turnaround from the old behaviour: deaths while ADVANCING to fight (moveFree /
+  // moveToSpot / flankTo) are essentially gone — casualties now occur firing or while
+  // breaking contact (caught fleeing a fight already judged lost), not charging in.
+  const advanceMove = (s: string) => /^(moveFree|moveToSpot|flankTo|advanceTo)/.test(s);
+  let total = 0;
+  let advanceDeaths = 0;
+  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    const sim = new SquadSim(attritionFlankInstance(), { seed, positioning: "goap" });
+    const lastStep = new Map<string, string>();
+    const alive = new Map<string, boolean>();
+    for (const u of sim.snapshot().units) alive.set(u.name, true);
+    for (let i = 0; i < 600 && !sim.engagementOver(); i++) {
+      for (const u of sim.step().units) {
+        if (alive.get(u.name) && !u.alive) {
+          total++;
+          if (advanceMove(lastStep.get(u.name) ?? "")) advanceDeaths++;
+          alive.set(u.name, false);
+        }
+        if (u.alive && u.step && u.step !== "—") lastStep.set(u.name, u.step);
+      }
+    }
+  }
+  assert.ok(total > 0, "the engagements produced casualties");
+  assert.equal(advanceDeaths, 0, `no unit died advancing into fire (saw ${advanceDeaths}/${total}) — the survival model prunes lethal crossings`);
+});
+
+test("squad: outnumbered ⇒ break contact (2-on-1, I won't survive — run)", () => {
+  // One unit alone against two shooters: the attrition race says it loses, and no
+  // reachable spot flips that, so it breaks contact instead of trading and dying.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -9, role: "assault" },
+      { name: "P1", side: "player", x: -3, z: 8 },
+      { name: "P2", side: "player", x: 3, z: 8 },
+    ],
+    covers: [{ name: "cBack", x: 0, z: -12 }, { name: "cMid", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 2, positioning: "goap" });
+  let brokeContact = false;
+  for (let i = 0; i < 120 && sim.world.actors.get("E")!.alive; i++) {
+    const e = sim.step().units.find((u) => u.name === "E")!;
+    if (e.step.startsWith("breakTo")) brokeContact = true;
+  }
+  assert.ok(brokeContact, "the outnumbered unit chose to break contact rather than fight a fight it loses");
+});
+
+test("squad: outnumbering ⇒ push (2-on-1 in our favour, we'll win — move in)", () => {
+  // Two units against one: friendly guns shorten the kill, so the attrition race is
+  // winnable — they engage and take the target rather than flee. Same geometry as the
+  // flee case, only the numbers are reversed, so the difference is the squad math.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E1", side: "enemy", x: -2, z: -9, role: "assault" },
+      { name: "E2", side: "enemy", x: 2, z: -9, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 8 },
+    ],
+    covers: [{ name: "cMid", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 2, positioning: "goap" });
+  let anyFled = false;
+  for (let i = 0; i < 200 && sim.world.actors.get("P")!.alive; i++) {
+    for (const u of sim.step().units) if ((u.name === "E1" || u.name === "E2") && u.step.startsWith("breakTo")) anyFled = true;
+  }
+  assert.equal(sim.world.actors.get("P")!.alive, false, "the outnumbering pair pushed in and neutralized the target");
+  assert.ok(!anyFled, "neither attacker broke contact — the squad math made it a winnable push");
 });
 
 // ---------------------------------------------------------------- F: caution (outgunned ⇒ value safety)
