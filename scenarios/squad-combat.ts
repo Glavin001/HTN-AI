@@ -58,12 +58,16 @@ export const SHOT_TIME = 0.32; // seconds to take a shot
 export const RELOAD_TIME = 1.6;
 export const SUPPRESS_MAX = 5; // a suppressor sustains fire up to this long (or until the flanker is set)
 export const MEMORY_SECONDS = 4; // how long a lost target is remembered before "search"
+export const SEARCH_SECONDS = 14; // after losing a target, sweep toward last contact this long before giving up
 export const LOW_HP = 48; // pull back to cover once this hurt (react to taking fire)
 // survival margin (HP) a unit insists on keeping after a projected engagement/crossing,
 // scaled by caution. The attrition model gates moves + engagements on this: a plan that
 // would drop you below it is "lethal" and pruned — so the planner reasons about whether
 // it will actually survive a fight or a dash, not just how exposed it is.
 export const SAFETY_MARGIN = 12;
+// a target at/under this HP in your sights is finished on the spot — don't reposition
+// for a prettier angle and let a near-dead enemy slip away (and stall the engagement).
+export const FINISH_HP = 30;
 // fraction of a dash actually spent under aimed fire: you cross most of a lane before
 // the enemy reacquires and lands shots, so a crossing is far less lethal than standing
 // in the open the whole time. Keeps units from freezing (they'll still dash to re-engage)
@@ -642,6 +646,12 @@ export const squadDomain: DomainDoc = {
     // where to break contact TO when the fight is unwinnable — the safest reachable spot
     // out of the enemy's fire (written by perception, enacted by the breakContact method)
     { name: "retreatSpot", kind: "entity", entityType: "cover" },
+    // where to PRESS toward when we have a position on the threat but no shot (it's
+    // behind cover / just broke contact): the reachable spot that closes the distance.
+    // This is pursuit — a winning unit hunts a fleeing one down instead of losing it.
+    { name: "advanceSpot", kind: "entity", entityType: "cover" },
+    // sweeping toward last contact after losing the threat fix (search to re-acquire)
+    { name: "searching", kind: "boolean", initial: false },
     // selects the positioning engine: false ⇒ the bespoke spot-graph route (default);
     // true ⇒ the generic GOAP search over move+engage, guided by a domain potential-
     // field heuristic (the planner DISCOVERS the route itself). Set per-unit at init.
@@ -760,16 +770,37 @@ export const squadDomain: DomainDoc = {
       executor: "move",
     },
     {
-      // move to a flanking cover (coordinated flank tactic); same motion, tagged
-      name: "flankTo",
+      // pursuit: close on the believed threat to re-establish a line of fire (it's
+      // behind cover or just broke contact). Survival-gated like any advance, so a unit
+      // only hunts when it can do so without crossing into a lethal lane — a healthy
+      // winner runs a fleeing enemy down; a hurt one doesn't over-extend.
+      name: "pursueTo",
       params: [{ name: "c", type: "cover" }],
-      pre: F.and(F.lit("coverFlank", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
-      // a flank is a deliberate maneuver to break symmetry — commit to it (only
-      // bail if the slot is taken; being hurt is handled by the retreat method)
-      verify: F.not(F.lit("coverTaken", ["?c"])),
+      pre: F.and(F.lit("useGoap"), F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      verify: F.and(F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
+        E.dec("myHp", [], N.ext("crossDmgTo", ["?c"], MOVE_SURV_READS), "planOnly"),
+      ],
+      cost: N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // move to a flanking cover (coordinated flank tactic); same motion, tagged.
+      // Now survival-aware: survivesMove gates a flank whose crossing would be lethal —
+      // BUT the crossing damage is discounted by covering fire (incomingDpsVsSquad), so
+      // a suppressor pinning the enemy is exactly what makes the flanker's dash survive.
+      // The flank thus EMERGES as safe only when the squad is actually suppressing.
+      name: "flankTo",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("coverFlank", ["?c"]), F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+        E.dec("myHp", [], N.ext("crossDmgTo", ["?c"], MOVE_SURV_READS), "planOnly"),
       ],
       cost: N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)),
       duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
@@ -967,6 +998,16 @@ export const squadDomain: DomainDoc = {
         { do: "Neutralize" },
       ],
     },
+    // 4b. lost the threat fix but had contact recently → SWEEP toward where we last saw
+    // it to re-acquire, rather than idle and let it slip away. Survival-gated via
+    // pursueTo. This closes the "winner loses the fleeing loser" standoff.
+    {
+      name: "searchContact",
+      task: "Fight",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("searching"), F.not(F.lit("tactic", [], "breach")), F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      subtasks: [{ do: "pursueTo", args: ["?c"] }],
+    },
     // 5. no threat fix at all → stand by in short beats (reactively wakes on contact)
     {
       name: "idle",
@@ -1006,6 +1047,15 @@ export const squadDomain: DomainDoc = {
     // can't do. Re-solved each beat, so it adapts as the fight moves. Two outcomes:
     //   • engage from here (the route says this spot is already the best place), or
     //   • move to the route's next hop, then re-decide.
+    // finishing shot: a target in your sights that's nearly dead (and that you can
+    // safely drop) gets engaged immediately — never reposition for a nicer angle and let
+    // a fleeing, near-dead enemy escape. Tried first, in both positioning modes.
+    {
+      name: "finishOff",
+      task: "Neutralize",
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.lte(N.fl("threatHp"), N.c(FINISH_HP)), F.ext("survivesEngage", [], ENGAGE_SURV_READS)),
+      subtasks: [{ do: "engageFrom" }],
+    },
     {
       name: "engageHere",
       task: "Neutralize",
@@ -1031,6 +1081,18 @@ export const squadDomain: DomainDoc = {
       task: "Neutralize",
       pre: F.and(F.lit("useGoap"), F.lit("hasThreat")),
       subtasks: [{ achieve: F.lte(N.fl("threatHp"), N.c(0)) }],
+    },
+    // PURSUE: we have a position on the threat but no shot from anywhere reachable
+    // (it's behind cover or just ran) — so close on it to re-establish a line of fire
+    // rather than hold and lose it. Survival-gated (won't chase into a kill lane), and
+    // only when not already breaking contact, so a winning unit hunts a fleeing one
+    // down. This is what turns a cautious standoff into a resolution.
+    {
+      name: "pursue",
+      task: "Neutralize",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("hasThreat"), F.not(F.lit("mustRetreat")), F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      subtasks: [{ do: "pursueTo", args: ["?c"] }],
     },
     // fallback: there's a threat but no actionable route right now (e.g. a defender
     // behind a closed door — you can't yet walk to any angle on them). Hold ready in
@@ -1270,6 +1332,7 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
         // chosen spot as the move target while staying a normal precondition.
         isChosen: (q) => Math.round(q.get("chosenSpot")) === q.args[0] + 1,
         isRetreatSpot: (q) => Math.round(q.get("retreatSpot")) === q.args[0] + 1,
+        isAdvanceSpot: (q) => Math.round(q.get("advanceSpot")) === q.args[0] + 1,
         // --- survival gates (the attrition model in the planner) ---
         // Will I still be standing after fighting the threat from where I am? Required on
         // engageFrom, so the planner never commits to a firefight it loses. caution
@@ -1547,6 +1610,8 @@ export interface UnitPlanner {
   allies: string[];
   /** per-foe clock of the last time this unit had a clear line of sight to it */
   foeLastSeen: Map<string, number>;
+  /** last believed contact (any foe seen/heard) + when — drives search-to-re-acquire */
+  lastContact?: { x: number; z: number; at: number };
   trace: TraceEvent[];
   /** most recent "why a branch was rejected" reasons (glass-box director, E3) */
   why: string[];
@@ -1798,6 +1863,33 @@ export class SquadSim {
     // the attrition read: is this fight unwinnable from anywhere, and where to run to
     setBelief(p, "mustRetreat", [], this.computeMustRetreat(p));
     setBelief(p, "retreatSpot", [], this.computeRetreatSpot(p) ?? false);
+    // pursuit / search: remember the last place we had contact; if we've since lost the
+    // threat fix entirely, sweep toward it to re-acquire (so a winner runs down a fleeing
+    // enemy instead of idling once it slips out of sight).
+    const fix = heard ?? null;
+    if (fix) p.lastContact = { x: fix.x, z: fix.z, at: this.world.clock };
+    const hasThreatNow = !!fix;
+    const searching = !hasThreatNow && !!p.lastContact && this.world.clock - p.lastContact.at < SEARCH_SECONDS;
+    setBelief(p, "searching", [], searching);
+    const target = hasThreatNow ? { x: heard!.x, z: heard!.z } : searching ? p.lastContact! : null;
+    setBelief(p, "advanceSpot", [], (target ? this.computeAdvanceSpot(p, target) : null) ?? false);
+  }
+
+  /** The cover that best closes on the believed threat (strictly nearer it than the
+   *  unit is now) — the next bound of a pursuit. Returns null when already as close as
+   *  the covers allow. pursueTo's survival gate decides whether the push is safe. */
+  private computeAdvanceSpot(p: UnitPlanner, target: { x: number; z: number }): string | null {
+    const me = this.world.actors.get(p.name);
+    if (!me) return null;
+    let best: string | null = null;
+    let bestD = dist2(me.x, me.z, target.x, target.z) - 1; // must be at least ~1 unit closer than here
+    for (const c of this.world.covers) {
+      const owner = this.world.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue;
+      const d = dist2(c.x, c.z, target.x, target.z);
+      if (d < bestD) { bestD = d; best = c.name; }
+    }
+    return best;
   }
 
   /** The safest cover this unit can fall back to — minimizes fire taken THERE plus fire
