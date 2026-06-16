@@ -1,218 +1,142 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
-import { type TraceEvent, F, N, explainFailure, goal, planOnce } from "../src/index";
-import { type SquadInstance, SquadSim, breachInstance, squadModel } from "../scenarios/index";
+import { type TraceEvent, F, explainFailure, goal, planOnce } from "../src/index";
+import { type SquadInstance, SquadSim, breachInstance, skirmishInstance, squadModel } from "../scenarios/index";
 
 /**
- * Squad Combat — ground-truth assertions for the F.E.A.R.-style tactical
- * scenario. These tests pin the *emergent* behaviours the demo shows off:
- * search-derived flanking, reactive replanning from perception, deterministic
- * traces, coordinated suppress-while-flank, cover reservation, and the
- * synchronized breach window. Everything runs the real reactive Planner.
+ * Squad Combat — ground-truth assertions for the emergent, search-driven positioning
+ * scenario. These pin the behaviours the demo shows off: a covered approach DERIVED by
+ * GOAP route search (not scripted waypoints), reactive replanning from perception,
+ * deterministic traces, single-occupancy cell reservation, the player-command seam,
+ * and the synchronized breach window. Everything runs the real reactive Planner.
  */
 
-// the AI unit's executed step labels, in order (for asserting what it actually did)
 function stepStarts(sim: SquadSim, unit: string): string[] {
   return sim.trace.filter((t) => t.unit === unit && t.e.t === "step.start").map((t) => (t.e as { label: string }).label);
 }
 
+/** did the unit MOVE (take any grid step)? */
 function moved(labels: string[]): boolean {
-  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo)/.test(l));
+  return labels.some((l) => l.startsWith("step"));
 }
 
 // ---------------------------------------------------------------- domain validity
 
 test("squad: the combat domain compiles", () => {
-  // building a real per-unit model proves the domain validates + grounds + binds
-  const inst: SquadInstance = {
-    units: [{ name: "E", side: "enemy", x: 0, z: 0 }],
-    covers: [{ name: "c1", x: 1, z: 1 }],
-  };
+  const inst: SquadInstance = { units: [{ name: "E", side: "enemy", x: 0, z: 0 }], covers: [] };
   const model = squadModel(inst, "E");
-  assert.ok(model.operators.length >= 6, "operators compiled");
-  assert.ok(model.methodsByTask.has("Fight"), "Fight task has methods");
+  const ops = new Set(model.operators.map((o) => o.name));
+  assert.ok(ops.has("step") && ops.has("takeShot") && ops.has("reload") && ops.has("breach"), "core operators compiled");
+  assert.ok(model.methodsByTask.has("Fight") && model.methodsByTask.has("Neutralize"), "tasks have methods");
 });
 
-// ---------------------------------------------------------------- A: neutralize with clear LOS
+// ---------------------------------------------------------------- a lone NPC engages
 
-test("squad: a lone NPC with line of sight engages and neutralizes the target", () => {
+test("squad: a lone NPC with a clear line of sight engages and neutralizes the target", () => {
   const inst: SquadInstance = {
     units: [
-      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
-      { name: "player", side: "player", x: 6, z: 0 },
+      { name: "E", side: "enemy", x: 0, z: 0 },
+      { name: "player", side: "player", x: 7, z: 0 },
     ],
-    covers: [{ name: "c1", x: 0, z: 0 }],
+    covers: [],
   };
   const sim = new SquadSim(inst, { seed: 7 });
   sim.run(400);
-  const player = sim.world.actors.get("player")!;
-  assert.equal(player.alive, false, "player neutralized");
+  assert.equal(sim.world.actors.get("player")!.alive, false, "player neutralized");
   assert.ok(stepStarts(sim, "E").some((l) => l.startsWith("takeShot")), "the NPC fired");
 });
 
-// ---------------------------------------------------------------- A: search-derived flanking (E1)
+// ---------------------------------------------------------------- emergent routing (E1)
 
-/** A wall blocks the straight line of fire; LOS is only available from the side. */
+/** A wall blocks the straight line of fire; LOS exists only by going around it. */
 function blockedLane(wall: boolean): SquadInstance {
   return {
     units: [
-      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
-      { name: "player", side: "player", x: 0, z: 10 },
+      { name: "E", side: "enemy", x: 0, z: 0 },
+      { name: "player", side: "player", x: 0, z: 12 },
     ],
-    covers: [
-      { name: "cNear", x: 0, z: 2 }, // still behind the wall — no LOS
-      { name: "fSide", x: 6, z: 6, flank: true }, // around the wall — clear LOS
-    ],
-    walls: wall ? [{ x: -2, z: 4, w: 4, d: 1 }] : [],
+    covers: [],
+    walls: wall ? [{ x: -4, z: 5, w: 8, d: 1.5 }] : [],
   };
 }
 
-test("squad: blocked line of fire ⇒ the NPC derives a flank to a cover that can see (emergent spatial tactics)", () => {
+test("squad: a blocked line of fire ⇒ the NPC SEARCHES a multi-step route around it (emergent spatial tactics)", () => {
   const blocked = new SquadSim(blockedLane(true), { seed: 3 });
   blocked.run(500);
-  const movedToFlank = moved(stepStarts(blocked, "E"));
-  assert.ok(movedToFlank, "with the lane blocked, the NPC relocates to get a line of sight");
+  const steps = stepStarts(blocked, "E").filter((l) => l.startsWith("step"));
+  assert.ok(steps.length >= 2, "with the lane blocked the NPC walks a multi-step route to find an angle");
   assert.equal(blocked.world.actors.get("player")!.alive, false, "and still neutralizes the target");
 
-  // contrast: remove the wall and the SAME unit shoots straight away, no detour —
-  // proving the flank was discovered from geometry, not scripted.
+  // contrast: remove the wall and the SAME unit fires from where it stands, no detour —
+  // proving the route was DISCOVERED from geometry, not scripted.
   const clear = new SquadSim(blockedLane(false), { seed: 3 });
-  // step a few times so it can plan + fire from spawn
-  for (let i = 0; i < 20 && !clear.engagementOver(); i++) clear.step();
+  for (let i = 0; i < 30 && !clear.engagementOver(); i++) clear.step();
   assert.not.ok(moved(stepStarts(clear, "E")), "with a clear lane it does NOT detour — it just fires");
 });
 
-// ---------------------------------------------------------------- A: reactive replanning from perception
+// ---------------------------------------------------------------- reactive replanning
 
 test("squad: perception drives reactive replanning (the planner reacts to a moving world)", () => {
   const inst: SquadInstance = {
     units: [
-      { name: "E", side: "enemy", x: -6, z: 0, role: "assault" },
-      { name: "player", side: "player", x: 6, z: 0 },
+      { name: "E", side: "enemy", x: -7, z: 0 },
+      { name: "player", side: "player", x: 7, z: 0 },
     ],
-    covers: [
-      { name: "a", x: -3, z: 0 },
-      { name: "b", x: 0, z: -3 },
-    ],
-    // the player walks across the field — the NPC must keep re-deciding
+    covers: [],
     playerPath: [
-      { x: 6, z: 0 },
-      { x: 6, z: 8 },
-      { x: -2, z: 8 },
+      { x: 7, z: 0 },
+      { x: 7, z: 9 },
+      { x: -3, z: 9 },
     ],
   };
   const sim = new SquadSim(inst, { seed: 5 });
   sim.run(500);
-  const dirty = sim.trace.filter((t) => t.unit === "E" && t.e.t === "replan.dirty");
-  assert.ok(dirty.length > 0, "the NPC replanned in reaction to the changing world");
+  assert.ok(sim.trace.some((t) => t.unit === "E" && t.e.t === "replan.dirty"), "the NPC replanned as the world changed");
 });
 
-// ---------------------------------------------------------------- A: determinism
+// ---------------------------------------------------------------- determinism
 
 test("squad: identical seed + fixed timestep ⇒ byte-identical traces", () => {
-  const mk = () =>
-    new SquadSim(
-      {
-        units: [
-          { name: "E1", side: "enemy", x: -6, z: -3, role: "suppressor" },
-          { name: "E2", side: "enemy", x: -6, z: 3, role: "flanker" },
-          { name: "player", side: "player", x: 6, z: 0 },
-        ],
-        covers: [
-          { name: "n", x: -2, z: -3 },
-          { name: "s", x: -2, z: 3 },
-          { name: "f", x: 4, z: 6, flank: true },
-        ],
-      },
-      { seed: 11 },
-    );
+  const mk = () => new SquadSim(skirmishInstance(), { seed: 11 });
   const run = (sim: SquadSim): string => {
-    sim.run(400);
+    sim.run(300);
     return JSON.stringify(sim.trace);
   };
   assert.equal(run(mk()), run(mk()), "two runs with the same seed are identical");
 });
 
-// ---------------------------------------------------------------- B: suppress-while-flank coordination
+// ---------------------------------------------------------------- the skirmish resolves
 
-test("squad: two NPCs coordinate — one suppresses while the other flanks (scoped, reactive)", () => {
-  const inst: SquadInstance = {
-    units: [
-      { name: "E1", side: "enemy", x: -7, z: -2 },
-      { name: "E2", side: "enemy", x: -7, z: 2 },
-      { name: "player", side: "player", x: 7, z: 0 },
-    ],
-    covers: [
-      { name: "cA", x: -3, z: -2 },
-      { name: "cB", x: -3, z: 2 },
-      { name: "fN", x: 2, z: 7, flank: true },
-      { name: "fS", x: 2, z: -7, flank: true },
-      { name: "rally", x: -10, z: 0, rally: true },
-    ],
-  };
-  const sim = new SquadSim(inst, { seed: 9 });
+test("squad: two autonomous squads fight to a decision (one side is eliminated)", () => {
+  const sim = new SquadSim(skirmishInstance(), { seed: 7 });
+  sim.run(600);
+  assert.ok(sim.engagementOver(), "the engagement reaches a terminal state");
+  const teams = sim.snapshot().teams;
+  assert.ok(teams.some((t) => t.alive === 0) && teams.some((t) => t.alive > 0), "exactly one squad is left standing");
+  // and they did it by MOVING — searched routes, not a static shoot-out
+  assert.ok(sim.units.some((u) => moved(stepStarts(sim, u.name))), "units manoeuvred to firing positions");
+});
+
+// ---------------------------------------------------------------- single-occupancy cells
+
+test("squad: cell reservation — two alive units never occupy the same cell", () => {
+  const sim = new SquadSim(skirmishInstance(), { seed: 4 });
   const frames = sim.run(600);
-
-  // coordinator promoted the enemy team to the flank tactic
-  assert.equal(sim.world.team("enemy").tactic, "flank", "≥2 in contact ⇒ coordinated flank");
-  // the suppressor opened a suppress-cover scope (cover fire)
-  const e1Scopes = sim.trace.filter((t) => t.unit === "E1" && t.e.t === "scope.enter");
-  assert.ok(
-    e1Scopes.some((t) => (t.e as { label: string }).label.includes("suppress")),
-    "the suppressor laid down covering fire inside a scope",
-  );
-  // the flanker actually flanked, and reaching position flipped the squad flag
-  assert.ok(stepStarts(sim, "E2").some((l) => l.startsWith("flankTo")), "the flanker moved to a flank cover");
-  assert.ok(frames.some((f) => f.teams.find((t) => t.side === "enemy")?.flankerReady), "the flanker reached position (squad flag set)");
-});
-
-// ---------------------------------------------------------------- B: cover reservation under contention
-
-test("squad: cover reservation — two NPCs never share a slot and split to distinct cover", () => {
-  // both spawns are blocked from the target; the only cover with a line of fire is
-  // contested, so the reservation must push the loser to the other LOS cover.
-  const inst: SquadInstance = {
-    units: [
-      { name: "E1", side: "enemy", x: -1, z: -1 },
-      { name: "E2", side: "enemy", x: -1, z: 1 },
-      { name: "player", side: "player", x: 0, z: 11 },
-    ],
-    covers: [
-      { name: "cBlocked", x: 0, z: 2 }, // still behind the wall — useless
-      { name: "cL", x: -5, z: 7 }, // LOS, nearest to both
-      { name: "cR", x: 5, z: 7 }, // LOS, the fallback
-    ],
-    walls: [{ x: -3, z: 4, w: 6, d: 1 }],
-  };
-  const sim = new SquadSim(inst, { seed: 4 });
-  const frames = sim.run(700);
-
-  // invariant: at no frame do two alive units hold the same claimed cover
   for (const f of frames) {
-    const claimed = f.units.filter((u) => u.alive && u.cover).map((u) => u.cover);
-    assert.equal(new Set(claimed).size, claimed.length, `distinct covers @ t=${f.clock}`);
+    const cells = f.units.filter((u) => u.alive && u.cover).map((u) => u.cover);
+    assert.equal(new Set(cells).size, cells.length, `distinct cells @ t=${f.clock}`);
   }
-  // the reservation pushed the two NPCs onto BOTH line-of-fire covers (they would
-  // both have greedily taken the nearer one)
-  const claimedEver = new Set<string>();
-  for (const f of frames) for (const [c, owner] of Object.entries(f.reservations)) if (owner) claimedEver.add(c);
-  assert.ok(claimedEver.has("cL") && claimedEver.has("cR"), "the NPCs split across both line-of-fire covers");
-  // the loser reacted to the slot being taken (fluent-precise replan)
-  assert.ok(
-    sim.trace.some((t) => t.e.t === "replan.dirty"),
-    "contention triggered reactive replanning",
-  );
 });
 
-// ---------------------------------------------------------------- C: ally companion
+// ---------------------------------------------------------------- ally companion
 
-test("squad: an allied companion auto-assists — engages the enemy, never a friendly", () => {
+test("squad: an allied companion auto-assists — engages the enemy", () => {
   const inst: SquadInstance = {
     units: [
       { name: "ally", side: "ally", x: 0, z: 0 },
       { name: "enemy", side: "enemy", x: 8, z: 0 },
     ],
-    covers: [{ name: "c", x: 0, z: 0 }],
+    covers: [],
   };
   const sim = new SquadSim(inst, { seed: 6 });
   sim.run(400);
@@ -226,37 +150,34 @@ test("squad: with only friendlies present the ally holds fire (no friendly targe
       { name: "ally", side: "ally", x: 0, z: 0 },
       { name: "player", side: "player", x: 3, z: 0 },
     ],
-    covers: [{ name: "c", x: 0, z: 0 }],
+    covers: [],
   };
   const sim = new SquadSim(inst, { seed: 6 });
   for (let i = 0; i < 60; i++) sim.step();
   assert.equal(sim.world.actors.get("player")!.hp, 100, "the friendly is untouched");
   assert.not.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally never fired");
-  assert.not.equal(sim.units[0].planner.getStatus(), "failed", "no fight to pick ⇒ the ally idles, it doesn't fail-loop");
+  assert.not.equal(sim.units[0].planner.getStatus(), "failed", "no fight ⇒ the ally idles, it doesn't fail-loop");
 });
 
 // ---------------------------------------------------------------- E2: player command via setGoals
 
-test("squad: a player 'regroup' order swaps the ally's goal and it obeys (setGoals seam)", () => {
+test("squad: a player 'regroup' order swaps the ally's goal and it falls back to a rally (setGoals seam)", () => {
   const inst: SquadInstance = {
     units: [
-      { name: "ally", side: "ally", x: 0, z: 0 },
-      { name: "enemy", side: "enemy", x: 10, z: 0, hp: 30 }, // a brief contact the ally wins
+      { name: "ally", side: "ally", x: 4, z: 0, hp: 999 }, // unkillable for the test — it's about the order, not survival
+      { name: "enemy", side: "enemy", x: 16, z: 0 },
     ],
-    covers: [
-      { name: "post", x: 1, z: 0 },
-      { name: "rally", x: -9, z: 0, rally: true },
-    ],
+    covers: [{ name: "rally", x: -8, z: 0, rally: true }],
   };
   const sim = new SquadSim(inst, { seed: 2 });
-  for (let i = 0; i < 25; i++) sim.step();
-  assert.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally was engaging before the order");
+  for (let i = 0; i < 15; i++) sim.step();
 
   const before = sim.trace.length;
   sim.command("ally", "regroup"); // ← player order, routed through setGoals
-  for (let i = 0; i < 150 && sim.world.actors.get("ally")!.cover !== "rally"; i++) sim.step();
+  const rallyCell = sim.world.nav.cells.find((c) => c.rally)!.name;
+  for (let i = 0; i < 200 && sim.world.actors.get("ally")!.cell !== rallyCell; i++) sim.step();
 
-  assert.equal(sim.world.actors.get("ally")!.cover, "rally", "the ally fell back to the rally point on command");
+  assert.equal(sim.world.actors.get("ally")!.cell, rallyCell, "the ally fell back to the rally cell on command");
   assert.ok(
     sim.trace.slice(before).some((t) => t.unit === "ally" && (t.e.t === "plan.new" || t.e.t === "step.start")),
     "the order triggered a fresh plan",
@@ -267,58 +188,52 @@ test("squad: a player 'regroup' order swaps the ally's goal and it obeys (setGoa
 
 test("squad: a fire-team breaches in sync inside a deadline window (temporal-lite)", () => {
   const sim = new SquadSim(breachInstance(), { seed: 8 });
-  const frames = sim.run(500);
+  sim.run(500);
 
   for (const u of ["R1", "R2"]) {
     const scopes = sim.trace.filter((t) => t.unit === u && t.e.t === "scope.enter");
-    assert.ok(
-      scopes.some((t) => (t.e as { label: string }).label.includes("breach-window")),
-      `${u} entered the timed breach window`,
-    );
-    assert.ok(stepStarts(sim, u).some((l) => l.startsWith("moveToBreach")), `${u} stacked on the door`);
+    assert.ok(scopes.some((t) => (t.e as { label: string }).label.includes("breach-window")), `${u} entered the timed breach window`);
   }
-  // the breachers used DISTINCT door slots (no piling onto one spot)
-  const claimedEver = new Set<string>();
-  for (const f of frames) for (const [c, o] of Object.entries(f.reservations)) if (o) claimedEver.add(c);
-  assert.ok(claimedEver.has("stackL") && claimedEver.has("stackR"), "the breachers stacked on distinct door slots");
-  // the door was breached (one kick opens it for the team)
   assert.ok(sim.world.doorBroken, "the door was breached open");
-  assert.ok(sim.trace.some((t) => t.e.t === "step.start" && (t.e as { label: string }).label.startsWith("breach")), "a breach action fired");
-  // nobody blew the deadline — the window was met
+  assert.ok(
+    sim.trace.some((t) => t.e.t === "step.start" && (t.e as { label: string }).label.startsWith("breach")),
+    "a breach action fired",
+  );
   const blown = sim.trace.filter((t) => t.e.t === "scope.violated" && (t.e as { reason: string }).reason === "deadline");
   assert.equal(blown.length, 0, "the breach completed within the window (no deadline violation)");
-  // the breach made contact with the defenders holding the room
   assert.ok([sim.world.actors.get("B1")!, sim.world.actors.get("B2")!].some((b) => b.hp < 100), "the breach hit the defenders");
 });
 
-// ---------------------------------------------------------------- E3: glass-box — explain why a branch was rejected
+// ---------------------------------------------------------------- E3: glass-box rejection reasons
 
 test("squad: the planner can explain why an impossible engagement fails (glass-box)", () => {
-  // a unit boxed in with no line of fire and nowhere with one ⇒ neutralize is
-  // unreachable; explainFailure surfaces readable rejection reasons.
+  // a target fully walled off: no cell anywhere can see it, so achieve(canSee) — and
+  // hence neutralize — is unreachable; explainFailure surfaces readable reasons.
   const inst: SquadInstance = {
     units: [
-      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+      { name: "E", side: "enemy", x: 0, z: 0 },
       { name: "player", side: "player", x: 0, z: 6 },
     ],
-    covers: [{ name: "c", x: 0, z: 1 }], // also boxed in
-    // fully enclose the target so no cover anywhere has a line of fire
-    walls: [{ x: -3, z: 3, w: 6, d: 1 }],
+    covers: [],
+    walls: [
+      { x: -3, z: 3, w: 6, d: 1 },
+      { x: -3, z: 9, w: 6, d: 1 },
+      { x: -3, z: 3, w: 1, d: 7 },
+      { x: 2, z: 3, w: 1, d: 7 },
+    ],
   };
   const model = squadModel(inst, "E");
   const state = model.createExecState();
-  // seed a believed threat the unit cannot see (boxed behind the wall)
   state.set(model.slotOf("hasThreat"), 1);
   state.buffer[model.slotOf("threatPos")] = 0;
   state.buffer[model.slotOf("threatPos") + 1] = 6;
   const result = planOnce(model, state, {
-    goals: [goal(F.lte(N.fl("threatHp"), N.c(0)))],
+    goals: [goal(F.ext("canSee", [], ["myPos", "threatPos"]))],
     collectRejections: true,
     maxNodes: 4000,
   });
-  assert.equal(result.status, "failure", "no line of fire exists ⇒ planning fails");
-  const reasons = explainFailure(result);
-  assert.ok(reasons.length > 0, "explainFailure produced human-readable rejection reasons");
+  assert.equal(result.status, "failure", "no reachable line of sight ⇒ planning fails");
+  assert.ok(explainFailure(result).length > 0, "explainFailure produced human-readable rejection reasons");
 });
 
 // ---------------------------------------------------------------- exports sanity
