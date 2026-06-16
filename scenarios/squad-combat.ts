@@ -130,6 +130,15 @@ interface Actor {
   elevation: number;
 }
 
+/** One team's coordination blackboard (squad comms — shared within a team only). */
+export interface TeamState {
+  tactic: "hold" | "flank" | "breach";
+  /** a flanker on this team has reached position — its suppressors push up */
+  flankerReady: boolean;
+  /** this team has breached the door */
+  breached: boolean;
+}
+
 const HOSTILE: Record<Side, Side[]> = {
   enemy: ["player", "ally"],
   ally: ["enemy"],
@@ -186,18 +195,26 @@ export class SquadWorld {
   public readonly coverByName = new Map<string, CoverSpec>();
   public readonly walls: WallSpec[];
 
-  // ---- blackboard (read by predicates, written by the coordinator/executors) ----
-  public squadTactic: "hold" | "flank" | "breach" = "hold";
+  // ---- blackboard — PER TEAM (each side coordinates its own squad; the two teams
+  //      share no memory, only physical cover reservations) ----
+  private readonly teamState = new Map<Side, TeamState>();
   /** cover name → owning unit name (reservation); prevents two units per slot */
   public readonly coverOwner = new Map<string, string | null>();
-  /** a flanker has reached its flanking cover — suppressors stop suppressing & push */
-  public flankerReady = false;
-  /** number of breachers stacked at the door (E4) */
-  public stacked = 0;
-  /** the door has been breached — the coordinator switches off the breach tactic */
-  public breached = false;
   /** most recent bark per unit, for the view */
   public readonly barks = new Map<string, { text: string; at: number }>();
+
+  /** the coordination blackboard for one team (lazily created). */
+  team(side: Side): TeamState {
+    let t = this.teamState.get(side);
+    if (!t) this.teamState.set(side, (t = { tactic: "hold", flankerReady: false, breached: false }));
+    return t;
+  }
+
+  /** the blackboard for the team `self` belongs to. */
+  teamOf(self: string): TeamState | null {
+    const a = this.actors.get(self);
+    return a ? this.team(a.side) : null;
+  }
 
   constructor(inst: SquadInstance) {
     this.covers = inst.covers;
@@ -474,9 +491,15 @@ export const squadDomain: DomainDoc = {
       task: "Fight",
       subtasks: [{ do: "Neutralize" }],
     },
-    // --- Neutralize: fire if there's a line of sight, else reposition to a cover
-    // that geometrically has one (the flank EMERGES from method selection; short
-    // reactive plans, re-entered each beat — no deep uninformed goal search).
+    // --- Neutralize: reload if dry, fire if there's a line of sight, else
+    // reposition to a cover that geometrically has one (the flank EMERGES from
+    // method selection; short reactive plans, re-entered each beat).
+    {
+      name: "reloadDry",
+      task: "Neutralize",
+      pre: F.and(F.lit("hasThreat"), F.lte(N.fl("myAmmo"), N.c(0))),
+      subtasks: [{ do: "reload" }, { do: "Neutralize" }],
+    },
     {
       name: "fireNow",
       task: "Neutralize",
@@ -592,8 +615,7 @@ function moveExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => Ta
     if (f >= 1) {
       a.x = cover.x;
       a.z = cover.z;
-      if (cover.flank) world.flankerReady = true;
-      if (cover.breach) world.stacked += 1;
+      if (cover.flank) world.team(a.side).flankerReady = true;
       return "success";
     }
     return "continue";
@@ -631,7 +653,7 @@ function suppressExecutor(self: string, world: SquadWorld): (api: ExecutorApi) =
       target.suppressedFor = 1.0; // pinned
       target.hp = Math.max(0, target.hp - SUPPRESS_DAMAGE * api.rng.next());
     }
-    if (world.flankerReady || a.ammo <= 0 || api.elapsedInStep() > SUPPRESS_MAX) return "success";
+    if (world.team(a.side).flankerReady || a.ammo <= 0 || api.elapsedInStep() > SUPPRESS_MAX) return "success";
     return "continue";
   };
 }
@@ -645,7 +667,7 @@ function breachExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => 
       target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
       if (target.hp <= 0) target.alive = false;
     }
-    world.breached = true;
+    world.team(a.side).breached = true;
     return "success";
   };
 }
@@ -720,11 +742,20 @@ export interface UnitFrame {
   why: string[];
 }
 
+export interface TeamFrame {
+  side: Side;
+  /** current squad tactic of this team */
+  tactic: string;
+  flankerReady: boolean;
+  alive: number;
+  total: number;
+}
+
 export interface SquadFrame {
   clock: number;
   units: UnitFrame[];
-  squadTactic: string;
-  flankerReady: boolean;
+  /** per-team coordination state (each side is its own squad) */
+  teams: TeamFrame[];
   /** cover name → owner unit (for the view) */
   reservations: Record<string, string | null>;
 }
@@ -761,7 +792,7 @@ export class SquadSim {
     this.nodes = opts.nodes ?? 60_000;
     this.barkAuthor = opts.bark ?? barkFor;
     this.world = new SquadWorld(inst);
-    if (inst.breach) this.world.squadTactic = "breach";
+    if (inst.breach) this.world.team("enemy").tactic = "breach"; // the attacking team breaches
     let seedBump = 0;
     for (const u of inst.units) {
       if (u.side === "player") continue;
@@ -821,7 +852,7 @@ export class SquadSim {
       const owner = this.world.coverOwner.get(c.name) ?? null;
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
     }
-    setBelief(p, "flankerReady", [], this.world.flankerReady);
+    setBelief(p, "flankerReady", [], this.world.team(p.side).flankerReady);
   }
 
   /** a fallen unit releases its cover reservation (so the slot frees up). */
@@ -851,21 +882,26 @@ export class SquadSim {
   }
 
   // ---- the squad coordinator: assigns roles/tactic into each unit's belief ----
+  /** Each team coordinates its OWN squad independently (no cross-team memory). */
   private coordinate(): void {
-    const enemies = this.units.filter((u) => u.side === "enemy" && (this.world.actors.get(u.name)?.alive ?? false));
-    // a breach opening ends once the door is cleared, then it's a standing fight
-    if (this.world.squadTactic === "breach" && this.world.breached) this.world.squadTactic = "hold";
-    const seeing = enemies.filter((u) => this.world.nearestHostile(u.name, true));
-    // two-or-more in contact → coordinated flank: one suppresses while one flanks
-    if (this.world.squadTactic !== "breach" && seeing.length >= 2) {
-      this.world.squadTactic = "flank";
-      enemies.forEach((u, i) => {
-        u.role = i === 0 ? "suppressor" : i === 1 ? "flanker" : "assault";
-      });
-    }
-    for (const u of enemies) {
-      setBelief(u, "role", [], u.role);
-      setBelief(u, "tactic", [], this.world.squadTactic === "breach" ? "breach" : this.world.squadTactic === "flank" ? "flank" : "hold");
+    const sides = [...new Set(this.units.map((u) => u.side))];
+    for (const side of sides) {
+      const members = this.units.filter((u) => u.side === side && (this.world.actors.get(u.name)?.alive ?? false));
+      const tb = this.world.team(side);
+      // a breach opening ends once the door is cleared, then it's a standing fight
+      if (tb.tactic === "breach" && tb.breached) tb.tactic = "hold";
+      const inContact = members.filter((u) => this.world.nearestHostile(u.name, true));
+      // two-or-more in contact → coordinated flank: one suppresses while one flanks
+      if (tb.tactic !== "breach" && inContact.length >= 2) {
+        tb.tactic = "flank";
+        members.forEach((u, i) => {
+          u.role = i === 0 ? "suppressor" : i === 1 ? "flanker" : "assault";
+        });
+      }
+      for (const u of members) {
+        setBelief(u, "role", [], u.role);
+        setBelief(u, "tactic", [], tb.tactic === "breach" ? "breach" : tb.tactic === "flank" ? "flank" : "hold");
+      }
     }
   }
 
@@ -924,10 +960,15 @@ export class SquadSim {
   }
 
   snapshot(): SquadFrame {
+    const sides = [...new Set(this.units.map((u) => u.side))];
+    const teams: TeamFrame[] = sides.map((side) => {
+      const all = [...this.world.actors.values()].filter((a) => a.side === side);
+      const tb = this.world.team(side);
+      return { side, tactic: tb.tactic, flankerReady: tb.flankerReady, alive: all.filter((a) => a.alive).length, total: all.length };
+    });
     return {
       clock: round(this.world.clock),
-      squadTactic: this.world.squadTactic,
-      flankerReady: this.world.flankerReady,
+      teams,
       reservations: Object.fromEntries(this.world.coverOwner),
       units: [...this.world.actors.values()].map((a) => {
         const up = this.units.find((u) => u.name === a.name);
@@ -961,7 +1002,7 @@ export class SquadSim {
           firingAt,
           firingKind,
           sees,
-          tactic: up ? (this.world.squadTactic === "breach" ? "breach" : this.world.squadTactic) : "—",
+          tactic: up ? this.world.team(a.side).tactic : "—",
           status,
           plan: up && plan ? planSummary(up.model, plan) : [],
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
@@ -981,10 +1022,10 @@ export class SquadSim {
     return frames;
   }
 
+  /** over when no living unit has any living hostile (one side wiped out). */
   engagementOver(): boolean {
-    const anyEnemyAlive = this.units.some((u) => u.side === "enemy" && (this.world.actors.get(u.name)?.alive ?? false));
-    const anyTargetAlive = [...this.world.actors.values()].some((a) => a.alive && a.side !== "enemy");
-    return !anyEnemyAlive || !anyTargetAlive;
+    const alive = [...this.world.actors.values()].filter((a) => a.alive);
+    return !alive.some((a) => alive.some((b) => (HOSTILE[a.side] ?? []).includes(b.side)));
   }
 }
 
@@ -1068,51 +1109,52 @@ export function barkFor(e: TraceEvent): string | null {
 
 // ---------------------------------------------------------------- instances
 
-/** Baseline skirmish: two NPCs flush a target on open ground with coordinated
- *  suppress-and-flank (matches F.E.A.R.). One pins the target while the other
- *  swings to a flank cover; reaching position releases the suppressor to push. */
+/** Skirmish: two autonomous squads (Red vs Blue) meet on open ground. Each side
+ *  coordinates its own suppress-and-flank from its OWN belief — no shared memory
+ *  across teams — and reactively readjusts as it discovers the other's moves. */
 export function skirmishInstance(): SquadInstance {
   return {
     units: [
-      { name: "E1", side: "enemy", x: -9, z: -1, role: "suppressor" },
-      { name: "E2", side: "enemy", x: -9, z: 1, role: "flanker" },
-      { name: "player", side: "player", x: 9, z: 0, hp: 100 },
+      { name: "R1", side: "enemy", x: -9, z: -1, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -9, z: 2, role: "flanker" },
+      { name: "B1", side: "ally", x: 9, z: 1, role: "suppressor" },
+      { name: "B2", side: "ally", x: 9, z: -2, role: "flanker" },
     ],
     covers: [
-      { name: "cN", x: -3, z: -2 },
-      { name: "cS", x: -3, z: 2 },
-      { name: "fN", x: 4, z: -7, flank: true },
-      { name: "fS", x: 4, z: 7, flank: true },
-      { name: "rally", x: -11, z: 0, rally: true },
+      { name: "cW", x: -4, z: 0 },
+      { name: "cE", x: 4, z: 0 },
+      { name: "fNW", x: -3, z: -7, flank: true },
+      { name: "fSW", x: -3, z: 7, flank: true },
+      { name: "fNE", x: 3, z: -7, flank: true },
+      { name: "fSE", x: 3, z: 7, flank: true },
+      { name: "rRally", x: -11, z: 0, rally: true },
+      { name: "bRally", x: 11, z: 0, rally: true },
     ],
-    // the target pushes in a little then holds in the open — both NPCs keep a line
-    // of sight, so the coordinator promotes them to the flank tactic
-    playerPath: [
-      { x: 9, z: 0 },
-      { x: 5, z: 0 },
-    ],
-    playerDwell: 1,
   };
 }
 
-/** Breach-and-clear: a fire-team stacks on a door and breaches in sync (E4). */
+/** Breach-and-clear: a Red fire-team breaches a room a Blue team is holding (E4).
+ *  Red stacks and breaches in sync inside a deadline window; Blue defends. */
 export function breachInstance(): SquadInstance {
   return {
     breach: true,
     units: [
-      { name: "E1", side: "enemy", x: -4, z: 0, role: "assault" },
-      { name: "E2", side: "enemy", x: 4, z: 0, role: "assault" },
-      { name: "player", side: "player", x: 0, z: 8 }, // holed up in the room
+      { name: "R1", side: "enemy", x: -4, z: 0, role: "assault" },
+      { name: "R2", side: "enemy", x: 4, z: 0, role: "assault" },
+      { name: "B1", side: "ally", x: -2, z: 9, role: "assault" }, // defenders in the room
+      { name: "B2", side: "ally", x: 2, z: 9, role: "assault" },
     ],
     covers: [
-      { name: "door", x: 0, z: 4, breach: true }, // the stack-up / breach point
-      { name: "cW", x: -5, z: 3 },
-      { name: "cE", x: 5, z: 3 },
+      { name: "door", x: 0, z: 4, breach: true }, // Red's stack-up / breach point
+      { name: "cW", x: -5, z: 2 },
+      { name: "cE", x: 5, z: 2 },
+      { name: "rN", x: -3, z: 11 },
+      { name: "rNE", x: 3, z: 11 },
     ],
-    // a wall with a doorway: blocks the line of fire so the room must be breached
+    // a wall with a central doorway: Red must breach to reach the room
     walls: [
-      { x: -6, z: 5, w: 5, d: 1 },
-      { x: 1, z: 5, w: 5, d: 1 },
+      { x: -7, z: 5, w: 6, d: 1 },
+      { x: 1, z: 5, w: 6, d: 1 },
     ],
   };
 }

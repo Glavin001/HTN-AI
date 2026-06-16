@@ -5,7 +5,7 @@ import { useMemo, useRef } from "react";
 import * as THREE from "three";
 import type { SquadFrame, SquadInstance, UnitFrame } from "@scenarios/squad-combat";
 
-const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#34d399", player: "#38bdf8" };
+const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
 const COVER_COLOR = { free: "#475569", flank: "#f59e0b", high: "#a78bfa", breach: "#f43f5e", rally: "#22c55e" };
 const CHEST = 0.55;
 const HOSTILE: Record<string, string[]> = { enemy: ["player", "ally"], ally: ["enemy"], player: ["enemy"] };

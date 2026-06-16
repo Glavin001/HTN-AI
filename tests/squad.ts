@@ -153,8 +153,8 @@ test("squad: two NPCs coordinate — one suppresses while the other flanks (scop
   const sim = new SquadSim(inst, { seed: 9 });
   const frames = sim.run(600);
 
-  // coordinator promoted them to the flank tactic
-  assert.equal(sim.world.squadTactic, "flank", "≥2 in contact ⇒ coordinated flank");
+  // coordinator promoted the enemy team to the flank tactic
+  assert.equal(sim.world.team("enemy").tactic, "flank", "≥2 in contact ⇒ coordinated flank");
   // the suppressor opened a suppress-cover scope (cover fire)
   const e1Scopes = sim.trace.filter((t) => t.unit === "E1" && t.e.t === "scope.enter");
   assert.ok(
@@ -163,7 +163,7 @@ test("squad: two NPCs coordinate — one suppresses while the other flanks (scop
   );
   // the flanker actually flanked, and reaching position flipped the squad flag
   assert.ok(stepStarts(sim, "E2").some((l) => l.startsWith("flankTo")), "the flanker moved to a flank cover");
-  assert.ok(frames.some((f) => f.flankerReady), "the flanker reached position (squad flag set)");
+  assert.ok(frames.some((f) => f.teams.find((t) => t.side === "enemy")?.flankerReady), "the flanker reached position (squad flag set)");
 });
 
 // ---------------------------------------------------------------- B: cover reservation under contention
@@ -269,7 +269,7 @@ test("squad: a fire-team breaches in sync inside a deadline window (temporal-lit
   const sim = new SquadSim(breachInstance(), { seed: 8 });
   sim.run(500);
 
-  for (const u of ["E1", "E2"]) {
+  for (const u of ["R1", "R2"]) {
     const scopes = sim.trace.filter((t) => t.unit === u && t.e.t === "scope.enter");
     assert.ok(
       scopes.some((t) => (t.e as { label: string }).label.includes("breach-window")),
@@ -281,7 +281,8 @@ test("squad: a fire-team breaches in sync inside a deadline window (temporal-lit
   // nobody blew the deadline — the window was met
   const blown = sim.trace.filter((t) => t.e.t === "scope.violated" && (t.e as { reason: string }).reason === "deadline");
   assert.equal(blown.length, 0, "the breach completed within the window (no deadline violation)");
-  assert.equal(sim.world.actors.get("player")!.alive, false, "the room was cleared");
+  // the breach made contact with the defenders holding the room
+  assert.ok([sim.world.actors.get("B1")!, sim.world.actors.get("B2")!].some((b) => b.hp < 100), "the breach hit the defenders");
 });
 
 // ---------------------------------------------------------------- E3: glass-box — explain why a branch was rejected

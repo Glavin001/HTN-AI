@@ -1,13 +1,13 @@
 "use client";
 /**
  * Bridge between the htn-ai squad-combat scenario and the 3D view. We build the
- * shared SquadSim, run the *real* reactive Planners (one per NPC) to a terminal
- * state, and capture a world snapshot after every step plus each unit's live plan
- * and trace. The scene then scrubs through these frames — deterministic replay of
- * the engagement (seed + fixed timestep), so the playback slider IS the glass-box
- * director's replay scrubber. Nothing here re-implements planning.
+ * shared SquadSim — TWO autonomous squads (Red vs Blue), each unit a real reactive
+ * Planner with its OWN belief and no shared memory across teams — run it to a
+ * terminal state, and capture a world snapshot after every step plus each unit's
+ * live plan and trace. The scene scrubs through these frames: deterministic replay
+ * of the whole skirmish (seed + fixed timestep). Nothing here re-implements planning.
  */
-import { SquadSim, breachInstance, skirmishInstance, type SquadFrame, type SquadInstance } from "@scenarios/squad-combat";
+import { SquadSim, breachInstance, skirmishInstance, type SquadFrame, type SquadInstance, type TeamFrame } from "@scenarios/squad-combat";
 import type { TraceEvent } from "htn-ai";
 
 export type SquadScenarioId = "skirmish" | "blockedFlank" | "breach" | "companion";
@@ -17,43 +17,51 @@ export interface SquadRun {
   instance: SquadInstance;
   frames: SquadFrame[];
   trace: { unit: string; e: TraceEvent }[];
-  /** the AI unit names (enemies + ally) for the director's unit picker */
+  /** the AI unit names (both squads) for the director's unit picker */
   units: string[];
 }
 
-/** A wall forces the only line of fire to the flanks — the staircase emergence in combat. */
+/** A central barricade blocks every direct shot — both squads must flank around it. */
 function blockedFlankInstance(): SquadInstance {
   return {
     units: [
-      { name: "E1", side: "enemy", x: -9, z: -2, role: "suppressor" },
-      { name: "E2", side: "enemy", x: -9, z: 2, role: "flanker" },
-      { name: "player", side: "player", x: 9, z: 0 },
+      { name: "R1", side: "enemy", x: -10, z: -1, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -10, z: 2, role: "flanker" },
+      { name: "B1", side: "ally", x: 10, z: 1, role: "suppressor" },
+      { name: "B2", side: "ally", x: 10, z: -2, role: "flanker" },
     ],
     covers: [
-      { name: "cNear", x: -3, z: 0 }, // behind the barricade — no line of fire
-      { name: "fN", x: 4, z: -7, flank: true }, // around the side — clear shot
-      { name: "fS", x: 4, z: 7, flank: true },
-      { name: "rally", x: -11, z: 0, rally: true },
+      { name: "cW", x: -5, z: 0 },
+      { name: "cE", x: 5, z: 0 },
+      { name: "fNW", x: -3, z: -8, flank: true },
+      { name: "fSW", x: -3, z: 8, flank: true },
+      { name: "fNE", x: 3, z: -8, flank: true },
+      { name: "fSE", x: 3, z: 8, flank: true },
+      { name: "rRally", x: -12, z: 0, rally: true },
+      { name: "bRally", x: 12, z: 0, rally: true },
     ],
-    walls: [{ x: -1, z: -3, w: 2, d: 6 }], // a central barricade blocking the direct lane
+    walls: [{ x: -2, z: -5, w: 4, d: 10 }], // the only shots are around the flanks
   };
 }
 
-/** An allied companion fights beside the player against two enemies. */
+/** Your Blue squad (autonomous) vs a Red squad — you command one Blue unit. */
 function companionInstance(): SquadInstance {
   return {
     units: [
-      { name: "ally", side: "ally", x: 4, z: 0, hp: 240 },
-      { name: "player", side: "player", x: 7, z: 0, hp: 160 },
-      { name: "E1", side: "enemy", x: -9, z: -2, hp: 60, role: "suppressor" },
-      { name: "E2", side: "enemy", x: -9, z: 3, hp: 60, role: "flanker" },
+      { name: "B1", side: "ally", x: 8, z: -1, role: "suppressor" },
+      { name: "B2", side: "ally", x: 8, z: 2, role: "flanker" },
+      { name: "R1", side: "enemy", x: -9, z: -1, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -9, z: 2, role: "flanker" },
     ],
     covers: [
-      { name: "cN", x: 0, z: -4 },
-      { name: "cS", x: 0, z: 4 },
-      { name: "fN", x: -5, z: -7, flank: true },
-      { name: "fS", x: -5, z: 7, flank: true },
-      { name: "rally", x: 10, z: 0, rally: true },
+      { name: "cW", x: -3, z: 0 },
+      { name: "cE", x: 3, z: 0 },
+      { name: "fNW", x: -2, z: -7, flank: true },
+      { name: "fSW", x: -2, z: 7, flank: true },
+      { name: "fNE", x: 2, z: -7, flank: true },
+      { name: "fSE", x: 2, z: 7, flank: true },
+      { name: "bRally", x: 11, z: 0, rally: true },
+      { name: "rRally", x: -11, z: 0, rally: true },
     ],
   };
 }
@@ -68,7 +76,7 @@ export function squadInstance(id: SquadScenarioId): SquadInstance {
 }
 
 export interface SquadRunOptions {
-  /** inject a player order to the ally at a given step (E2 commands, deterministic replay) */
+  /** inject a player order to a Blue unit at a step (E2 commands, deterministic replay) */
   allyCommand?: { at: number; order: "engage" | "regroup" | "holdFire"; unit?: string };
   maxSteps?: number;
 }
@@ -79,19 +87,11 @@ export function runSquad(id: SquadScenarioId, opts: SquadRunOptions = {}): Squad
   const maxSteps = opts.maxSteps ?? 600;
   const frames: SquadFrame[] = [sim.snapshot()];
   for (let i = 0; i < maxSteps; i++) {
-    if (opts.allyCommand && i === opts.allyCommand.at) {
-      sim.command(opts.allyCommand.unit ?? "ally", opts.allyCommand.order);
-    }
+    if (opts.allyCommand && i === opts.allyCommand.at) sim.command(opts.allyCommand.unit ?? "B1", opts.allyCommand.order);
     frames.push(sim.step());
     if (sim.engagementOver()) break;
   }
-  return {
-    scenario: id,
-    instance,
-    frames,
-    trace: sim.trace,
-    units: sim.units.map((u) => u.name),
-  };
+  return { scenario: id, instance, frames, trace: sim.trace, units: sim.units.map((u) => u.name) };
 }
 
 /** Counts per trace event kind, for the summary panel. */
@@ -101,44 +101,44 @@ export function squadTraceSummary(trace: { unit: string; e: TraceEvent }[]): { l
   return [...counts.entries()].map(([label, count]) => ({ label, count }));
 }
 
-/** The squad's current coordination state, as a short banner. */
-export function squadTacticBanner(frame: SquadFrame): { label: string; hint: string } {
-  const tactic = frame.squadTactic;
-  if (tactic === "breach") return { label: "BREACH", hint: "stack on the door + breach inside the deadline window" };
-  if (tactic === "flank") return { label: "FLANK", hint: frame.flankerReady ? "flanker in position — suppressor pushing up" : "one suppresses while the other swings wide" };
-  return { label: "HOLD", hint: "engaging from cover" };
+/** Display name + colour for a team (internal sides → Red / Blue). */
+export function teamName(side: string): string {
+  return side === "enemy" ? "Red" : "Blue";
+}
+export function teamColor(side: string): string {
+  return side === "enemy" ? "#ef4444" : "#3b82f6";
+}
+export function teamHint(t: TeamFrame): string {
+  if (t.tactic === "breach") return "breaching the room";
+  if (t.tactic === "flank") return t.flankerReady ? "flanker set — pushing up" : "suppress + flank";
+  return "holding";
 }
 
-/** A plain-English caption of what's happening this frame — the live educator. */
+/** A plain-English caption of what BOTH squads are doing this frame — the educator. */
 export function squadNarration(frame: SquadFrame): string {
-  const enemies = frame.units.filter((u) => u.side === "enemy");
-  const friends = frame.units.filter((u) => u.side !== "enemy");
-  if (enemies.length && enemies.every((u) => !u.alive)) return "✓ Enemies neutralized — the engagement is over.";
-  if (friends.length && friends.every((u) => !u.alive)) return "✓ Target down — the squad cleared the area.";
-
-  const ai = frame.units.filter((u) => u.side !== "player" && u.alive);
-  const names = (verb: (a: string) => boolean) => ai.filter((u) => verb(u.action)).map((u) => u.name);
-  const breaching = names((a) => a === "breaching" || a === "stacking on door");
-  const suppressing = names((a) => a.startsWith("suppress"));
-  const flanking = names((a) => a === "flanking");
-  const firing = names((a) => a.startsWith("firing"));
-  const moving = names((a) => a.includes("moving") || a.includes("high ground"));
-  const fallingBack = names((a) => a === "falling back");
-
-  if (breaching.length) return `${list(breaching)} stacking on the door — breaching in sync inside the deadline window.`;
-  if (suppressing.length && flanking.length) return `${list(suppressing)} pins the target with covering fire while ${list(flanking)} swings to a flank — coordinated, not scripted.`;
-  if (suppressing.length) return `${list(suppressing)} laying down suppressing fire to free up the flank.`;
-  if (flanking.length) return `${list(flanking)} routing to a cover that can actually see the target — a flank the planner discovered.`;
-  if (fallingBack.length) return `${list(fallingBack)} breaking contact and falling back on orders.`;
-  if (moving.length && firing.length) return `${list(firing)} engaging while ${list(moving)} repositions for a better angle.`;
-  if (firing.length) return `${list(firing)} engaging the target from cover.`;
-  if (moving.length) return `${list(moving)} repositioning — no clean line of fire from here yet.`;
-  return "Sizing up the engagement…";
+  const dead = frame.teams.filter((t) => t.alive === 0);
+  if (dead.length) {
+    const win = frame.teams.find((t) => t.alive > 0);
+    return `✓ ${teamName(dead[0].side)} squad eliminated — ${win ? teamName(win.side) : "the other"} team holds the field.`;
+  }
+  return frame.teams
+    .map((t) => `${teamName(t.side)} ${teamPhrase(frame.units.filter((u) => u.side === t.side && u.alive))}`)
+    .join("  ·  ");
 }
 
-function list(xs: string[]): string {
-  if (xs.length <= 1) return xs[0] ?? "";
-  return `${xs.slice(0, -1).join(", ")} & ${xs[xs.length - 1]}`;
+function teamPhrase(units: SquadFrame["units"]): string {
+  const has = (p: (a: string) => boolean) => units.some((u) => p(u.action));
+  if (has((a) => a === "breaching" || a === "stacking on door")) return "breaching the door";
+  const sup = has((a) => a.startsWith("suppress"));
+  const fl = has((a) => a === "flanking");
+  if (sup && fl) return "pinning + flanking";
+  if (sup) return "laying down suppressing fire";
+  if (fl) return "swinging to a flank";
+  if (has((a) => a.startsWith("firing"))) return "trading fire from cover";
+  if (has((a) => a === "falling back")) return "falling back";
+  if (has((a) => a.includes("moving"))) return "repositioning for an angle";
+  if (has((a) => a === "reloading")) return "reloading";
+  return "holding";
 }
 
 /** Per-scenario "what to watch for" — the unique thing each shows off. */
@@ -146,27 +146,27 @@ export function whatToWatch(id: SquadScenarioId): string[] {
   switch (id) {
     case "skirmish":
       return [
-        "One NPC pins the target with covering fire while the other swings wide to a flank cover.",
-        "The moment the flanker is set, the suppressor reactively stops and pushes — watch the AI Director plan change.",
-        "Every move is the real planner's; the barks announce the tactic, F.E.A.R.-style.",
+        "Two squads — Red and Blue — each plan from their OWN belief; neither can read the other's mind.",
+        "Each side coordinates suppress-and-flank and reactively readjusts as it discovers the other's moves (watch the replan count climb).",
+        "Select any unit to see its live plan + sight line (green = has a shot, red = blocked).",
       ];
     case "blockedFlank":
       return [
-        "The barricade blocks the direct line of fire (try selecting an NPC — its sight line turns red).",
-        "Nobody scripted a route: the planner DISCOVERS it must reach a cover that can see the target.",
-        "Compare with Skirmish (no wall) where they just shoot — proof this is search, not a script.",
+        "A central barricade blocks every direct shot — both squads must flank around it.",
+        "Nobody scripted a route: each unit DISCOVERS a cover that can see the enemy (its red sight line turns green on arrival).",
+        "Two teams contesting the same flanks → cover reservation + constant replanning.",
       ];
     case "breach":
       return [
-        "The fire-team stacks on the door, then breaches together.",
-        "It happens inside a deadline window enforced INSIDE the planner's search (projected clock).",
-        "Anyone who can't reach the door in time is pruned from the plan — temporal coordination.",
+        "A Red fire-team breaches a room a Blue team is holding.",
+        "Red stacks and breaches together inside a deadline window enforced INSIDE the planner's search (projected clock).",
+        "Then it's close-quarters — watch both sides' plans invalidate and readjust in real time.",
       ];
     case "companion":
       return [
-        "Your ally fights on its own and never targets a friendly.",
-        "Tap an order (Engage / Regroup / Hold fire) — it's routed through Planner.setGoals, not a state machine.",
-        "Watch the ally's plan change in the AI Director the instant you give the order.",
+        "This is YOUR Blue squad (fully autonomous) vs a Red squad — you don't move anyone.",
+        "Issue an order to B1 (Engage / Regroup / Hold fire) — routed through Planner.setGoals, the LLM seam.",
+        "Watch B1's plan change in the AI Director the instant you order it, and the replay diverge.",
       ];
   }
 }

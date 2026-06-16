@@ -288,6 +288,29 @@ input[type="range"] {
   backdrop-filter: blur(4px);
 }
 
+.team-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 0 4px;
+}
+.team-chip .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  display: inline-block;
+}
+.team-chip b {
+  font-weight: 800;
+  letter-spacing: 0.3px;
+}
+.team-hint {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .banner-tag {
   font-size: 9px;
   letter-spacing: 1px;
