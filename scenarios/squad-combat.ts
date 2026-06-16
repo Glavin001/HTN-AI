@@ -302,7 +302,7 @@ export const squadDomain: DomainDoc = {
     // a claim by one unit dirties this for the others, who then replan to a free slot
     { name: "coverTaken", params: [{ name: "c", type: "cover" }], kind: "boolean", initial: false },
   ],
-  compounds: [{ name: "Fight" }, { name: "Regroup" }],
+  compounds: [{ name: "Fight" }, { name: "Regroup" }, { name: "Neutralize" }],
   operators: [
     {
       // seek a free cover (the workhorse move; GOAP picks WHICH cover gives LOS)
@@ -440,7 +440,7 @@ export const squadDomain: DomainDoc = {
           scope: { deadline: BREACH_WINDOW, label: "breach-window" },
           subtasks: [{ do: "moveToBreach", args: ["?bp"] }, { do: "breach" }],
         },
-        { achieve: F.lte(N.fl("threatHp"), N.c(0)) },
+        { do: "Neutralize" },
       ],
     },
     // 3. assigned flanker → take a flank cover, then neutralize from there
@@ -449,7 +449,7 @@ export const squadDomain: DomainDoc = {
       task: "Fight",
       params: [{ name: "fc", type: "cover" }],
       pre: F.and(F.lit("role", [], "flanker"), F.lit("coverFlank", ["?fc"]), F.not(F.lit("coverTaken", ["?fc"]))),
-      subtasks: [{ do: "flankTo", args: ["?fc"] }, { achieve: F.lte(N.fl("threatHp"), N.c(0)) }],
+      subtasks: [{ do: "flankTo", args: ["?fc"] }, { do: "Neutralize" }],
     },
     // 4. assigned suppressor → suppress UNTIL the flanker is in position, then push
     {
@@ -458,7 +458,7 @@ export const squadDomain: DomainDoc = {
       pre: F.lit("role", [], "suppressor"),
       subtasks: [
         { scope: { maintain: F.not(F.lit("flankerReady")), label: "suppress-cover" }, subtasks: [{ do: "suppress" }] },
-        { achieve: F.lte(N.fl("threatHp"), N.c(0)) },
+        { do: "Neutralize" },
       ],
     },
     // 5. no threat fix at all → stand by in short beats (reactively wakes on contact)
@@ -468,11 +468,31 @@ export const squadDomain: DomainDoc = {
       pre: F.not(F.lit("hasThreat")),
       subtasks: [{ hold: 0.5 }],
     },
-    // 6. default → neutralize the threat (GOAP discovers seek-LOS-cover + fire)
+    // 6. default → neutralize the threat
     {
       name: "assault",
       task: "Fight",
-      subtasks: [{ achieve: F.lte(N.fl("threatHp"), N.c(0)) }],
+      subtasks: [{ do: "Neutralize" }],
+    },
+    // --- Neutralize: fire if there's a line of sight, else reposition to a cover
+    // that geometrically has one (the flank EMERGES from method selection; short
+    // reactive plans, re-entered each beat — no deep uninformed goal search).
+    {
+      name: "fireNow",
+      task: "Neutralize",
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"])),
+      subtasks: [{ do: "takeShot" }],
+    },
+    {
+      name: "reposition",
+      task: "Neutralize",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(
+        F.lit("hasThreat"),
+        F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]),
+        F.not(F.lit("coverTaken", ["?c"])),
+      ),
+      subtasks: [{ do: "advanceTo", args: ["?c"] }, { do: "takeShot" }],
     },
     // player order: fall back to a rally point (HTN — a direct decomposition, no
     // goal search; the `setGoals` seam routes "regroup" here)
@@ -519,6 +539,15 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           const t = q.vec("threatPos");
           if (m[0] === t[0] && m[1] === t[1]) return false; // no threat fix yet
           return world.losClear(m[0], m[1], t[0], t[1]) && dist2(m[0], m[1], t[0], t[1]) <= SIGHT_RANGE;
+        },
+        // would cover `c` have a line of fire to the threat? This is what lets the
+        // flank EMERGE: method selection picks a cover that geometrically sees the
+        // target, rather than searching deep over move+shoot combinations.
+        coverSeesThreat: (q) => {
+          const c = q.vec("coverPos", q.args[0]);
+          const t = q.vec("threatPos");
+          if (c[0] === t[0] && c[1] === t[1]) return false;
+          return world.losClear(c[0], c[1], t[0], t[1]) && dist2(c[0], c[1], t[0], t[1]) <= SIGHT_RANGE;
         },
       },
       numerics: {
@@ -1000,26 +1029,28 @@ export function barkFor(e: TraceEvent): string | null {
 
 // ---------------------------------------------------------------- instances
 
-/** Baseline skirmish: two NPCs flush a player crossing open ground (matches F.E.A.R.). */
+/** Baseline skirmish: two NPCs flush a target on open ground with coordinated
+ *  suppress-and-flank (matches F.E.A.R.). One pins the target while the other
+ *  swings to a flank cover; reaching position releases the suppressor to push. */
 export function skirmishInstance(): SquadInstance {
   return {
     units: [
-      { name: "E1", side: "enemy", x: -6, z: -5, role: "suppressor" },
-      { name: "E2", side: "enemy", x: -6, z: 5, role: "flanker" },
-      { name: "player", side: "player", x: 8, z: 0, hp: 100 },
+      { name: "E1", side: "enemy", x: -9, z: -1, role: "suppressor" },
+      { name: "E2", side: "enemy", x: -9, z: 1, role: "flanker" },
+      { name: "player", side: "player", x: 9, z: 0, hp: 100 },
     ],
     covers: [
-      { name: "cN", x: -2, z: -4 },
-      { name: "cS", x: -2, z: 4 },
-      { name: "cMid", x: 0, z: 0 },
-      { name: "fNorth", x: 4, z: -6, flank: true },
-      { name: "fSouth", x: 4, z: 6, flank: true },
-      { name: "rally", x: -8, z: 0, rally: true },
+      { name: "cN", x: -3, z: -2 },
+      { name: "cS", x: -3, z: 2 },
+      { name: "fN", x: 4, z: -7, flank: true },
+      { name: "fS", x: 4, z: 7, flank: true },
+      { name: "rally", x: -11, z: 0, rally: true },
     ],
-    walls: [{ x: 1, z: -2, w: 1.5, d: 4 }],
+    // the target pushes in a little then holds in the open — both NPCs keep a line
+    // of sight, so the coordinator promotes them to the flank tactic
     playerPath: [
-      { x: 8, z: 0 },
-      { x: 2, z: 0 },
+      { x: 9, z: 0 },
+      { x: 5, z: 0 },
     ],
     playerDwell: 1,
   };
