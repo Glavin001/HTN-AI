@@ -26,7 +26,7 @@ function stepStarts(sim: SquadSim, unit: string): string[] {
 }
 
 function moved(labels: string[]): boolean {
-  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo|moveToSpot)/.test(l));
+  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo|moveToSpot|moveFree)/.test(l));
 }
 
 // a unit "fired" if it took a shot or ran an engage-from-position burst (the macro)
@@ -486,6 +486,68 @@ test("squad: with NO cover available the unit still engages and resolves the fig
   sim.run(400);
   assert.ok(fired(stepStarts(sim, "E")), "it engaged the target");
   assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized it without any cover to use");
+});
+
+// ---------------------------------------------------------------- F: engine custom-heuristic hook
+
+test("squad: the engine consults a domain customHeuristic on a numeric goal (potential-field hook)", () => {
+  // a numeric goal (threatHp ≤ 0) yields no symbolic atoms, so the relaxation heuristic
+  // is 0 (uninformed). The engine must instead consult the domain-supplied heuristic.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0 },
+      { name: "player", side: "player", x: 5, z: 0 },
+    ],
+    covers: [{ name: "c", x: 0, z: 0 }],
+  };
+  const model = squadModel(inst, "E");
+  const state = model.createExecState();
+  state.set(model.slotOf("hasThreat"), 1);
+  state.buffer[model.slotOf("threatPos")] = 5; // player at (5,0): E has a clear shot
+  let calls = 0;
+  const result = planOnce(model, state, {
+    goals: [goal(F.lte(N.fl("threatHp"), N.c(0)))],
+    customHeuristic: (s) => {
+      calls++;
+      void s;
+      return 0;
+    },
+    maxNodes: 5000,
+  });
+  assert.ok(calls > 0, "the engine consulted the domain heuristic");
+  assert.equal(result.status, "success", "and found a plan for the numeric goal");
+});
+
+// ---------------------------------------------------------------- F: GOAP positioning mode (engine search)
+
+test("squad: GOAP positioning (generic search + potential-field heuristic) also fights from cover", () => {
+  // the SAME 1v1-with-a-crate fight, but positioning is decided by the generic planner
+  // search guided by the spatial heuristic instead of the bespoke spot-graph route.
+  // The heuristic is what keeps it from wandering — it reaches cover and neutralizes.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -8, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 8 },
+    ],
+    covers: [{ name: "crate", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 3, positioning: "goap" });
+  const world = sim.world as SquadWorld;
+  let covered = 0;
+  let exposed = 0;
+  for (let i = 0; i < 140 && sim.world.actors.get("P")!.alive; i++) {
+    const f = sim.step();
+    const e = f.units.find((u) => u.name === "E")!;
+    if (e.action.startsWith("firing")) {
+      const a = world.actors.get("E")!;
+      if (world.exposureAt(a.x, a.z, [{ x: 0, z: 8 }]) === 0) covered++;
+      else exposed++;
+    }
+  }
+  assert.equal(sim.positioning, "goap", "running the GOAP positioning engine");
+  assert.ok(moved(stepStarts(sim, "E")), "the search relocated the unit (move op fired)");
+  assert.ok(covered > exposed, `it fought mostly from cover (covered=${covered} exposed=${exposed})`);
+  assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized the target");
 });
 
 // ---------------------------------------------------------------- F: spot-graph multi-hop routing

@@ -124,6 +124,11 @@ export interface PlanRequest {
   novelty?: boolean;
   /** goal-search heuristic: h_add (fast, may overestimate — default), h_max (admissible: use with weight 1 for guaranteed-optimal plans), or none (Dijkstra) */
   heuristic?: "hadd" | "hmax" | "none";
+  /** optional DOMAIN heuristic over the raw state — an estimate of remaining cost to
+   *  the goal. When set it overrides the symbolic relaxation, letting a domain inject
+   *  knowledge the atom-based heuristic can't see (e.g. a spatial / navigation potential
+   *  field). Pair with `weight` to trade optimality for speed. Must be deterministic. */
+  customHeuristic?: (s: Snap) => number;
   /** internal: plan a pre-built agenda instead of `goals` (used by plan repair) */
   agendaOverride?: Agenda;
 }
@@ -773,6 +778,19 @@ export class Engine {
   }
 
   private heuristic(state: StateView, descs: GoalAtomDesc[]): number {
+    // a domain-supplied heuristic (e.g. a spatial potential field) overrides the
+    // symbolic relaxation — it sees structure (distance, exposure) the atom-based
+    // heuristic is blind to, which is what makes search over a fine spatial action
+    // space goal-directed instead of a uniform-cost wander.
+    if (this.req.customHeuristic) {
+      const key = state.key();
+      const cached = this.hCache.get(key);
+      if (cached !== undefined) return cached;
+      this.heuristicEvals++;
+      const h = this.req.customHeuristic(state);
+      this.hCache.set(key, h);
+      return h;
+    }
     if (descs.length === 0 || this.req.heuristic === "none") return 0;
     const key = state.key();
     const cached = this.hCache.get(key);

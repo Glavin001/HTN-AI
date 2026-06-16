@@ -37,6 +37,7 @@ import {
   type Model,
   type Planner as PlannerT,
   type Rejection,
+  type Snap,
   type TaskStatus,
   type TraceEvent,
   E,
@@ -556,6 +557,10 @@ export const squadDomain: DomainDoc = {
     // search; the planner just enacts the decision and re-decides as the world moves.
     { name: "engageHere", kind: "boolean", initial: false },
     { name: "chosenSpot", kind: "entity", entityType: "cover" },
+    // selects the positioning engine: false ⇒ the bespoke spot-graph route (default);
+    // true ⇒ the generic GOAP search over move+engage, guided by a domain potential-
+    // field heuristic (the planner DISCOVERS the route itself). Set per-unit at init.
+    { name: "useGoap", kind: "boolean", initial: false },
     // --- threat (belief; perception gates by line-of-sight + memory) ---
     { name: "threatPos", kind: "vec2" },
     { name: "threatHp", kind: "float", initial: 100 },
@@ -620,6 +625,24 @@ export const squadDomain: DomainDoc = {
         N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
         N.add(N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE)), N.mul(N.ext("spotRange", ["?c"], TACTICAL_READS), N.c(W_RANGE))),
       ),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // GOAP-mode positioning: relocate to any FIRING position (a spot that sees the
+      // threat — the move executor pathfinds around walls to reach it). Used only by
+      // the generic kill-search (neutralizeGoap); its cost is travel + crossing danger,
+      // and engageFrom adds the firefight cost, so the search minimises the total. The
+      // potential-field heuristic is what keeps this search from wandering.
+      name: "moveFree",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("useGoap"), F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"])),
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"])),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+      ],
+      cost: N.add(N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)), N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE))),
       duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
       executor: "move",
     },
@@ -849,6 +872,19 @@ export const squadDomain: DomainDoc = {
       pre: F.and(F.lit("hasThreat"), F.ext("isChosen", ["?c"], ["chosenSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
       subtasks: [{ do: "moveToSpot", args: ["?c"] }],
     },
+    // ALTERNATE engine (useGoap): let the generic planner DISCOVER the move+engage
+    // sequence itself, as a GOAP goal (threatHp ≤ 0). On its own this wanders — the
+    // goal is numeric so the symbolic heuristic is blind to geometry — so the planner
+    // is given a domain potential-field heuristic (customHeuristic) that estimates the
+    // remaining cost to reach a firing position. THAT is what makes the search
+    // goal-directed and fast. Selectable so it can be compared against the spot-graph
+    // route; both produce fight-from-cover behaviour.
+    {
+      name: "neutralizeGoap",
+      task: "Neutralize",
+      pre: F.and(F.lit("useGoap"), F.lit("hasThreat")),
+      subtasks: [{ achieve: F.lte(N.fl("threatHp"), N.c(0)) }],
+    },
     // fallback: there's a threat but no actionable route right now (e.g. a defender
     // behind a closed door — you can't yet walk to any angle on them). Hold ready in
     // short beats rather than fail; a changed world (door breached, enemy steps out)
@@ -894,6 +930,53 @@ function believedFoes(q: ExtQuery, foes: string[]): { x: number; z: number }[] {
 function spotHasLos(world: SquadWorld, x: number, z: number, t: number[]): boolean {
   if (x === t[0] && z === t[1]) return false;
   return world.losClear(x, z, t[0], t[1]) && dist2(x, z, t[0], t[1]) <= SIGHT_RANGE;
+}
+
+/**
+ * The DOMAIN potential-field heuristic for the GOAP kill-search (Commit 2): an
+ * admissible lower bound on the remaining cost to neutralize the threat from a given
+ * state. For each firing position (current spot or any cover that sees the threat) it
+ * lower-bounds travel (straight-line · W_MOVE ≤ the real walked, exposure-laden path)
+ * plus the engagement (shots-to-kill · 1 ≤ the real per-shot cost), and takes the
+ * min. Because it estimates "how far am I from a good place to shoot, and how long
+ * will the kill take", it pulls the generic A* straight toward firing positions
+ * instead of letting it wander over cheap micro-moves — the spatial structure the
+ * symbolic relaxation can't see. Cheap (O(covers)) and deterministic.
+ */
+function squadEngageHeuristic(world: SquadWorld, model: Model, foeNames: string[], s: Snap): number {
+  if (s.get(model.slotOf("hasThreat")) < 0.5) return 0;
+  const hp = s.get(model.slotOf("threatHp"));
+  if (hp <= 0) return 0;
+  const mp = model.slotOf("myPos");
+  const mx = s.get(mp);
+  const mz = s.get(mp + 1);
+  const tps = model.slotOf("threatPos");
+  const t = [s.get(tps), s.get(tps + 1)];
+  const caution = s.get(model.slotOf("caution"));
+  const foes: { x: number; z: number }[] = [];
+  for (const f of foeNames) {
+    const fid = model.entityId(f);
+    if (s.get(model.slotOf("foeAlive", fid)) < 0.5) continue;
+    const ps = model.slotOf("foePos", fid);
+    foes.push({ x: s.get(ps), z: s.get(ps + 1) });
+  }
+  // estimate the remaining cost as the cheapest firing position: straight-line travel
+  // (≤ the real walked path) + the actual engagement from there (shots-to-kill × the
+  // per-shot exposure of that spot). Including exposure makes the field TIGHT — A*
+  // heads to the cheapest covered angle directly instead of treating every firing
+  // spot as equal, which is what kept the loose bound wandering.
+  let best = Infinity;
+  const consider = (x: number, z: number): void => {
+    if (!spotHasLos(world, x, z, t)) return;
+    let hit = rangeFalloff(dist2(x, z, t[0], t[1]));
+    if (world.inCoverVs(t[0], t[1], x, z)) hit *= COVER_HIT_MULT;
+    const shots = Math.max(1, Math.ceil(hp / (SHOT_DAMAGE * Math.max(0.12, hit))));
+    const engage = shots * (1 + caution * W_EXPOSE * world.exposureAt(x, z, foes));
+    best = Math.min(best, W_MOVE * dist2(mx, mz, x, z) + engage);
+  };
+  consider(mx, mz); // engage from where I am
+  for (const c of world.covers) consider(c.x, c.z);
+  return best === Infinity ? 1e6 : best;
 }
 
 // ---------------------------------------------------------------- registry / model per unit
@@ -1267,6 +1350,10 @@ export interface SquadSimOptions {
   nodes?: number;
   /** override the bark author (the LLM-rewrite seam, Phase D); defaults to `barkFor` */
   bark?: BarkAuthor;
+  /** positioning engine: "spotgraph" (bespoke route search, default) or "goap" (the
+   *  generic planner search over move+engage, guided by a domain potential-field
+   *  heuristic). Exposed to compare the two approaches. */
+  positioning?: "spotgraph" | "goap";
 }
 
 /**
@@ -1282,6 +1369,8 @@ export class SquadSim {
   private readonly dt: number;
   private readonly nodes: number;
   private readonly barkAuthor: BarkAuthor;
+  /** positioning engine — see SquadSimOptions.positioning */
+  public readonly positioning: "spotgraph" | "goap";
   private playerLeg = 0;
   private playerLegT = 0;
 
@@ -1290,6 +1379,7 @@ export class SquadSim {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
     this.barkAuthor = opts.bark ?? barkFor;
+    this.positioning = opts.positioning ?? "spotgraph";
     // augment the map with invisible tactical standing positions (grid + cover edges)
     // the planner can reposition to — fluid movement, not a handful of waypoints
     const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...generateTacticalSpots(inst)] };
@@ -1314,12 +1404,19 @@ export class SquadSim {
         goalText: DEFAULT_GOAL.text,
         goalExpr: DEFAULT_GOAL.expr,
       };
+      const goap = this.positioning === "goap";
       entry.planner = new Planner(model, {
         goals: [{ kind: "task", name: "Fight" }],
         now: () => this.world.clock,
         seed: (opts.seed ?? 1) + seedBump++,
-        weight: 1.6,
+        // GOAP mode runs greedier (higher weight) with a tight node cap so the generic
+        // search satisfices fast; if it ever hits the cap, holdEngage covers the beat.
+        weight: goap ? 2.6 : 1.6,
+        maxNodes: goap ? 4000 : undefined,
         collectRejections: true,
+        // GOAP mode: feed the generic search the spatial potential-field heuristic so
+        // it stays goal-directed instead of wandering over the fine move space.
+        customHeuristic: goap ? (s) => squadEngageHeuristic(this.world, model, entry.foes, s) : undefined,
         trace: (e) => {
           trace.push(e);
           this.trace.push({ unit: entry.name, e });
@@ -1377,12 +1474,20 @@ export class SquadSim {
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
     }
     setBelief(p, "flankerReady", [], this.world.team(p.side).flankerReady);
-    // the DEEP decision: solve the spot-graph route from belief and write the result
-    // the planner enacts this beat (engage from here, or the next hop toward the
-    // optimal killing position).
-    const route = this.computeEngageRoute(p);
-    setBelief(p, "engageHere", [], route.engageHere);
-    setBelief(p, "chosenSpot", [], route.nextSpot ?? false);
+    setBelief(p, "useGoap", [], this.positioning === "goap");
+    if (this.positioning === "goap") {
+      // GOAP mode: the planner's own search (guided by the heuristic) decides — clear
+      // the spot-graph route beliefs so its methods stay inactive.
+      setBelief(p, "engageHere", [], false);
+      setBelief(p, "chosenSpot", [], false);
+    } else {
+      // the DEEP decision: solve the spot-graph route from belief and write the result
+      // the planner enacts this beat (engage from here, or the next hop toward the
+      // optimal killing position).
+      const route = this.computeEngageRoute(p);
+      setBelief(p, "engageHere", [], route.engageHere);
+      setBelief(p, "chosenSpot", [], route.nextSpot ?? false);
+    }
   }
 
   /** Believed positions of every hostile this unit currently thinks is alive (belief,
