@@ -12,5 +12,5 @@ This repo is a TypeScript library (`htn-ai`, an HTN + GOAP planning/execution ru
 ### Non-obvious notes
 
 - Dependencies live in **two** separate npm trees: repo root and `examples/web` (independent lockfiles). The update script installs both.
-- `next build` ignores ESLint/TS errors (`next.config.mjs`); use the root `npm run typecheck`/`npm run lint` for real type/lint signal on the library.
-- Known pre-existing bug in the demo: selecting some non-default scenarios (e.g. "Blocks World (Sussman)") in the SCENARIO dropdown throws `TypeError: Cannot read properties of undefined (reading 'heavyMs')` from `examples/web/lib/run.ts`. The default "Staircase" scenario works fine. This is unrelated to environment setup.
+- `next build` ignores ESLint/TS errors (`next.config.mjs`); use the root `npm run typecheck`/`npm run lint` for real type/lint signal on the library. The web demo (`examples/web`) has its own narrower per-file types — note that `lib/run.ts` `ScenarioId` does not include `"blocks"` (that path lives in `lib/runBlocks.ts`), so any helper consuming a page-level scenario id (which does include `"blocks"`) must guard for ids outside its own `SCENARIOS` map.
+- All 7 demo scenarios (Staircase, Climb the ledge, Quarry, Scavenger, Scavenger XL, Scavenger HUGE, Blocks World) run to "succeeded". "Scavenger HUGE" is a deliberate stress test and takes ~9s to plan before it animates.
