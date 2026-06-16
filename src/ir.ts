@@ -37,6 +37,14 @@ export interface FluentDecl {
   entityType?: TypeName;
   /** default initial value (boolean=false, numbers=0, enum=values[0], entity=null) */
   initial?: number | boolean | string | [number, number] | [number, number, number];
+  /**
+   * Declares this fluent IMMUTABLE after the initial state — never changed by any
+   * operator *or the host*. Lets the compiler treat precondition lits over it as
+   * compile-time constants and prune ground operators whose static precondition
+   * can never hold (adjacency, maps, alignment, type tables). Unsound to set on a
+   * fluent that actually changes; validated against operator effects.
+   */
+  static?: boolean;
 }
 
 // ---------------------------------------------------------------- terms

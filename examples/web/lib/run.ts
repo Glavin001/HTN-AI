@@ -88,8 +88,8 @@ const SCENARIOS: Record<ScenarioId, ScenarioCfg> = {
 };
 
 /** Rough heads-up (ms) for scenarios whose planning is slow enough to warn about. */
-export function scenarioHeavyMs(id: ScenarioId): number {
-  return SCENARIOS[id].heavyMs ?? 0;
+export function scenarioHeavyMs(id: string): number {
+  return SCENARIOS[id as ScenarioId]?.heavyMs ?? 0;
 }
 
 export function runScenario(id: ScenarioId): RunResult {

@@ -93,6 +93,10 @@ export interface CompiledFormula {
   /** like `atoms`, but also folds in external/opaque `relax` over-approximations —
    *  used only by the relaxation heuristic, never for search applicability */
   relaxAtoms: (b: Bindings) => Atom[];
+  /** true when `atoms` fully captures the formula (a conjunction of encodable,
+   *  non-axiom positive lits) — so an atom-level check is the whole precondition
+   *  and the compiled closure can be skipped once the atoms hold */
+  atomsComplete: boolean;
   ir: Formula;
 }
 
@@ -239,6 +243,8 @@ export class Model {
   public groundOps: GroundOp[] = [];
   /** fluents any operator writes non-atomically — relaxation treats them as optimistically settable */
   public readonly relaxFuzzyWrites = new Set<number>();
+  /** fluents no operator effect writes — their precondition lits are compile-time constants */
+  public readonly staticFluents = new Set<number>();
 
   // ---- relaxation heuristic tables: distinct (slot,value) atoms interned to
   //      dense ids at compile time so h_add/h_max runs over typed arrays with no
@@ -642,8 +648,24 @@ export class Model {
       readsClock: readsClock.v,
       atoms: (b: Bindings) => atomFns.map((f) => f(b)),
       relaxAtoms: (b: Bindings) => relaxAtomFns.map((f) => f(b)),
+      atomsComplete: this.formulaAtomsComplete(formula, vars, context),
       ir: formula,
     };
+  }
+
+  /** Does `atoms()` fully capture this formula? True iff it's a conjunction of
+   *  encodable, non-axiom positive lits (no not/or/cmp/external/opaque/axiom). */
+  private formulaAtomsComplete(f: Formula, vars: Map<string, number>, context: string): boolean {
+    if (f.f === "and") return f.parts.every((p) => this.formulaAtomsComplete(p, vars, context));
+    if (f.f !== "lit" || this.axioms.has(f.fluent)) return false;
+    const cf = this.fluentByName.get(f.fluent);
+    if (!cf) return false;
+    try {
+      this.encodeLitValue(cf, f.value, vars, context); // must be representable as an atom
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   private buildFormula(
@@ -1097,6 +1119,26 @@ export class Model {
 
   private groundOperators(): void {
     this.groundOps = [];
+    // fluents the author DECLARED static are immutable after init, so any
+    // precondition lit over them is a compile-time constant. (We cannot infer
+    // this from "no operator writes it" — the host can mutate world fluents
+    // between plans, e.g. has_vehicle; it must be a promise, validated here.)
+    const written = new Set<number>();
+    for (const op of this.operators) for (const w of op.effects.writes) written.add(w);
+    for (const f of this.fluents) {
+      if (!f.decl.static) continue;
+      if (written.has(f.id)) {
+        throw new Error(`Fluent '${f.decl.name}' is declared static but an operator effect writes it`);
+      }
+      this.staticFluents.add(f.id);
+    }
+    const base = this.baseState;
+    const owner = this.slotOwner;
+    const staticAtomFails = (a: Atom): boolean => {
+      const o = owner[a.slot];
+      return o >= 0 && this.staticFluents.has(o) && base[a.slot] !== a.value;
+    };
+
     for (const op of this.operators) {
       const checks = op.argOnlyChecks;
       for (const b of this.enumerateBindings(op.paramTypes)) {
@@ -1112,11 +1154,25 @@ export class Model {
           }
         }
         if (!ok) continue;
+        const preAtoms = op.pre ? op.pre.atoms(b) : [];
+        // static-fluent prune (relevance analysis): a precondition over a static
+        // fluent (adjacency, maps, alignment, …) that is false in the initial
+        // state can NEVER hold, so this grounding is dead — drop it. Sound for the
+        // heuristic too: such an atom is unreachable in the relaxation (static ⇒
+        // never added, current value = base value), so the op never fires there.
+        let dead = false;
+        for (let i = 0; i < preAtoms.length; i++) {
+          if (staticAtomFails(preAtoms[i])) {
+            dead = true;
+            break;
+          }
+        }
+        if (dead) continue;
         this.groundOps.push({
           gid: this.groundOps.length,
           op,
           b,
-          preAtoms: op.pre ? op.pre.atoms(b) : [],
+          preAtoms,
           addAtoms: op.effects.addAtoms(b),
         });
       }

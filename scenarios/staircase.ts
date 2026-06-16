@@ -35,7 +35,7 @@ export const staircaseDomain: DomainDoc = {
     { name: "height", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 },
     { name: "pos", params: [{ name: "c", type: "cell" }], kind: "vec2" },
     { name: "supply", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 },
-    { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false },
+    { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false, static: true },
     { name: "agentAt", kind: "entity", entityType: "cell" },
     // the agent's elevation = the height of the column it stands on. This is the
     // ONLY observable the goal constrains: "be up in the air at coordinate Y".
@@ -44,7 +44,7 @@ export const staircaseDomain: DomainDoc = {
     // only designated cells can be built up — keeps the search focused on the
     // staircase (and lets walls/obstacles be no-build). Defaults to true so
     // simple instances need not set it.
-    { name: "buildable", params: [{ name: "c", type: "cell" }], kind: "boolean", initial: true },
+    { name: "buildable", params: [{ name: "c", type: "cell" }], kind: "boolean", initial: true, static: true },
   ],
   operators: [
     {
@@ -265,7 +265,7 @@ export const scavengerDomain: DomainDoc = {
   fluents: [
     { name: "height", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 },
     { name: "pos", params: [{ name: "c", type: "cell" }], kind: "vec2" },
-    { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false },
+    { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false, static: true },
     { name: "agentAt", kind: "entity", entityType: "cell" },
     { name: "agentY", kind: "int", initial: 0 },
     { name: "holding", kind: "boolean", initial: false },

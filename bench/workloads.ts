@@ -205,7 +205,7 @@ export function navGrid(k: number): Run {
     types: [{ name: "cell" }],
     fluents: [
       { name: "at", kind: "entity", entityType: "cell" },
-      { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false },
+      { name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", initial: false, static: true },
       { name: "pos", params: [{ name: "c", type: "cell" }], kind: "vec2" },
     ],
     operators: [
