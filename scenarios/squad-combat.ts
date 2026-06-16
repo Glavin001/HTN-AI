@@ -97,8 +97,9 @@ export const MAX_SPOTS = 22; // cap on tactical points exposed to the planner (b
 /** Fluents every tactical external reads — listed so a foe moving (perception) or a
  *  reposition dirties the cost/precondition and the unit re-decides each beat. */
 const TACTICAL_READS = ["myPos", "coverPos", "threatPos", "foePos", "foeAlive"];
-/** Same, plus threatHp (the engagement-cost utilities also depend on how hurt it is). */
-const MOVE_ENGAGE_READS = ["myPos", "coverPos", "threatPos", "threatHp", "foePos", "foeAlive"];
+/** Same, plus threatHp + caution (the engagement-cost utilities weigh exposure by how
+ *  hurt the target is and how cautious this unit currently is). */
+const MOVE_ENGAGE_READS = ["myPos", "coverPos", "threatPos", "threatHp", "caution", "foePos", "foeAlive"];
 
 // ---------------------------------------------------------------- instance shapes
 
@@ -548,6 +549,10 @@ export const squadDomain: DomainDoc = {
     { name: "role", kind: "enum", values: ["assault", "flanker", "suppressor", "leader"], initial: "assault" },
     { name: "tactic", kind: "enum", values: ["hold", "flank", "breach", "regroup"], initial: "hold" },
     { name: "myCover", kind: "entity", entityType: "cover" },
+    // how much to weight staying alive right now (1 = normal). The coordinator raises
+    // it when a unit is outgunned or hurt, so it values cover + breaking contact more —
+    // an outnumbered unit flows to cover/escape instead of trading in the open.
+    { name: "caution", kind: "float", initial: 1 },
     // --- threat (belief; perception gates by line-of-sight + memory) ---
     { name: "threatPos", kind: "vec2" },
     { name: "threatHp", kind: "float", initial: 100 },
@@ -999,7 +1004,7 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           const dmg = SHOT_DAMAGE * Math.max(0.12, p);
           const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
           const exposure = world.exposureAt(m[0], m[1], believedFoes(q, foes));
-          return shots * (1 + W_EXPOSE * exposure);
+          return shots * (1 + q.get("caution") * W_EXPOSE * exposure);
         },
         // the total cost of RELOCATING to a candidate firing spot and fighting from it:
         // travel + the danger of crossing to it + the whole-engagement cost once there.
@@ -1018,7 +1023,7 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           if (world.inCoverVs(t[0], t[1], c[0], c[1])) p *= COVER_HIT_MULT;
           const dmg = SHOT_DAMAGE * Math.max(0.12, p);
           const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
-          return moveCost + shots * (1 + W_EXPOSE * world.exposureAt(c[0], c[1], fb));
+          return moveCost + shots * (1 + q.get("caution") * W_EXPOSE * world.exposureAt(c[0], c[1], fb));
         },
         // projected duration of that engagement (shots-to-kill × aim time), so a scoped
         // deadline or a racing flanker is reasoned about over the real firefight length
@@ -1260,6 +1265,9 @@ export interface UnitFrame {
   events: string[];
   /** most recent "why a branch was rejected" reasons (glass-box director) */
   why: string[];
+  /** plain-English read of the unit's current tactical posture (glass-box director):
+   *  whether it is in cover, how many enemies can shoot it, and its range to the threat */
+  posture: string;
 }
 
 export interface TeamFrame {
@@ -1464,6 +1472,14 @@ export class SquadSim {
       for (const u of members) {
         setBelief(u, "role", [], u.role);
         setBelief(u, "tactic", [], tb.tactic === "breach" ? "breach" : tb.tactic === "flank" ? "flank" : "hold");
+        // caution: value safety more when locally outgunned (this unit sees more foes
+        // than it has friends in the fight) or hurt — so it leans to cover / breaking
+        // contact rather than trading shots. This is the "outnumbered ⇒ go to ground".
+        const me = this.world.actors.get(u.name);
+        const seenFoes = me ? this.world.hostilesOf(u.side).filter((h) => dist2(me.x, me.z, h.x, h.z) <= SIGHT_RANGE && this.world.losClear(me.x, me.z, h.x, h.z)).length : 0;
+        const outgunned = seenFoes > members.length;
+        const hurt = (me?.hp ?? 100) < LOW_HP;
+        setBelief(u, "caution", [], 1 + (outgunned ? 0.9 : 0) + (hurt ? 0.7 : 0));
       }
     }
   }
@@ -1576,9 +1592,23 @@ export class SquadSim {
           plan: up && plan ? planSummary(up.model, plan) : [],
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
           why: up ? up.why : [],
+          posture: up && a.alive ? this.describePosture(a) : "—",
         };
       }),
     };
+  }
+
+  /** A plain-English read of a unit's tactical posture for the glass-box director:
+   *  in cover or open, how many enemies can actually shoot it, and its range. */
+  private describePosture(a: Actor): string {
+    const foes = this.world.hostilesOf(a.side).map((h) => ({ x: h.x, z: h.z }));
+    const exposed = this.world.exposureAt(a.x, a.z, foes);
+    const covered = this.world.coverCountAt(a.x, a.z, foes);
+    const nearest = this.world.nearestHostile(a.name, false);
+    const range = nearest ? Math.round(dist2(a.x, a.z, nearest.x, nearest.z)) : null;
+    const head = covered > 0 ? `in cover vs ${covered}` : exposed > 0 ? "in the open" : "no line of fire";
+    const exp = exposed > 0 ? ` · exposed to ${exposed}` : exposed === 0 && covered > 0 ? " · shielded" : "";
+    return `${head}${exp}${range != null ? ` · range ${range}` : ""}`;
   }
 
   /** run the engagement to a terminal state (offline rollout for tests + web). */

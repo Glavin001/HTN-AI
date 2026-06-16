@@ -77,6 +77,11 @@ export default function SquadDirector({
             {u.replanning ? <span className="pill busy">⟳ replanning…</span> : <span className="pill" style={{ color: "var(--muted)" }}>{tacticWord[u.tactic]?.split(" — ")[0] ?? u.tactic}</span>}
           </div>
           <div className="mono" style={{ color: "var(--muted)", marginTop: 3, fontSize: 11 }}>{u.role} · {tacticWord[u.tactic] ?? u.tactic} · hp {Math.round(u.hp)} · ammo {u.ammo}</div>
+          {u.posture && u.posture !== "—" && (
+            <div className="mono" style={{ color: u.posture.includes("cover") || u.posture.includes("shielded") ? "var(--accent)" : "#fca5a5", marginTop: 3, fontSize: 11 }}>
+              ◈ reading the room: {u.posture}
+            </div>
+          )}
 
           <h3 className="dir-h" style={{ marginTop: 12 }}>
             PLAN <span style={{ color: "var(--muted)", fontWeight: 400 }}>· discovered by search</span>

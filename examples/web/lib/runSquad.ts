@@ -33,10 +33,16 @@ function blockedFlankInstance(): SquadInstance {
     covers: [
       { name: "cW", x: -5, z: 0 },
       { name: "cE", x: 5, z: 0 },
-      { name: "fNW", x: -3, z: -8, flank: true },
-      { name: "fSW", x: -3, z: 8, flank: true },
-      { name: "fNE", x: 3, z: -8, flank: true },
-      { name: "fSE", x: 3, z: 8, flank: true },
+      // scattered crates by the flank approaches — real directional cover to fight
+      // FROM once you've swung around the barricade (not just open firing lanes)
+      { name: "crNW", x: -3.5, z: -7 },
+      { name: "crNE", x: 3.5, z: -7 },
+      { name: "crSW", x: -3.5, z: 7 },
+      { name: "crSE", x: 3.5, z: 7 },
+      { name: "fNW", x: -3, z: -9.5, flank: true },
+      { name: "fSW", x: -3, z: 9.5, flank: true },
+      { name: "fNE", x: 3, z: -9.5, flank: true },
+      { name: "fSE", x: 3, z: 9.5, flank: true },
       { name: "rRally", x: -12, z: 0, rally: true },
       { name: "bRally", x: 12, z: 0, rally: true },
     ],
@@ -160,14 +166,14 @@ export function whatToWatch(id: SquadScenarioId): string[] {
     case "skirmish":
       return [
         "Two squads — Red and Blue — each plan from their OWN belief; neither can read the other's mind.",
-        "Each side coordinates suppress-and-flank and reactively readjusts as it discovers the other's moves (watch the replan count climb).",
-        "Select any unit to see its live plan + sight line (green = has a shot, red = blocked).",
+        "Watch units READ THE ROOM: they tuck behind crates to deny the enemy a clean shot, close in for accuracy, and break contact when outgunned (see each unit's 'reading the room' line in the Director).",
+        "Cover is directional + dynamic — a crate that shields you now stops helping the instant a foe swings around it, so units keep repositioning.",
       ];
     case "blockedFlank":
       return [
-        "A central barricade blocks every direct shot — both squads must flank around it.",
-        "Nobody scripted a route: each unit DISCOVERS a cover that can see the enemy (its red sight line turns green on arrival).",
-        "Two teams contesting the same flanks → cover reservation + constant replanning.",
+        "A central barricade blocks every direct shot — both squads must flank around it to earn a line of fire.",
+        "Nobody scripted a route: each unit DISCOVERS a firing position around the wall, then fights FROM the scattered crates there rather than standing in the open.",
+        "Two teams contesting the same flanks → cover reservation, dynamic cover, and constant replanning.",
       ];
     case "breach":
       return [

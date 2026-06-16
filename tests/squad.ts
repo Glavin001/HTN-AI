@@ -488,6 +488,60 @@ test("squad: with NO cover available the unit still engages and resolves the fig
   assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized it without any cover to use");
 });
 
+// ---------------------------------------------------------------- F: caution (outgunned ⇒ value safety)
+
+test("squad: an outgunned unit becomes more cautious than one fighting even odds", () => {
+  const outgunned = new SquadSim(
+    {
+      units: [
+        { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+        { name: "P1", side: "player", x: 5, z: -2 },
+        { name: "P2", side: "player", x: 5, z: 2 },
+      ],
+      covers: [{ name: "c", x: 0, z: 0 }],
+    },
+    { seed: 1 },
+  );
+  outgunned.step();
+  const e1 = outgunned.units.find((u) => u.name === "E")!;
+  const cautionOutgunned = e1.model.read(e1.planner.state, "caution") as number;
+
+  const even = new SquadSim(
+    {
+      units: [
+        { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+        { name: "P1", side: "player", x: 5, z: 0 },
+      ],
+      covers: [{ name: "c", x: 0, z: 0 }],
+    },
+    { seed: 1 },
+  );
+  even.step();
+  const e2 = even.units.find((u) => u.name === "E")!;
+  const cautionEven = e2.model.read(e2.planner.state, "caution") as number;
+
+  assert.ok(cautionOutgunned > cautionEven, `outgunned is more cautious (${cautionOutgunned} > ${cautionEven})`);
+  assert.equal(cautionEven, 1, "even odds, healthy ⇒ baseline caution");
+});
+
+test("squad: the frame carries a plain-English tactical posture (glass-box)", () => {
+  const sim = new SquadSim(
+    {
+      units: [
+        { name: "E", side: "enemy", x: 0, z: -8, role: "assault" },
+        { name: "P", side: "player", x: 0, z: 8 },
+      ],
+      covers: [{ name: "crate", x: 0, z: -3 }],
+    },
+    { seed: 3 },
+  );
+  let frame = sim.snapshot();
+  for (let i = 0; i < 40; i++) frame = sim.step();
+  const e = frame.units.find((u) => u.name === "E")!;
+  assert.type(e.posture, "string", "posture is reported");
+  assert.ok(/cover|open|line of fire/.test(e.posture), `posture reads tactically: "${e.posture}"`);
+});
+
 // ---------------------------------------------------------------- F: multi-enemy belief
 
 test("squad: perception tracks each known hostile individually (multi-enemy belief)", () => {
