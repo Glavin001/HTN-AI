@@ -406,19 +406,19 @@ function ThinkingOverlay({
     <group>
       {/* sight range ring */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[self.x, 0.015, self.z]}>
-        <ringGeometry args={[21.7, 22, 64]} />
-        <meshBasicMaterial color="#38bdf8" transparent opacity={0.35} side={THREE.DoubleSide} />
+        <ringGeometry args={[21.5, 22, 64]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.5} side={THREE.DoubleSide} />
       </mesh>
 
       {/* scored candidate positions */}
       {spots.map((s) => {
         if (s.current) return null;
         if (!s.hasLos) {
-          // considered, but no line of fire from here → dim grey dot
+          // considered, but no line of fire from here → dim slate dot
           return (
             <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.02, s.z]}>
-              <circleGeometry args={[0.16, 16]} />
-              <meshBasicMaterial color="#475569" transparent opacity={0.3} side={THREE.DoubleSide} />
+              <circleGeometry args={[0.19, 16]} />
+              <meshBasicMaterial color="#64748b" transparent opacity={0.45} side={THREE.DoubleSide} />
             </mesh>
           );
         }
