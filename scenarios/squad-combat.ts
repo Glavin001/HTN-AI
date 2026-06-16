@@ -92,8 +92,8 @@ export const W_EXPOSE = 5.0; // cost per enemy with a clear shot on you (the dan
 export const W_PATH_EXPOSE = 0.8; // cost for crossing exposed ground to reach a spot
 export const W_RANGE = 0.12; // mild pull toward comfortable firing range (don't let it dominate cover)
 export const IDEAL_RANGE = 12; // closer than this you fight well; far costs a little accuracy
-export const SPOT_GRID = 4.2; // spacing of the auto-generated walkable grid
-export const MAX_SPOTS = 22; // cap on tactical points exposed to the planner (branching)
+export const SPOT_GRID = 3.2; // spacing of the auto-generated walkable grid
+export const MAX_SPOTS = 48; // cap on tactical points exposed to the planner (branching)
 
 /** Fluents the move-cost externals read — listed so a foe moving (perception) dirties
  *  the cost and the unit re-decides each beat. */
@@ -278,6 +278,14 @@ export function generateTacticalSpots(inst: SquadInstance): CoverSpec[] {
     for (const [sx, sz] of offs) {
       const x = cx + sx * (o.w / 2 + EDGE);
       const z = cz + sz * (o.d / 2 + EDGE);
+      if (!insideWall(x, z)) pts.push({ x, z });
+    }
+    // a wider standoff ring — diagonal firing angles a step back from the crate, so a
+    // unit can pick an OBLIQUE line on the enemy (more interesting perspectives than
+    // just hugging the box edge)
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]] as [number, number][]) {
+      const x = cx + sx * (o.w / 2 + EDGE * 2.6);
+      const z = cz + sz * (o.d / 2 + EDGE * 2.6);
       if (!insideWall(x, z)) pts.push({ x, z });
     }
   }
@@ -706,9 +714,14 @@ export const squadDomain: DomainDoc = {
       executor: "move",
     },
     {
-      // fire on the threat; reactively aborts the instant line-of-sight is lost
+      // fire on the threat; reactively aborts the instant line-of-sight is lost.
+      // Like suppress, excluded from the GOAP kill-search (not(useGoap)): it chips
+      // threatHp per shot and burns ammo, so as a route to "threatHp ≤ 0" it spawns
+      // deep (threatHp × ammo) chip-chains that explode the search even with dedup.
+      // The GOAP search uses engageFrom (the whole-burst finisher) as its kill action.
       name: "takeShot",
       pre: F.and(
+        F.not(F.lit("useGoap")),
         F.lit("hasThreat"),
         F.ext("canSee", [], ["myPos", "threatPos"]),
         F.gt(N.fl("myAmmo"), N.c(0)),
@@ -746,9 +759,13 @@ export const squadDomain: DomainDoc = {
       executor: "engage",
     },
     {
-      // suppressing fire: pins the target so a flanker can move (chips little HP)
+      // suppressing fire: pins the target so a flanker can move (chips little HP).
+      // Excluded from the GOAP kill-search (not(useGoap)): it chips threatHp a little
+      // per shot, so as a path to "threatHp ≤ 0" it spawns deep chip-chains (threatHp ×
+      // ammo states spatialDedup can't fold) that explode the search. It's a coordinated
+      // team tactic (suppress-and-flank), not a solo finisher — engageFrom is the kill.
       name: "suppress",
-      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
+      pre: F.and(F.not(F.lit("useGoap")), F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
       verify: F.ext("canSee", [], ["myPos", "threatPos"]),
       eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.c(SUPPRESS_DAMAGE), "planOnly")],
       // suppressing is firing too — it exposes you, so the solo kill-search won't pick
@@ -932,51 +949,99 @@ function spotHasLos(world: SquadWorld, x: number, z: number, t: number[]): boole
   return world.losClear(x, z, t[0], t[1]) && dist2(x, z, t[0], t[1]) <= SIGHT_RANGE;
 }
 
+/** The risk/reward of standing at (sx,sz) to fight `threat`, with `foes` able to shoot
+ *  you — the SAME cost the planner's spot search optimises, exposed so the view can
+ *  paint the potential field. `cost` is the whole-engagement cost (shots-to-kill ×
+ *  per-shot exposure); `firing` is false when the spot has no line of fire (cost ∞). */
+export interface SpotEval {
+  firing: boolean;
+  exposure: number;
+  cost: number;
+}
+export function evaluateSpot(world: SquadWorld, sx: number, sz: number, threat: { x: number; z: number }, foes: { x: number; z: number }[], caution = 1): SpotEval {
+  const exposure = world.exposureAt(sx, sz, foes);
+  if (!spotHasLos(world, sx, sz, [threat.x, threat.z])) return { firing: false, exposure, cost: Infinity };
+  let hit = rangeFalloff(dist2(sx, sz, threat.x, threat.z));
+  if (world.inCoverVs(threat.x, threat.z, sx, sz)) hit *= COVER_HIT_MULT;
+  const shots = Math.max(1, Math.ceil(100 / (SHOT_DAMAGE * Math.max(0.12, hit))));
+  return { firing: true, exposure, cost: shots * (1 + caution * W_EXPOSE * exposure) };
+}
+
 /**
- * The DOMAIN potential-field heuristic for the GOAP kill-search (Commit 2): an
- * admissible lower bound on the remaining cost to neutralize the threat from a given
- * state. For each firing position (current spot or any cover that sees the threat) it
- * lower-bounds travel (straight-line · W_MOVE ≤ the real walked, exposure-laden path)
- * plus the engagement (shots-to-kill · 1 ≤ the real per-shot cost), and takes the
- * min. Because it estimates "how far am I from a good place to shoot, and how long
- * will the kill take", it pulls the generic A* straight toward firing positions
- * instead of letting it wander over cheap micro-moves — the spatial structure the
- * symbolic relaxation can't see. Cheap (O(covers)) and deterministic.
+ * Builds the DOMAIN potential-field heuristic for one unit's GOAP kill-search: an
+ * estimate of the remaining cost to neutralize the threat from a given state. For each
+ * firing position it sums travel (straight-line · W_MOVE ≤ the real walked path) and
+ * the engagement from there (shots-to-kill × per-shot exposure), and takes the min.
+ * Including exposure makes the field TIGHT, so A* heads straight to the cheapest
+ * covered angle instead of wandering over equal-looking firing spots — the spatial
+ * structure the symbolic relaxation is blind to.
+ *
+ * The field (which covers are firing positions, and the full engagement cost from
+ * each) depends ONLY on the threat (position + HP), caution, and foe positions — all
+ * constant within a search and slow-changing between ticks. So we MEMOIZE it by that
+ * signature and rebuild only when the situation changes; the per-node work then
+ * collapses to a cheap distance to each precomputed firing spot (plus one line-of-fire
+ * check for the current position). That is what keeps the generic search's per-node
+ * cost on par with the bespoke route's single Dijkstra. Deterministic.
  */
-function squadEngageHeuristic(world: SquadWorld, model: Model, foeNames: string[], s: Snap): number {
-  if (s.get(model.slotOf("hasThreat")) < 0.5) return 0;
-  const hp = s.get(model.slotOf("threatHp"));
-  if (hp <= 0) return 0;
-  const mp = model.slotOf("myPos");
-  const mx = s.get(mp);
-  const mz = s.get(mp + 1);
-  const tps = model.slotOf("threatPos");
-  const t = [s.get(tps), s.get(tps + 1)];
-  const caution = s.get(model.slotOf("caution"));
-  const foes: { x: number; z: number }[] = [];
-  for (const f of foeNames) {
-    const fid = model.entityId(f);
-    if (s.get(model.slotOf("foeAlive", fid)) < 0.5) continue;
-    const ps = model.slotOf("foePos", fid);
-    foes.push({ x: s.get(ps), z: s.get(ps + 1) });
-  }
-  // estimate the remaining cost as the cheapest firing position: straight-line travel
-  // (≤ the real walked path) + the actual engagement from there (shots-to-kill × the
-  // per-shot exposure of that spot). Including exposure makes the field TIGHT — A*
-  // heads to the cheapest covered angle directly instead of treating every firing
-  // spot as equal, which is what kept the loose bound wandering.
-  let best = Infinity;
-  const consider = (x: number, z: number): void => {
-    if (!spotHasLos(world, x, z, t)) return;
-    let hit = rangeFalloff(dist2(x, z, t[0], t[1]));
-    if (world.inCoverVs(t[0], t[1], x, z)) hit *= COVER_HIT_MULT;
+function makeEngageHeuristic(world: SquadWorld, model: Model, foeNames: string[]): (s: Snap) => number {
+  const hasThreatSlot = model.slotOf("hasThreat");
+  const hpSlot = model.slotOf("threatHp");
+  const mypSlot = model.slotOf("myPos");
+  const tpSlot = model.slotOf("threatPos");
+  const cautionSlot = model.slotOf("caution");
+  const foeSlots = foeNames.map((f) => ({ alive: model.slotOf("foeAlive", model.entityId(f)), pos: model.slotOf("foePos", model.entityId(f)) }));
+  // cached field for the current situation
+  let sig = "";
+  let field: { x: number; z: number; engage: number }[] = [];
+  let tx = 0;
+  let tz = 0;
+  let hp = 0;
+  let caution = 0;
+  let foes: { x: number; z: number }[] = [];
+  const engageCostAt = (x: number, z: number): number => {
+    let hit = rangeFalloff(dist2(x, z, tx, tz));
+    if (world.inCoverVs(tx, tz, x, z)) hit *= COVER_HIT_MULT;
     const shots = Math.max(1, Math.ceil(hp / (SHOT_DAMAGE * Math.max(0.12, hit))));
-    const engage = shots * (1 + caution * W_EXPOSE * world.exposureAt(x, z, foes));
-    best = Math.min(best, W_MOVE * dist2(mx, mz, x, z) + engage);
+    return shots * (1 + caution * W_EXPOSE * world.exposureAt(x, z, foes));
   };
-  consider(mx, mz); // engage from where I am
-  for (const c of world.covers) consider(c.x, c.z);
-  return best === Infinity ? 1e6 : best;
+  return (s: Snap): number => {
+    if (s.get(hasThreatSlot) < 0.5) return 0;
+    const curHp = s.get(hpSlot);
+    if (curHp <= 0) return 0;
+    const ctx = s.get(tpSlot);
+    const ctz = s.get(tpSlot + 1);
+    const ccaution = s.get(cautionSlot);
+    let nsig = `${ctx},${ctz},${curHp},${ccaution}`;
+    const cfoes: { x: number; z: number }[] = [];
+    for (const fs of foeSlots) {
+      if (s.get(fs.alive) < 0.5) continue;
+      const fx = s.get(fs.pos);
+      const fz = s.get(fs.pos + 1);
+      cfoes.push({ x: fx, z: fz });
+      nsig += `;${fx.toFixed(2)},${fz.toFixed(2)}`;
+    }
+    if (nsig !== sig) {
+      // situation changed — rebuild the field once, then reuse it for every node
+      sig = nsig;
+      tx = ctx;
+      tz = ctz;
+      hp = curHp;
+      caution = ccaution;
+      foes = cfoes;
+      field = [];
+      const t = [tx, tz];
+      for (const c of world.covers) if (spotHasLos(world, c.x, c.z, t)) field.push({ x: c.x, z: c.z, engage: engageCostAt(c.x, c.z) });
+    }
+    const mx = s.get(mypSlot);
+    const mz = s.get(mypSlot + 1);
+    let best = spotHasLos(world, mx, mz, [tx, tz]) ? engageCostAt(mx, mz) : Infinity; // engage from here
+    for (const f of field) {
+      const c = W_MOVE * dist2(mx, mz, f.x, f.z) + f.engage;
+      if (c < best) best = c;
+    }
+    return best === Infinity ? 1e6 : best;
+  };
 }
 
 // ---------------------------------------------------------------- registry / model per unit
@@ -1322,6 +1387,11 @@ export interface UnitFrame {
   /** plain-English read of the unit's current tactical posture (glass-box director):
    *  whether it is in cover, how many enemies can shoot it, and its range to the threat */
   posture: string;
+  /** the unit's BELIEVED primary threat position (null when it knows of no threat) —
+   *  what it scores spots against, for a belief-honest heatmap */
+  believedThreat: { x: number; z: number } | null;
+  /** the unit's BELIEVED positions of foes it thinks are alive */
+  believedFoes: { x: number; z: number }[];
 }
 
 export interface TeamFrame {
@@ -1374,6 +1444,10 @@ export class SquadSim {
   private readonly barkAuthor: BarkAuthor;
   /** positioning engine ("mixed" when chosen per-side) — see SquadSimOptions.positioning */
   public readonly positioning: "spotgraph" | "goap" | "mixed";
+  /** the invisible tactical standing positions the planner chooses among (grid + cover
+   *  edges) — the discrete candidate set the spot search/route scores each beat. The
+   *  view renders these so you can watch which the planner considers and picks. */
+  public readonly spots: { name: string; x: number; z: number }[];
   private readonly modeOf: (side: Side) => "spotgraph" | "goap";
   private playerLeg = 0;
   private playerLegT = 0;
@@ -1388,7 +1462,9 @@ export class SquadSim {
     this.positioning = typeof pos === "function" ? "mixed" : pos;
     // augment the map with invisible tactical standing positions (grid + cover edges)
     // the planner can reposition to — fluid movement, not a handful of waypoints
-    const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...generateTacticalSpots(inst)] };
+    const tacticalSpots = generateTacticalSpots(inst);
+    this.spots = tacticalSpots.map((c) => ({ name: c.name, x: c.x, z: c.z }));
+    const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...tacticalSpots] };
     this.world = new SquadWorld(augmented);
     if (inst.breach) this.world.team("enemy").tactic = "breach"; // the attacking team breaches
     let seedBump = 0;
@@ -1423,7 +1499,7 @@ export class SquadSim {
         collectRejections: true,
         // GOAP mode: feed the generic search the spatial potential-field heuristic so
         // it stays goal-directed instead of wandering over the fine move space.
-        customHeuristic: goap ? (s) => squadEngageHeuristic(this.world, model, entry.foes, s) : undefined,
+        customHeuristic: goap ? makeEngageHeuristic(this.world, model, entry.foes) : undefined,
         // the kill goal is time-independent (no deadline), so collapse positions that
         // differ only in elapsed clock — turns the move search from combinatorial into
         // ~a Dijkstra over positions.
@@ -1750,11 +1826,21 @@ export class SquadSim {
         let firingAt: string | null = null;
         let firingKind: UnitFrame["firingKind"] = null;
         let sees: string | null = null;
+        // the unit's BELIEF of where the enemy is — what it actually scores spots
+        // against (vs ground truth), captured so the view can paint a belief-honest field
+        let believedThreat: { x: number; z: number } | null = null;
+        let believedFoes: { x: number; z: number }[] = [];
         if (up && a.alive) {
           sees = this.world.nearestHostile(a.name, true)?.name ?? null;
           if (stepLabel.startsWith("takeShot") || stepLabel.startsWith("engageFrom")) { firingKind = "shot"; firingAt = sees; }
           else if (stepLabel.startsWith("suppress")) { firingKind = "suppress"; firingAt = sees; }
           else if (stepLabel.startsWith("breach")) { firingKind = "breach"; firingAt = this.world.nearestHostile(a.name, false)?.name ?? null; }
+          const st = up.planner.state;
+          if (st.get(up.model.slotOf("hasThreat")) > 0.5) {
+            const tp = up.model.slotOf("threatPos");
+            believedThreat = { x: round(st.get(tp)), z: round(st.get(tp + 1)) };
+          }
+          believedFoes = this.believedFoePositions(up).map((f) => ({ x: round(f.x), z: round(f.z) }));
         }
         return {
           name: a.name,
@@ -1782,6 +1868,8 @@ export class SquadSim {
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
           why: up ? up.why : [],
           posture: up && a.alive ? this.describePosture(a) : "—",
+          believedThreat,
+          believedFoes,
         };
       }),
     };

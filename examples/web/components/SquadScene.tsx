@@ -3,8 +3,7 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, Grid, Html, Line, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
-import type { SquadFrame, SquadInstance, UnitFrame } from "@scenarios/squad-combat";
-import { buildTacticalWorld, coverIsSoft, readUnit, scoreSpots, type ScoredSpot, type UnitTactical } from "../lib/tacticalView";
+import { SquadWorld, evaluateSpot, isSoftCover, type SquadFrame, type SquadInstance, type UnitFrame, type SpotEval } from "@scenarios/squad-combat";
 
 const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
 const COVER_COLOR = { free: "#6b6051", flank: "#b45309", high: "#6d28d9", breach: "#7c2d12", rally: "#15803d" };
@@ -37,12 +36,72 @@ function stateColor(action: string): string {
   return "#64748b";
 }
 
+/** green (good / cheap & safe) → red (bad / exposed) for a normalized cost t∈[0,1]. */
+function heatColor(t: number): string {
+  return new THREE.Color().setHSL((1 - t) * 0.33, 0.85, 0.5).getStyle();
+}
+
 interface SceneProps {
   frame: SquadFrame;
   instance: SquadInstance;
+  /** the discrete tactical positions the planner scores + chooses among */
+  spots?: { name: string; x: number; z: number }[];
+  /** score spots against the unit's BELIEF (what it knows) or ground TRUTH */
+  heatMode?: "belief" | "truth";
+  /** master switch for the whole "what it's thinking" overlay */
+  showThinking: boolean;
   selected: string | null;
   onSelect: (name: string) => void;
-  showThinking: boolean;
+}
+
+interface Heat {
+  evals: Map<string, SpotEval>;
+  lo: number;
+  hi: number;
+}
+
+/** The candidate positions the spot search considers, drawn as floor markers. When a
+ *  unit is selected they become a POTENTIAL FIELD: each dot is tinted by that unit's
+ *  risk/reward at that spot (green = cheap, safe firing position → red = exposed),
+ *  grey = no line of fire. The dot the unit is moving to lights up cyan — the choice
+ *  the search just made. The field shifts live as enemies move. */
+function TacticalSpots({ spots, chosen, heat }: { spots: { name: string; x: number; z: number }[]; chosen: string | null; heat: Heat | null }) {
+  return (
+    <group>
+      {spots.map((s) => {
+        if (s.name === chosen) {
+          return (
+            <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.02, s.z]}>
+              <circleGeometry args={[0.34, 24]} />
+              <meshBasicMaterial color="#38bdf8" transparent opacity={0.9} side={THREE.DoubleSide} />
+            </mesh>
+          );
+        }
+        let color = "#3b4763";
+        let opacity = 0.26;
+        let r = 0.12;
+        const e = heat?.evals.get(s.name);
+        if (e) {
+          if (!e.firing) {
+            color = "#2b3447";
+            opacity = 0.2;
+            r = 0.11;
+          } else {
+            const t = heat && heat.hi > heat.lo ? (e.cost - heat.lo) / (heat.hi - heat.lo) : 0;
+            color = heatColor(t);
+            opacity = 0.82;
+            r = 0.22;
+          }
+        }
+        return (
+          <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.015, s.z]}>
+            <circleGeometry args={[r, 12]} />
+            <meshBasicMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      })}
+    </group>
+  );
 }
 
 function unitPos(u: UnitFrame): THREE.Vector3 {
@@ -60,7 +119,6 @@ function FireBeam({ from, to, kind, color }: { from: THREE.Vector3; to: THREE.Ve
   useFrame((state) => {
     const t = (state.clock.elapsedTime * (kind === "suppress" ? 1.4 : 3)) % 1;
     if (round.current) round.current.position.lerpVectors(a, b, t);
-    // muzzle flash flickers at the firing cadence
     const f = 0.5 + 0.5 * Math.abs(Math.sin(state.clock.elapsedTime * (kind === "suppress" ? 9 : 22)));
     if (flash.current) flash.current.scale.setScalar(0.7 + f * 0.9);
     if (light.current) light.current.intensity = (kind === "suppress" ? 1.2 : 2.6) * f;
@@ -73,7 +131,6 @@ function FireBeam({ from, to, kind, color }: { from: THREE.Vector3; to: THREE.Ve
         <sphereGeometry args={[0.09, 8, 8]} />
         <meshBasicMaterial color={beamColor} />
       </mesh>
-      {/* muzzle flash + a short-range light so it reads as a gunshot */}
       <group position={a.toArray()}>
         <mesh ref={flash}>
           <sphereGeometry args={[0.18, 10, 10]} />
@@ -101,7 +158,6 @@ function Impacts({ impactsRef }: { impactsRef: React.MutableRefObject<Impact[]> 
   const group = useRef<THREE.Group>(null);
   const dummy = useMemo(() => new THREE.Object3D(), []);
   const meshes = useRef<(THREE.InstancedMesh | null)[]>([]);
-  // a small pool of instanced bursts; each burst owns one instanced mesh
   const POOL = 10;
   const seeds = useMemo(
     () =>
@@ -116,7 +172,6 @@ function Impacts({ impactsRef }: { impactsRef: React.MutableRefObject<Impact[]> 
   useFrame((state) => {
     const now = state.clock.elapsedTime;
     const live = impactsRef.current;
-    // cull expired
     while (live.length && now - live[0].born > 0.9) live.shift();
     if (live.length > POOL) live.splice(0, live.length - POOL);
     for (let i = 0; i < POOL; i++) {
@@ -133,8 +188,8 @@ function Impacts({ impactsRef }: { impactsRef: React.MutableRefObject<Impact[]> 
       const s = seeds[i];
       for (let p = 0; p < PARTICLES; p++) {
         const sd = s[p];
-        const r = sd.spd * age;
-        dummy.position.set(sd.dir.x * r, sd.dir.y * r - 2.2 * age * age, sd.dir.z * r);
+        const rr = sd.spd * age;
+        dummy.position.set(sd.dir.x * rr, sd.dir.y * rr - 2.2 * age * age, sd.dir.z * rr);
         const sc = (imp.lethal ? 0.14 : 0.08) * (1 - k * 0.6);
         dummy.scale.setScalar(Math.max(0.001, sc));
         dummy.updateMatrix();
@@ -158,14 +213,14 @@ function Impacts({ impactsRef }: { impactsRef: React.MutableRefObject<Impact[]> 
 function Unit({
   u,
   target,
-  read,
+  inCover,
   suppressed,
   selected,
   onSelect,
 }: {
   u: UnitFrame;
   target: THREE.Vector3 | null;
-  read: UnitTactical | null;
+  inCover: boolean;
   suppressed: boolean;
   selected: boolean;
   onSelect: () => void;
@@ -174,7 +229,7 @@ function Unit({
   const body = useRef<THREE.Group>(null);
   const pulse = useRef<THREE.Mesh>(null);
   const dest = useMemo(() => unitPos(u), [u]);
-  const crouch = !!(read?.inCover && u.alive && !/moving|flanking|repositioning|falling|stacking/.test(u.action));
+  const crouch = inCover && u.alive && !/moving|flanking|repositioning|falling|stacking/.test(u.action);
   useFrame((state, dt) => {
     const g = ref.current;
     if (!g) return;
@@ -183,7 +238,6 @@ function Unit({
       const dir = Math.atan2(target.x - g.position.x, target.z - g.position.z);
       g.rotation.y += (dir - g.rotation.y) * Math.min(1, dt * 8);
     }
-    // crouch behind cover (peek), stand otherwise
     if (body.current) {
       const ty = crouch ? -0.16 : 0;
       const ts = crouch ? 0.82 : 1;
@@ -204,14 +258,12 @@ function Unit({
           <capsuleGeometry args={[0.32, 0.5, 6, 14]} />
           <meshStandardMaterial color={u.alive ? color : "#3a3f4b"} emissive={u.alive ? color : "#000"} emissiveIntensity={selected ? 0.7 : 0.25} roughness={0.5} transparent opacity={u.alive ? 1 : 0.3} />
         </mesh>
-        {/* facing / weapon nub */}
         {u.alive && (
           <mesh position={[0, 0.15, 0.42]} rotation={[Math.PI / 2, 0, 0]}>
             <cylinderGeometry args={[0.05, 0.05, 0.5, 8]} />
             <meshStandardMaterial color="#1f2630" />
           </mesh>
         )}
-        {/* a small shield arc on the threat-facing side when tucked in cover */}
         {crouch && (
           <mesh position={[0, 0.05, 0.46]} rotation={[Math.PI / 2, 0, 0]}>
             <torusGeometry args={[0.34, 0.05, 8, 16, Math.PI]} />
@@ -219,14 +271,12 @@ function Unit({
           </mesh>
         )}
       </group>
-      {/* feet ring coloured by what the unit is doing */}
       {u.alive && (
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.74, 0]}>
           <ringGeometry args={[0.42, 0.54, 28]} />
           <meshBasicMaterial color={stateColor(u.action)} side={THREE.DoubleSide} transparent opacity={0.9} />
         </mesh>
       )}
-      {/* pinned-by-suppression pulse */}
       {u.alive && suppressed && (
         <mesh ref={pulse} rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.72, 0]}>
           <ringGeometry args={[0.6, 0.78, 28]} />
@@ -294,7 +344,6 @@ function CoverCrate({ x, z, color, ownerColor }: { x: number; z: number; color: 
         <boxGeometry args={[0.98, 0.32, 0.56]} />
         <meshStandardMaterial color={color} roughness={0.96} metalness={0.02} />
       </mesh>
-      {/* a couple of sandbags on top so it reads as cover, not a floor tile */}
       <mesh position={[-0.22, 0.4, 0]} rotation={[0, 0, Math.PI / 2]} castShadow>
         <capsuleGeometry args={[0.12, 0.34, 4, 8]} />
         <meshStandardMaterial color={color} roughness={1} />
@@ -377,114 +426,6 @@ function Wall({ x, z, w, d, door, broken }: { x: number; z: number; w: number; d
   );
 }
 
-/** Heat colour for a position's desirability: red (bad) → amber → green (good). */
-function heatColor(d: number): string {
-  const hue = Math.round(d * 120); // 0 = red, 120 = green
-  return `hsl(${hue}, 85%, 55%)`;
-}
-
-/**
- * The "what the selected unit is thinking" overlay: a sight-range ring, the score/risk
- * the planner assigns to every candidate position (a heat disc per spot), the best
- * firing position with the intended move toward it, plus the enemies who currently
- * have a line of fire ON this unit (incoming threat).
- */
-function ThinkingOverlay({
-  self,
-  spots,
-  read,
-  incoming,
-}: {
-  self: UnitFrame;
-  spots: ScoredSpot[];
-  read: UnitTactical;
-  incoming: UnitFrame[];
-}) {
-  const here = unitPos(self);
-  const best = spots.find((s) => s.best && !s.current);
-  return (
-    <group>
-      {/* sight range ring */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[self.x, 0.015, self.z]}>
-        <ringGeometry args={[21.5, 22, 64]} />
-        <meshBasicMaterial color="#38bdf8" transparent opacity={0.5} side={THREE.DoubleSide} />
-      </mesh>
-
-      {/* scored candidate positions */}
-      {spots.map((s) => {
-        if (s.current) return null;
-        if (!s.hasLos) {
-          // considered, but no line of fire from here → dim slate dot
-          return (
-            <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.02, s.z]}>
-              <circleGeometry args={[0.19, 16]} />
-              <meshBasicMaterial color="#64748b" transparent opacity={0.45} side={THREE.DoubleSide} />
-            </mesh>
-          );
-        }
-        const r = 0.28 + s.desirability * 0.22;
-        return (
-          <group key={s.name}>
-            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.02, s.z]}>
-              <circleGeometry args={[r, 22]} />
-              <meshBasicMaterial color={heatColor(s.desirability)} transparent opacity={0.32 + s.desirability * 0.33} side={THREE.DoubleSide} />
-            </mesh>
-            {s.cover > 0 && (
-              <mesh rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.025, s.z]}>
-                <ringGeometry args={[r, r + 0.06, 22]} />
-                <meshBasicMaterial color="#7dd3fc" transparent opacity={0.7} side={THREE.DoubleSide} />
-              </mesh>
-            )}
-          </group>
-        );
-      })}
-
-      {/* intended move toward the best firing position */}
-      {best && (
-        <>
-          <Line points={[here.clone().setY(0.05), new THREE.Vector3(best.x, 0.05, best.z)]} color="#34d399" lineWidth={2} dashed dashSize={0.3} gapSize={0.18} transparent opacity={0.85} />
-          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[best.x, 0.03, best.z]}>
-            <ringGeometry args={[0.5, 0.62, 28]} />
-            <meshBasicMaterial color="#34d399" side={THREE.DoubleSide} />
-          </mesh>
-          <Html position={[best.x, 0.6, best.z]} center distanceFactor={16} style={{ pointerEvents: "none" }}>
-            <div style={{ fontSize: 9, color: "#34d399", fontFamily: "monospace", background: "rgba(11,14,20,0.75)", padding: "1px 6px", borderRadius: 5, whiteSpace: "nowrap" }}>
-              best angle{best.cover > 0 ? " · in cover" : ""}{best.exposure > 0 ? ` · exposed ${best.exposure}` : " · safe"}
-            </div>
-          </Html>
-        </>
-      )}
-
-      {/* current threat sight line (green = shot / red = blocked) */}
-      {read.threat && (
-        <SightLine from={here} to={unitPos(read.threat)} hasShot={read.hasShot} />
-      )}
-
-      {/* enemies who currently have a line of fire ON this unit */}
-      {incoming.map((e) => (
-        <Line
-          key={`in-${e.name}`}
-          points={[unitPos(e).clone().setY(unitPos(e).y + CHEST), here.clone().setY(here.y + CHEST)]}
-          color="#ef4444"
-          lineWidth={1.5}
-          dashed
-          dashSize={0.15}
-          gapSize={0.12}
-          transparent
-          opacity={0.55}
-        />
-      ))}
-      {incoming.length > 0 && (
-        <Html position={[self.x, 2.2, self.z]} center distanceFactor={16} style={{ pointerEvents: "none" }}>
-          <div style={{ fontSize: 9, color: "#fca5a5", fontFamily: "monospace", background: "rgba(11,14,20,0.75)", padding: "1px 6px", borderRadius: 5, whiteSpace: "nowrap" }}>
-            ⚠ {incoming.length} enemy gun{incoming.length > 1 ? "s" : ""} on me
-          </div>
-        </Html>
-      )}
-    </group>
-  );
-}
-
 /** The selected unit's line of sight to its target — green if it has a shot, red if blocked. */
 function SightLine({ from, to, hasShot }: { from: THREE.Vector3; to: THREE.Vector3; hasShot: boolean }) {
   const a = from.clone().setY(from.y + CHEST);
@@ -501,7 +442,18 @@ function SightLine({ from, to, hasShot }: { from: THREE.Vector3; to: THREE.Vecto
   );
 }
 
-function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps) {
+function nearestHostileFrame(frame: SquadFrame, self: UnitFrame): UnitFrame | null {
+  let best: UnitFrame | null = null;
+  let bestD = Infinity;
+  for (const h of frame.units) {
+    if (!h.alive || !(HOSTILE[self.side] ?? []).includes(h.side)) continue;
+    const d = Math.hypot(h.x - self.x, h.z - self.z);
+    if (d < bestD) { bestD = d; best = h; }
+  }
+  return best;
+}
+
+function Scene({ frame, instance, spots = [], heatMode = "belief", showThinking, selected, onSelect }: SceneProps) {
   const center = useMemo<[number, number, number]>(() => {
     const xs = instance.units.map((u) => u.x).concat(instance.covers.map((c) => c.x));
     const zs = instance.units.map((u) => u.z).concat(instance.covers.map((c) => c.z));
@@ -514,14 +466,21 @@ function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps
     return m;
   }, [frame]);
 
-  // a SquadWorld snapped to this frame — used to read each unit's cover state and to
-  // score positions for the selected unit (the library's own geometry, no re-impl)
-  const world = useMemo(() => buildTacticalWorld(instance, frame), [instance, frame]);
-  const reads = useMemo(() => {
-    const m = new Map<string, UnitTactical | null>();
-    for (const u of frame.units) m.set(u.name, u.alive ? readUnit(world, frame, u) : null);
-    return m;
-  }, [world, frame]);
+  // geometry-only world (walls + crates) for line-of-sight / cover / exposure queries —
+  // the library's own primitives, rebuilt only when the map changes. Positions are
+  // always passed in explicitly (from the current frame), so it needs no per-tick sync.
+  const world = useMemo(() => new SquadWorld(instance), [instance]);
+
+  // which units are tucked behind a crate vs. their nearest real threat (so they crouch)
+  const coverSet = useMemo(() => {
+    const s = new Set<string>();
+    for (const u of frame.units) {
+      if (!u.alive) continue;
+      const t = nearestHostileFrame(frame, u);
+      if (t && world.inCoverVs(u.x, u.z, t.x, t.z)) s.add(u.name);
+    }
+    return s;
+  }, [frame, world]);
 
   // who is being suppressed (an enemy is laying suppressing fire on them this beat)
   const suppressedSet = useMemo(() => {
@@ -531,11 +490,43 @@ function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps
   }, [frame]);
 
   const sel = selected ? byName.get(selected) : undefined;
-  const selRead = sel ? reads.get(sel.name) ?? null : null;
-  const scored = useMemo(
-    () => (sel && sel.alive ? scoreSpots(world, instance, sel, frame) : []),
-    [world, instance, sel, frame],
-  );
+  const selTarget = useMemo(() => (sel && sel.alive ? nearestHostileFrame(frame, sel) : null), [sel, frame]);
+
+  // the potential field FOR THE SELECTED UNIT: score every candidate spot by its
+  // risk/reward (the SAME cost the planner optimises). "belief" = against what the unit
+  // KNOWS (the positions it actually plans against); "truth" = against the enemies' real
+  // positions. Either way it shifts as the fight moves.
+  const heat = useMemo<Heat | null>(() => {
+    if (!sel || !sel.alive || spots.length === 0) return null;
+    const threat = heatMode === "belief" ? sel.believedThreat : selTarget ? { x: selTarget.x, z: selTarget.z } : null;
+    if (!threat) return null;
+    const foes =
+      heatMode === "belief"
+        ? sel.believedFoes
+        : frame.units.filter((u) => u.alive && (HOSTILE[sel.side] ?? []).includes(u.side)).map((u) => ({ x: u.x, z: u.z }));
+    const evals = new Map<string, SpotEval>();
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const s of spots) {
+      const e = evaluateSpot(world, s.x, s.z, threat, foes);
+      evals.set(s.name, e);
+      if (e.firing) { lo = Math.min(lo, e.cost); hi = Math.max(hi, e.cost); }
+    }
+    return { evals, lo, hi };
+  }, [sel, selTarget, spots, frame, world, heatMode]);
+
+  // the spot the selected unit is currently moving to — parsed from its plan step
+  const chosenSpot = useMemo(() => {
+    if (!sel || !sel.alive) return null;
+    const m = /\((\w+)\)/.exec(sel.step ?? "");
+    return m ? m[1] : null;
+  }, [sel]);
+  const chosenPos = useMemo(() => {
+    if (!chosenSpot) return null;
+    const s = spots.find((p) => p.name === chosenSpot) ?? instance.covers.find((c) => c.name === chosenSpot);
+    return s ? new THREE.Vector3(s.x, 0.05, s.z) : null;
+  }, [chosenSpot, spots, instance]);
+
   // enemies that currently have a line of fire on the selected unit (incoming risk)
   const incoming = useMemo(() => {
     if (!sel || !sel.alive) return [];
@@ -558,6 +549,8 @@ function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps
     }
   }, [frame]);
 
+  const selPos = sel && sel.alive ? unitPos(sel) : null;
+
   return (
     <>
       <PerspectiveCamera makeDefault position={[center[0], 20, center[2] + 13]} fov={40} />
@@ -578,10 +571,18 @@ function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps
         <Wall key={i} {...w} broken={frame.doorBroken} />
       ))}
 
+      {/* the discrete candidate positions the planner scores each beat (heat field) */}
+      {showThinking && <TacticalSpots spots={spots} chosen={chosenSpot} heat={heat} />}
+
+      {/* the move the SELECTED unit's search just committed to (unit → chosen spot) */}
+      {showThinking && sel && sel.alive && chosenPos && (
+        <Line points={[unitPos(sel).setY(0.05), chosenPos]} color="#38bdf8" lineWidth={1.5} dashed dashSize={0.3} gapSize={0.2} transparent opacity={0.8} />
+      )}
+
       {instance.covers.map((c) => {
         const owner = frame.reservations[c.name] ?? null;
         const oc = owner ? SIDE_COLOR[byName.get(owner)?.side ?? ""] ?? "#e2e8f0" : null;
-        if (coverIsSoft(c)) return <CoverCrate key={c.name} x={c.x} z={c.z} color={COVER_COLOR.free} ownerColor={oc} />;
+        if (isSoftCover(c)) return <CoverCrate key={c.name} x={c.x} z={c.z} color={COVER_COLOR.free} ownerColor={oc} />;
         const kind = c.breach ? "breach" : c.flank ? "flank" : c.high ? "high" : "rally";
         return <Anchor key={c.name} x={c.x} z={c.z} kind={kind} color={COVER_COLOR[kind as keyof typeof COVER_COLOR]} ownerColor={oc} />;
       })}
@@ -594,8 +595,36 @@ function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps
         return <FireBeam key={`beam-${u.name}`} from={unitPos(u)} to={unitPos(t)} kind={u.firingKind ?? "shot"} color={SIDE_COLOR[u.side] ?? "#fff"} />;
       })}
 
-      {/* the selected unit's "thinking" overlay */}
-      {showThinking && sel && sel.alive && selRead && <ThinkingOverlay self={sel} spots={scored} read={selRead} incoming={incoming} />}
+      {/* selected unit's awareness overlay: sight-range ring, line of fire, incoming guns */}
+      {showThinking && sel && sel.alive && selPos && (
+        <group>
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[sel.x, 0.012, sel.z]}>
+            <ringGeometry args={[21.5, 22, 64]} />
+            <meshBasicMaterial color="#38bdf8" transparent opacity={0.45} side={THREE.DoubleSide} />
+          </mesh>
+          {selTarget && <SightLine from={selPos} to={unitPos(selTarget)} hasShot={sel.sees === selTarget.name} />}
+          {incoming.map((e) => (
+            <Line
+              key={`in-${e.name}`}
+              points={[unitPos(e).clone().setY(unitPos(e).y + CHEST), selPos.clone().setY(selPos.y + CHEST)]}
+              color="#ef4444"
+              lineWidth={1.5}
+              dashed
+              dashSize={0.15}
+              gapSize={0.12}
+              transparent
+              opacity={0.5}
+            />
+          ))}
+          {incoming.length > 0 && (
+            <Html position={[sel.x, 2.2, sel.z]} center distanceFactor={16} style={{ pointerEvents: "none" }}>
+              <div style={{ fontSize: 9, color: "#fca5a5", fontFamily: "monospace", background: "rgba(11,14,20,0.75)", padding: "1px 6px", borderRadius: 5, whiteSpace: "nowrap" }}>
+                ⚠ {incoming.length} enemy gun{incoming.length > 1 ? "s" : ""} on me
+              </div>
+            </Html>
+          )}
+        </group>
+      )}
 
       {frame.units.map((u) => {
         const aimAt = u.firingAt ? byName.get(u.firingAt) : u.sees ? byName.get(u.sees) : null;
@@ -604,7 +633,7 @@ function Scene({ frame, instance, selected, onSelect, showThinking }: SceneProps
             key={u.name}
             u={u}
             target={aimAt ? unitPos(aimAt) : null}
-            read={reads.get(u.name) ?? null}
+            inCover={coverSet.has(u.name)}
             suppressed={suppressedSet.has(u.name)}
             selected={selected === u.name}
             onSelect={() => onSelect(u.name)}

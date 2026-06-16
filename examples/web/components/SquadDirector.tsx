@@ -39,19 +39,23 @@ const tacticWord: Record<string, string> = {
 export default function SquadDirector({
   frame,
   instance,
+  spots,
+  heatMode = "belief",
   units,
   selected,
   onSelect,
 }: {
   frame: SquadFrame;
   instance: SquadInstance;
+  spots: { name: string; x: number; z: number }[];
+  heatMode?: "belief" | "truth";
   units: string[];
   selected: string | null;
   onSelect: (name: string) => void;
 }) {
   const u: UnitFrame | undefined = frame.units.find((x) => x.name === selected);
-  const read = tacticalRead(instance, frame, selected ?? null);
-  const best = read.spots.find((s) => s.best && !s.current);
+  const read = tacticalRead(instance, frame, spots, selected ?? null, heatMode);
+  const best = read?.best ?? null;
   return (
     <div className="card">
       <h2>AI director · glass-box</h2>
@@ -88,32 +92,32 @@ export default function SquadDirector({
             </div>
           )}
 
-          {u.alive && read.unit && (
+          {u.alive && read && read.here && (
             <>
               <h3 className="dir-h" style={{ marginTop: 12 }}>
-                POSITION READ <span style={{ color: "var(--muted)", fontWeight: 400 }}>· scoring the map</span>
+                POSITION READ <span style={{ color: "var(--muted)", fontWeight: 400 }}>· scoring vs {heatMode === "belief" ? "what it knows" : "ground truth"}</span>
               </h3>
               <div className="risk-row">
                 <span className="risk-tag">here</span>
-                <span className="mono" style={{ color: read.unit.exposure > 0 ? "#fca5a5" : "var(--accent)" }}>
-                  {read.unit.cover > 0 ? `🛡 covered vs ${read.unit.cover}` : read.unit.exposure > 0 ? "exposed" : "no contact"}
+                <span className="mono" style={{ color: read.here.exposure > 0 ? "#fca5a5" : "var(--accent)" }}>
+                  {read.cover > 0 ? `🛡 covered vs ${read.cover}` : read.here.exposure > 0 ? "exposed" : "no contact"}
                 </span>
                 <span className="mono" style={{ color: "var(--muted)" }}>
-                  {read.unit.exposure} gun{read.unit.exposure === 1 ? "" : "s"} on me{read.unit.range != null ? ` · ${Math.round(read.unit.range)}m` : ""}
+                  {read.here.exposure} gun{read.here.exposure === 1 ? "" : "s"} on me{read.range != null ? ` · ${Math.round(read.range)}m` : ""}
                 </span>
-                <span className="pill" style={{ color: read.unit.hasShot ? "var(--good)" : "var(--muted)" }}>{read.unit.hasShot ? "has shot" : "no shot"}</span>
+                <span className="pill" style={{ color: read.here.firing ? "var(--good)" : "var(--muted)" }}>{read.here.firing ? "has shot" : "no shot"}</span>
               </div>
               {best && (
                 <div className="risk-row">
                   <span className="risk-tag good">best</span>
-                  <span className="mono" style={{ color: "var(--good)" }}>{best.named ? best.name : "a covered angle"}</span>
+                  <span className="mono" style={{ color: "var(--good)" }}>{best.name.startsWith("spot") ? "a covered angle" : best.name}</span>
                   <span className="mono" style={{ color: "var(--muted)" }}>
-                    {best.cover > 0 ? `cover vs ${best.cover} · ` : ""}{best.exposure > 0 ? `exposed ${best.exposure}` : "safe"} · {Math.round(best.travel)}m away
+                    {best.eval.exposure > 0 ? `exposed ${best.eval.exposure}` : "safe"} · cost {best.eval.cost.toFixed(1)} · {Math.round(best.travel)}m away
                   </span>
                 </div>
               )}
               <div className="mono" style={{ color: "var(--muted)", marginTop: 4, fontSize: 10.5 }}>
-                {read.spots.filter((s) => s.hasLos).length} firing position{read.spots.filter((s) => s.hasLos).length === 1 ? "" : "s"} scored · select on the map to see the heat overlay
+                {read.firingCount} firing position{read.firingCount === 1 ? "" : "s"} scored · select on the map to see the heat overlay
               </div>
             </>
           )}
