@@ -19,7 +19,7 @@ function actionIcon(action: string): string {
   if (action.includes("stacking")) return "▮";
   if (action === "breaching") return "💥";
   if (action === "reloading") return "⟳";
-  if (action === "falling back") return "⮌";
+  if (action === "falling back" || action === "breaking contact") return "⮌";
   if (action === "down") return "✖";
   if (action === "thinking…") return "…";
   return "•";

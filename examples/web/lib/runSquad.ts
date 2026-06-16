@@ -159,7 +159,7 @@ function teamPhrase(units: SquadFrame["units"]): string {
   if (sup) return "laying down suppressing fire";
   if (fl) return "swinging to a flank";
   if (has((a) => a.startsWith("firing"))) return "trading fire from cover";
-  if (has((a) => a === "falling back")) return "falling back";
+  if (has((a) => a === "falling back" || a === "breaking contact")) return "breaking contact";
   if (has((a) => a.includes("moving"))) return "repositioning for an angle";
   if (has((a) => a === "reloading")) return "reloading";
   return "holding";

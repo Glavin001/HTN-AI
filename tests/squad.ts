@@ -619,16 +619,11 @@ test("squad: the spot-graph route composes a multi-hop path around a barricade t
   assert.equal(sim.world.actors.get("P")!.alive, false, "and reached a firing angle to neutralize the target");
 });
 
-// --------------------------------------------------- F: known limitation — no survival modelling
+// --------------------------------------------------- F: survival / attrition model (push vs flee)
 
-test("squad: planning does NOT model own survival — units die mid-reposition crossing fire", () => {
-  // Characterizes a real gap (not a feature): NO operator projects myHp loss, so the
-  // crossing of an exposed lane is only a soft COST (pathExposure, scaled by caution),
-  // never a survival constraint. A unit therefore commits to a reposition toward a
-  // better angle even when the enemy's fire kills it before it arrives — it cannot
-  // reason "I'll be dead before I complete this move." We assert the observable symptom:
-  // across seeds, some units die WHILE executing a move step (not while firing).
-  const inst: SquadInstance = {
+/** A flank scenario whose open approaches are dangerous to cross. */
+function attritionFlankInstance(): SquadInstance {
+  return {
     units: [
       { name: "R1", side: "enemy", x: -10, z: -1, role: "suppressor" },
       { name: "R2", side: "enemy", x: -10, z: 2, role: "flanker" },
@@ -642,13 +637,21 @@ test("squad: planning does NOT model own survival — units die mid-reposition c
       { name: "fNW", x: -3, z: -9.5, flank: true }, { name: "fSW", x: -3, z: 9.5, flank: true },
       { name: "fNE", x: 3, z: -9.5, flank: true }, { name: "fSE", x: 3, z: 9.5, flank: true },
     ],
-    walls: [{ x: -2, z: -5, w: 4, d: 10 }], // central barricade forces exposed flanks
+    walls: [{ x: -2, z: -5, w: 4, d: 10 }],
   };
-  const isMove = (s: string) => /^(moveFree|moveToSpot|flankTo|advanceTo|retreatTo)/.test(s);
+}
+
+test("squad: the attrition model stops suicidal advances — nobody dies charging into fire", () => {
+  // With myHp projected onto move + engage and the survival gates, a unit no longer
+  // commits to a reposition-to-fight whose crossing/engagement kills it. We assert the
+  // turnaround from the old behaviour: deaths while ADVANCING to fight (moveFree /
+  // moveToSpot / flankTo) are essentially gone — casualties now occur firing or while
+  // breaking contact (caught fleeing a fight already judged lost), not charging in.
+  const advanceMove = (s: string) => /^(moveFree|moveToSpot|flankTo|advanceTo)/.test(s);
   let total = 0;
-  let moveDeaths = 0;
-  for (const seed of [1, 2, 3, 4, 5, 6]) {
-    const sim = new SquadSim(inst, { seed, positioning: "goap" });
+  let advanceDeaths = 0;
+  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    const sim = new SquadSim(attritionFlankInstance(), { seed, positioning: "goap" });
     const lastStep = new Map<string, string>();
     const alive = new Map<string, boolean>();
     for (const u of sim.snapshot().units) alive.set(u.name, true);
@@ -656,7 +659,7 @@ test("squad: planning does NOT model own survival — units die mid-reposition c
       for (const u of sim.step().units) {
         if (alive.get(u.name) && !u.alive) {
           total++;
-          if (isMove(lastStep.get(u.name) ?? "")) moveDeaths++;
+          if (advanceMove(lastStep.get(u.name) ?? "")) advanceDeaths++;
           alive.set(u.name, false);
         }
         if (u.alive && u.step && u.step !== "—") lastStep.set(u.name, u.step);
@@ -664,7 +667,48 @@ test("squad: planning does NOT model own survival — units die mid-reposition c
     }
   }
   assert.ok(total > 0, "the engagements produced casualties");
-  assert.ok(moveDeaths >= 1, `at least one unit died while repositioning across fire (saw ${moveDeaths}/${total}) — confirms plans don't weigh lethal crossing as survival`);
+  assert.equal(advanceDeaths, 0, `no unit died advancing into fire (saw ${advanceDeaths}/${total}) — the survival model prunes lethal crossings`);
+});
+
+test("squad: outnumbered ⇒ break contact (2-on-1, I won't survive — run)", () => {
+  // One unit alone against two shooters: the attrition race says it loses, and no
+  // reachable spot flips that, so it breaks contact instead of trading and dying.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -9, role: "assault" },
+      { name: "P1", side: "player", x: -3, z: 8 },
+      { name: "P2", side: "player", x: 3, z: 8 },
+    ],
+    covers: [{ name: "cBack", x: 0, z: -12 }, { name: "cMid", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 2, positioning: "goap" });
+  let brokeContact = false;
+  for (let i = 0; i < 120 && sim.world.actors.get("E")!.alive; i++) {
+    const e = sim.step().units.find((u) => u.name === "E")!;
+    if (e.step.startsWith("breakTo")) brokeContact = true;
+  }
+  assert.ok(brokeContact, "the outnumbered unit chose to break contact rather than fight a fight it loses");
+});
+
+test("squad: outnumbering ⇒ push (2-on-1 in our favour, we'll win — move in)", () => {
+  // Two units against one: friendly guns shorten the kill, so the attrition race is
+  // winnable — they engage and take the target rather than flee. Same geometry as the
+  // flee case, only the numbers are reversed, so the difference is the squad math.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E1", side: "enemy", x: -2, z: -9, role: "assault" },
+      { name: "E2", side: "enemy", x: 2, z: -9, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 8 },
+    ],
+    covers: [{ name: "cMid", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 2, positioning: "goap" });
+  let anyFled = false;
+  for (let i = 0; i < 200 && sim.world.actors.get("P")!.alive; i++) {
+    for (const u of sim.step().units) if ((u.name === "E1" || u.name === "E2") && u.step.startsWith("breakTo")) anyFled = true;
+  }
+  assert.equal(sim.world.actors.get("P")!.alive, false, "the outnumbering pair pushed in and neutralized the target");
+  assert.ok(!anyFled, "neither attacker broke contact — the squad math made it a winnable push");
 });
 
 // ---------------------------------------------------------------- F: caution (outgunned ⇒ value safety)

@@ -59,6 +59,16 @@ export const RELOAD_TIME = 1.6;
 export const SUPPRESS_MAX = 5; // a suppressor sustains fire up to this long (or until the flanker is set)
 export const MEMORY_SECONDS = 4; // how long a lost target is remembered before "search"
 export const LOW_HP = 48; // pull back to cover once this hurt (react to taking fire)
+// survival margin (HP) a unit insists on keeping after a projected engagement/crossing,
+// scaled by caution. The attrition model gates moves + engagements on this: a plan that
+// would drop you below it is "lethal" and pruned — so the planner reasons about whether
+// it will actually survive a fight or a dash, not just how exposed it is.
+export const SAFETY_MARGIN = 12;
+// fraction of a dash actually spent under aimed fire: you cross most of a lane before
+// the enemy reacquires and lands shots, so a crossing is far less lethal than standing
+// in the open the whole time. Keeps units from freezing (they'll still dash to re-engage)
+// while a genuinely long, fully-exposed run is still gated as lethal.
+const CROSS_RISK = 0.5;
 export const SIGHT_RANGE = 22;
 export const BREACH_WINDOW = 6; // seconds the synchronized breach must complete within
 
@@ -98,6 +108,10 @@ export const MAX_SPOTS = 48; // cap on tactical points exposed to the planner (b
 /** Fluents the move-cost externals read — listed so a foe moving (perception) dirties
  *  the cost and the unit re-decides each beat. */
 const TACTICAL_READS = ["myPos", "coverPos", "threatPos", "foePos", "foeAlive"];
+/** Reads for the attrition/survival externals — moving (crossing damage) vs fighting
+ *  (engagement damage). Listed so a foe/ally moving or HP dropping re-decides the gate. */
+const MOVE_SURV_READS = ["myPos", "coverPos", "foePos", "foeAlive", "allyPos", "allyAlive", "caution", "myHp"];
+const ENGAGE_SURV_READS = ["myPos", "threatPos", "threatHp", "foePos", "foeAlive", "allyPos", "allyAlive", "caution", "myHp"];
 
 // ---------------------------------------------------------------- instance shapes
 
@@ -433,6 +447,15 @@ export class SquadWorld {
     return [...this.actors.values()].filter((a) => HOSTILE[me.side].includes(a.side)).map((a) => a.name);
   }
 
+  /** The names of every OTHER actor on `self`'s side (its squadmates) — each becomes an
+   *  `ally` entity so belief can track their positions (shared squad comms), which the
+   *  attrition model uses to count friendly guns on a shared threat. */
+  allyNamesFor(self: string): string[] {
+    const me = this.actors.get(self);
+    if (!me) return [];
+    return [...this.actors.values()].filter((a) => a.side === me.side && a.name !== self).map((a) => a.name);
+  }
+
   /** Probability a shot from `shooter` lands on `target`, given range + the target's
    *  cover relative to the shooter (and a small peek penalty if the shooter itself is
    *  hugging cover). Deterministic inputs → the executor rolls a seeded RNG against it. */
@@ -463,6 +486,53 @@ export class SquadWorld {
     let n = 0;
     for (const f of foes) if (dist2(px, pz, f.x, f.z) <= SIGHT_RANGE && this.inCoverVs(px, pz, f.x, f.z)) n++;
     return n;
+  }
+
+  /** Damage/second I'd take standing at (px,pz) from `shooters` that can see me, each
+   *  shot's chance discounted by my cover relative to that shooter. The core of the
+   *  attrition model — how fast this spot bleeds me. Pass believed foe positions. */
+  incomingDps(px: number, pz: number, shooters: { x: number; z: number }[]): number {
+    let dps = 0;
+    for (const f of shooters) {
+      if (dist2(px, pz, f.x, f.z) > SIGHT_RANGE) continue;
+      if (!this.losClear(px, pz, f.x, f.z)) continue;
+      let p = rangeFalloff(dist2(px, pz, f.x, f.z));
+      if (this.inCoverVs(px, pz, f.x, f.z)) p *= COVER_HIT_MULT; // my cover vs this shooter
+      dps += (SHOT_DAMAGE * p) / SHOT_TIME;
+    }
+    return dps;
+  }
+
+  /** Like incomingDps, but discounted by COVERING FIRE: a foe my squadmates can also
+   *  shoot splits/suppresses its fire instead of pouring it all on me. So two units
+   *  pushing a lone foe each take less return fire than one would — which is what lets
+   *  an outnumbering squad commit (and keeps a lone, uncovered unit from doing so). */
+  incomingDpsVsSquad(px: number, pz: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[]): number {
+    let dps = 0;
+    for (const f of foes) {
+      if (dist2(px, pz, f.x, f.z) > SIGHT_RANGE || !this.losClear(px, pz, f.x, f.z)) continue;
+      let p = rangeFalloff(dist2(px, pz, f.x, f.z));
+      if (this.inCoverVs(px, pz, f.x, f.z)) p *= COVER_HIT_MULT;
+      let covering = 0;
+      for (const a of allies) if (dist2(a.x, a.z, f.x, f.z) <= SIGHT_RANGE && this.losClear(a.x, a.z, f.x, f.z)) covering++;
+      dps += ((SHOT_DAMAGE * p) / SHOT_TIME) / (1 + covering); // each covering gun draws a share of the foe's fire
+    }
+    return dps;
+  }
+
+  /** Combined damage/second `shooters` (me + believed allies) put onto a target at
+   *  (tx,tz) — how fast WE kill it. This is what makes outnumbering matter: more guns
+   *  on the threat ⇒ a shorter fight ⇒ less time taking return fire ⇒ "we'll win". */
+  firepowerOnto(tx: number, tz: number, shooters: { x: number; z: number }[]): number {
+    let dps = 0;
+    for (const s of shooters) {
+      if (dist2(s.x, s.z, tx, tz) > SIGHT_RANGE) continue;
+      if (!this.losClear(s.x, s.z, tx, tz)) continue;
+      let p = rangeFalloff(dist2(s.x, s.z, tx, tz));
+      if (this.inCoverVs(tx, tz, s.x, s.z)) p *= COVER_HIT_MULT; // target's cover vs us
+      dps += (SHOT_DAMAGE * p) / SHOT_TIME;
+    }
+    return dps;
   }
 
   /** Shortest walkable path from (ax,az) to (bx,bz) around obstacles (visibility
@@ -546,7 +616,7 @@ export class SquadWorld {
  */
 export const squadDomain: DomainDoc = {
   name: "squad-combat",
-  types: [{ name: "cover" }, { name: "foe" }],
+  types: [{ name: "cover" }, { name: "foe" }, { name: "ally" }],
   fluents: [
     // --- self (belief; perception mirrors truth, ungated) ---
     { name: "myPos", kind: "vec2" },
@@ -565,6 +635,13 @@ export const squadDomain: DomainDoc = {
     // search; the planner just enacts the decision and re-decides as the world moves.
     { name: "engageHere", kind: "boolean", initial: false },
     { name: "chosenSpot", kind: "entity", entityType: "cover" },
+    // the unwinnable-fight read (written by perception via the attrition model): there
+    // is NO firing position — here or reachable — where this unit outlasts the threat,
+    // so it should break contact. False when squadmates make the fight winnable.
+    { name: "mustRetreat", kind: "boolean", initial: false },
+    // where to break contact TO when the fight is unwinnable — the safest reachable spot
+    // out of the enemy's fire (written by perception, enacted by the breakContact method)
+    { name: "retreatSpot", kind: "entity", entityType: "cover" },
     // selects the positioning engine: false ⇒ the bespoke spot-graph route (default);
     // true ⇒ the generic GOAP search over move+engage, guided by a domain potential-
     // field heuristic (the planner DISCOVERS the route itself). Set per-unit at init.
@@ -581,6 +658,11 @@ export const squadDomain: DomainDoc = {
     { name: "foePos", params: [{ name: "f", type: "foe" }], kind: "vec2" },
     { name: "foeAlive", params: [{ name: "f", type: "foe" }], kind: "boolean", initial: false },
     { name: "foeSeen", params: [{ name: "f", type: "foe" }], kind: "boolean", initial: false },
+    // --- squadmates (belief; shared comms within a team). Used to count friendly guns
+    //     on the shared threat, so an outnumbered unit knows to flee and an outnumbering
+    //     one knows to push — the attrition calculus behind "2v1, run" vs "2v1, we win". ---
+    { name: "allyPos", params: [{ name: "a", type: "ally" }], kind: "vec2" },
+    { name: "allyAlive", params: [{ name: "a", type: "ally" }], kind: "boolean", initial: false },
     // --- squad blackboard (belief; written by the coordinator) ---
     { name: "flankerReady", kind: "boolean", initial: false },
     // --- cover descriptors (static, set at init) ---
@@ -644,13 +726,36 @@ export const squadDomain: DomainDoc = {
       // potential-field heuristic is what keeps this search from wandering.
       name: "moveFree",
       params: [{ name: "c", type: "cover" }],
-      pre: F.and(F.lit("useGoap"), F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"])),
-      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"])),
+      // survivesMove gates out a dash the enemy's fire would kill me during — so the
+      // search can't pick "great spot, dead on arrival". The projected HP loss is
+      // written to myHp, so a chain of moves accumulates damage the planner must survive.
+      pre: F.and(F.lit("useGoap"), F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+        E.dec("myHp", [], N.ext("crossDmgTo", ["?c"], MOVE_SURV_READS), "planOnly"),
+      ],
+      cost: N.add(N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)), N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE))),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // break contact: fall back to the safe spot perception picked (out of the
+      // enemy's fire). Used when no survivable firefight exists — the "I'm not getting
+      // out of this, time to run" move. No survival gate (the point is to GET safe).
+      name: "breakTo",
+      // mustRetreat gates this out of normal kill-searches — it's ONLY available when
+      // perception has judged the fight unwinnable, so it's never picked as a generic
+      // reposition (that's moveFree's job); it's purely the bail-out move.
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("mustRetreat"), F.ext("isRetreatSpot", ["?c"], ["retreatSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      verify: F.and(F.lit("mustRetreat"), F.ext("isRetreatSpot", ["?c"], ["retreatSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
       ],
-      cost: N.add(N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)), N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE))),
+      cost: N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
       duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
       executor: "move",
     },
@@ -751,9 +856,16 @@ export const squadDomain: DomainDoc = {
       // room between magazines. The planOnly effect optimistically projects the kill so
       // a single engageFrom satisfies the goal during search.
       name: "engageFrom",
-      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("threatHp"), N.c(0))),
-      verify: F.ext("canSee", [], ["myPos", "threatPos"]),
-      eff: [E.set("threatHp", [], N.c(0), "planOnly")],
+      // survivesEngage gates out a firefight I lose: I must expect to outlast the threat
+      // (mine + allied guns shorten the kill; the foes' fire bleeds me) with a caution-
+      // scaled buffer to spare. This is what turns "2v1 alone → I'd die" into a pruned
+      // option (→ break contact) while "2v1 with a squadmate → we win" stays open.
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("threatHp"), N.c(0)), F.ext("survivesEngage", [], ENGAGE_SURV_READS)),
+      verify: F.and(F.ext("canSee", [], ["myPos", "threatPos"]), F.ext("survivesEngage", [], ENGAGE_SURV_READS)),
+      // project BOTH outcomes of the exchange: the threat dies, and I take the return
+      // fire I'd absorb over the kill — so myHp falls in the plan and later steps (and
+      // the survival gates) reason about a depleted me.
+      eff: [E.set("threatHp", [], N.c(0), "planOnly"), E.dec("myHp", [], N.ext("engageDmgHere", [], ENGAGE_SURV_READS), "planOnly")],
       cost: N.ext("engageCost", [], ["myPos", "threatPos", "threatHp", "foePos", "foeAlive"]),
       duration: N.ext("engageDur", [], ["myPos", "threatPos", "threatHp"]),
       executor: "engage",
@@ -802,6 +914,24 @@ export const squadDomain: DomainDoc = {
       pre: F.and(F.lt(N.fl("myHp"), N.c(LOW_HP)), F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
       utility: N.sub(N.c(0), N.dist("myPos", [], "coverPos", ["?r"])),
       subtasks: [{ do: "retreatTo", args: ["?r"] }],
+    },
+    // 1b. UNWINNABLE fight → break contact. The survival model has found no firing
+    // position (here or reachable) where I outlast the threat — e.g. outnumbered and
+    // exposed with no cover that helps. Rather than trade and die, fall back to the
+    // safe spot perception picked. This is the emergent "2-on-1, I won't survive this —
+    // run" (and, conversely, it does NOT fire when squadmates' guns make the fight
+    // winnable, so an outnumbering unit pushes instead). Not during a breach assault.
+    {
+      name: "breakContact",
+      task: "Fight",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(
+        F.lit("mustRetreat"),
+        F.not(F.lit("tactic", [], "breach")),
+        F.ext("isRetreatSpot", ["?c"], ["retreatSpot"]),
+        F.not(F.lit("coverTaken", ["?c"])),
+      ),
+      subtasks: [{ do: "breakTo", args: ["?c"] }],
     },
     // 2. synchronized breach (E4) — stack up AND breach inside one deadline window.
     // The scoped deadline prunes any unit that can't reach the door in time *during
@@ -943,6 +1073,50 @@ function believedFoes(q: ExtQuery, foes: string[]): { x: number; z: number }[] {
   return out;
 }
 
+/** The believed positions of this unit's living squadmates (shared comms). */
+function believedAllies(q: ExtQuery, allies: string[]): { x: number; z: number }[] {
+  const out: { x: number; z: number }[] = [];
+  for (const a of allies) {
+    if (q.get("allyAlive", a) < 0.5) continue;
+    const p = q.vec("allyPos", a);
+    out.push({ x: p[0], z: p[1] });
+  }
+  return out;
+}
+
+/** HP I expect to lose fighting the threat from (sx,sz): the incoming fire I take there
+ *  × how long the kill takes (my + allied guns combined). Projected onto myHp so the
+ *  planner sees its health fall across a plan. */
+function engageAttrition(world: SquadWorld, sx: number, sz: number, threat: number[], threatHp: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[]): number {
+  const killDps = world.firepowerOnto(threat[0], threat[1], [{ x: sx, z: sz }, ...allies]);
+  if (killDps <= 0) return Infinity; // can't hurt it from here at all
+  return world.incomingDpsVsSquad(sx, sz, foes, allies) * (threatHp / killDps);
+}
+
+/** Do I WIN the exchange from (sx,sz)? A race between two clocks: time for us (my gun +
+ *  allied guns on the threat) to drop it, vs time for the foes shooting me to drop me
+ *  (from `hp`). I'm safe if I'd outlast them — by a caution-scaled margin, so a fair
+ *  1v1 is allowed but an outgunned/hurt unit demands a clear win. More friendly guns
+ *  shorten MY kill clock (push); more enemy guns on me shorten THEIRS (flee). */
+function winsExchange(world: SquadWorld, sx: number, sz: number, threat: number[], threatHp: number, hp: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[], caution: number): boolean {
+  const killDps = world.firepowerOnto(threat[0], threat[1], [{ x: sx, z: sz }, ...allies]);
+  if (killDps <= 0) return false; // can't even hurt it from here
+  const incoming = world.incomingDpsVsSquad(sx, sz, foes, allies);
+  if (incoming <= 0) return true; // they can't shoot me here — free kill
+  const timeToKillThem = threatHp / killDps;
+  const timeToKillMe = hp / incoming;
+  return timeToKillMe >= timeToKillThem * caution; // outlast them (with margin)
+}
+
+/** Expected HP lost crossing from (mx,mz) to (cx,cz) — incoming fire sampled along the
+ *  straight leg × travel time. What makes "I'd die on the way there" representable. */
+function crossAttrition(world: SquadWorld, mx: number, mz: number, cx: number, cz: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[]): number {
+  const moveTime = dist2(mx, mz, cx, cz) / MOVE_SPEED;
+  let dps = 0;
+  for (const k of [0.2, 0.4, 0.6, 0.8]) dps += world.incomingDpsVsSquad(mx + (cx - mx) * k, mz + (cz - mz) * k, foes, allies);
+  return (dps / 4) * moveTime * CROSS_RISK;
+}
+
 /** Whether a position has a line of fire to the believed primary threat. */
 function spotHasLos(world: SquadWorld, x: number, z: number, t: number[]): boolean {
   if (x === t[0] && z === t[1]) return false;
@@ -1051,6 +1225,8 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
   for (const c of inst.covers) entities[c.name] = "cover";
   const foes = world.foeNamesFor(self);
   for (const f of foes) entities[f] = "foe";
+  const allies = world.allyNamesFor(self);
+  for (const a of allies) entities[a] = "ally";
   return createModel(
     squadDomain,
     {
@@ -1093,10 +1269,43 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
         // gid+1; chosenSpot holds that, 0 = none.) Lets the planner bind the route's
         // chosen spot as the move target while staying a normal precondition.
         isChosen: (q) => Math.round(q.get("chosenSpot")) === q.args[0] + 1,
+        isRetreatSpot: (q) => Math.round(q.get("retreatSpot")) === q.args[0] + 1,
+        // --- survival gates (the attrition model in the planner) ---
+        // Will I still be standing after fighting the threat from where I am? Required on
+        // engageFrom, so the planner never commits to a firefight it loses. caution
+        // scales the buffer — an outgunned/hurt unit insists on more HP to spare.
+        survivesEngage: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          if (!spotHasLos(world, m[0], m[1], t)) return false;
+          return winsExchange(world, m[0], m[1], t, q.get("threatHp"), q.get("myHp"), believedFoes(q, foes), believedAllies(q, allies), q.get("caution"));
+        },
+        // Will I survive the DASH to spot `c`? Required on a reposition, so the planner
+        // won't route me across a lane that kills me before I arrive.
+        survivesMove: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          const dmg = crossAttrition(world, m[0], m[1], c[0], c[1], believedFoes(q, foes), believedAllies(q, allies));
+          return q.get("myHp") - dmg > SAFETY_MARGIN * q.get("caution");
+        },
       },
       numerics: {
         coverX: (q) => q.vec("coverPos", q.args[0])[0],
         coverZ: (q) => q.vec("coverPos", q.args[0])[1],
+        // HP I expect to lose fighting the threat from where I am — projected onto myHp
+        // by engageFrom, so the planner SEES its health fall and reasons about survival.
+        engageDmgHere: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          const d = engageAttrition(world, m[0], m[1], t, q.get("threatHp"), believedFoes(q, foes), believedAllies(q, allies));
+          return Number.isFinite(d) ? d : 0;
+        },
+        // HP I expect to lose dashing to spot `c` — projected onto myHp by the move op.
+        crossDmgTo: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          return crossAttrition(world, m[0], m[1], c[0], c[1], believedFoes(q, foes), believedAllies(q, allies));
+        },
         // expected damage of a shot from myPos at the believed threat — range falloff
         // plus the target's cover relative to me. Drives "close in / break their cover".
         shotDamage: (q) => {
@@ -1334,6 +1543,8 @@ export interface UnitPlanner {
   lastSeen: number;
   /** the static set of this unit's possible foes (hostile actor names) */
   foes: string[];
+  /** this unit's squadmates (same-side actor names) — for shared-comms ally belief */
+  allies: string[];
   /** per-foe clock of the last time this unit had a clear line of sight to it */
   foeLastSeen: Map<string, number>;
   trace: TraceEvent[];
@@ -1480,6 +1691,7 @@ export class SquadSim {
         planner: undefined as unknown as PlannerT,
         lastSeen: -Infinity,
         foes: this.world.foeNamesFor(u.name),
+        allies: this.world.allyNamesFor(u.name),
         foeLastSeen: new Map(),
         trace,
         why: [],
@@ -1555,6 +1767,14 @@ export class SquadSim {
         if (!fa.alive || lost > MEMORY_SECONDS) setBelief(p, "foeAlive", [fname], false);
       }
     }
+    // squadmates: shared comms — a unit knows where its living teammates are, which is
+    // what lets the attrition model count friendly guns on the threat (push vs flee).
+    for (const aname of p.allies) {
+      const aa = this.world.actors.get(aname);
+      if (!aa) continue;
+      setBelief(p, "allyAlive", [aname], aa.alive);
+      if (aa.alive) setBeliefVecArgs(p, "allyPos", [aname], aa.x, aa.z);
+    }
     setBelief(p, "myCover", [], a.cover ?? false); // reconcile claimed cover (for the regroup goal)
     for (const c of this.world.covers) {
       const owner = this.world.coverOwner.get(c.name) ?? null;
@@ -1575,6 +1795,28 @@ export class SquadSim {
       setBelief(p, "engageHere", [], route.engageHere);
       setBelief(p, "chosenSpot", [], route.nextSpot ?? false);
     }
+    // the attrition read: is this fight unwinnable from anywhere, and where to run to
+    setBelief(p, "mustRetreat", [], this.computeMustRetreat(p));
+    setBelief(p, "retreatSpot", [], this.computeRetreatSpot(p) ?? false);
+  }
+
+  /** The safest cover this unit can fall back to — minimizes fire taken THERE plus fire
+   *  taken getting there. The destination for break-contact when no fight is survivable. */
+  private computeRetreatSpot(p: UnitPlanner): string | null {
+    const me = this.world.actors.get(p.name);
+    if (!me) return null;
+    const foes = this.believedFoePositions(p);
+    if (foes.length === 0) return null;
+    const allies = this.believedAllyPositions(p);
+    let best: string | null = null;
+    let bestScore = Infinity;
+    for (const c of this.world.covers) {
+      const owner = this.world.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue;
+      const score = this.world.incomingDpsVsSquad(c.x, c.z, foes, allies) * 3 + crossAttrition(this.world, me.x, me.z, c.x, c.z, foes, allies);
+      if (score < bestScore) { bestScore = score; best = c.name; }
+    }
+    return best;
   }
 
   /** Believed positions of every hostile this unit currently thinks is alive (belief,
@@ -1588,6 +1830,48 @@ export class SquadSim {
       out.push({ x: p.planner.state.get(ps), z: p.planner.state.get(ps + 1) });
     }
     return out;
+  }
+
+  /** Believed positions of living squadmates (shared comms) — the friendly guns the
+   *  attrition model counts on the shared threat. */
+  private believedAllyPositions(p: UnitPlanner): { x: number; z: number }[] {
+    const out: { x: number; z: number }[] = [];
+    for (const a of p.allies) {
+      const aid = p.model.entityId(a);
+      if (p.planner.state.get(p.model.slotOf("allyAlive", aid)) < 0.5) continue;
+      const ps = p.model.slotOf("allyPos", aid);
+      out.push({ x: p.planner.state.get(ps), z: p.planner.state.get(ps + 1) });
+    }
+    return out;
+  }
+
+  /** Is the fight unwinnable from anywhere reachable? Runs the attrition race (the same
+   *  winsExchange the operator gates use) over the current spot + every free cover: if
+   *  NO spot lets this unit both survive the dash and outlast the threat, it must break
+   *  contact. This is the emergent "2-on-1, I won't make it — run" read; friendly guns
+   *  (allies) shorten the kill and flip it back to "we can take them, push". */
+  private computeMustRetreat(p: UnitPlanner): boolean {
+    const me = this.world.actors.get(p.name);
+    const st = p.planner.state;
+    const m = p.model;
+    if (!me || st.get(m.slotOf("hasThreat")) < 0.5) return false;
+    const tp = m.slotOf("threatPos");
+    const threat = [st.get(tp), st.get(tp + 1)];
+    const tHp = st.get(m.slotOf("threatHp"));
+    const hp = st.get(m.slotOf("myHp"));
+    const caution = st.get(m.slotOf("caution"));
+    const fb = this.believedFoePositions(p);
+    const ab = this.believedAllyPositions(p);
+    const margin = SAFETY_MARGIN * caution;
+    const ok = (sx: number, sz: number, cross: number): boolean =>
+      spotHasLos(this.world, sx, sz, threat) && hp - cross > margin && winsExchange(this.world, sx, sz, threat, tHp, hp - cross, fb, ab, caution);
+    if (ok(me.x, me.z, 0)) return false; // can win from here
+    for (const c of this.world.covers) {
+      const owner = this.world.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue;
+      if (ok(c.x, c.z, crossAttrition(this.world, me.x, me.z, c.x, c.z, fb, ab))) return false; // a winnable spot is reachable
+    }
+    return true; // nothing survivable → break contact
   }
 
   /**
@@ -1951,12 +2235,12 @@ function describeAction(step: string, status: string, alive: boolean, firingAt: 
   if (step.startsWith("suppress")) return firingAt ? `suppressing ${firingAt}` : "suppressing";
   if (step.startsWith("flankTo")) return "flanking";
   if (step.startsWith("climbTo")) return "taking high ground";
-  if (step.startsWith("moveToSpot")) return "repositioning to cover";
+  if (step.startsWith("moveToSpot") || step.startsWith("moveFree")) return "repositioning to cover";
   if (step.startsWith("advanceTo")) return "moving to cover";
   if (step.startsWith("moveToBreach")) return "stacking on door";
   if (step.startsWith("breach")) return "breaching";
   if (step.startsWith("reload")) return "reloading";
-  if (step.startsWith("retreatTo")) return "falling back";
+  if (step.startsWith("retreatTo") || step.startsWith("breakTo")) return "breaking contact";
   if (step === "wait" || step === "hold") return "holding";
   if (status === "planning") return "thinking…";
   if (status === "failed") return "looking for a shot";
