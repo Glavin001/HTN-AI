@@ -584,7 +584,10 @@ export const squadDomain: DomainDoc = {
         F.gt(N.fl("threatHp"), N.c(0)),
       ),
       verify: F.ext("canSee", [], ["myPos", "threatPos"]),
-      eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.c(SHOT_DAMAGE), "planOnly")],
+      // planning reasons over the EXPECTED damage of a shot from where I am: closer +
+      // a target not in cover ⇒ more damage per shot, so the planner values closing in
+      // and denying the target its cover (execution rolls the seeded RNG around this).
+      eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.ext("shotDamage", [], ["myPos", "threatPos"]), "planOnly")],
       cost: 1,
       duration: SHOT_TIME,
       executor: "shoot",
@@ -777,6 +780,15 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
       numerics: {
         coverX: (q) => q.vec("coverPos", q.args[0])[0],
         coverZ: (q) => q.vec("coverPos", q.args[0])[1],
+        // expected damage of a shot from myPos at the believed threat — range falloff
+        // plus the target's cover relative to me. Drives "close in / break their cover".
+        shotDamage: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          let p = rangeFalloff(dist2(m[0], m[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
+          return SHOT_DAMAGE * Math.max(0.12, p);
+        },
       },
       executors: {
         move: moveExecutor(self, world),
@@ -831,9 +843,12 @@ function shootExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => T
     if (!target) return "failure"; // lost line of sight → repair
     if (api.elapsedInStep() < SHOT_TIME) return "continue"; // aiming
     a.ammo = Math.max(0, a.ammo - 1);
-    const dmg = SHOT_DAMAGE * (0.85 + 0.3 * api.rng.next());
-    target.hp = Math.max(0, target.hp - dmg);
-    if (target.hp <= 0) target.alive = false;
+    // roll the seeded RNG against the real hit chance (range + the target's cover):
+    // a covered or distant target is often missed, so position genuinely matters.
+    if (api.rng.next() < world.hitChance(a, target)) {
+      target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
+      if (target.hp <= 0) target.alive = false;
+    }
     return "success";
   };
 }

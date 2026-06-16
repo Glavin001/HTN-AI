@@ -412,6 +412,29 @@ test("squad: exposure counts the foes with a clear line of fire, cover and walls
   assert.equal(world.exposureAt(0, 1.4, ns), 1, "so exposure drops to the single uncovered foe");
 });
 
+// ---------------------------------------------------------------- F: probabilistic hits in the sim
+
+test("squad: a target in cover takes far fewer hits than the same target in the open (probabilistic)", () => {
+  // identical lone shooter + stationary target + seed; the only difference is a crate
+  // between them. Cover must measurably reduce the damage that lands over time.
+  const mk = (crate: boolean): SquadInstance => ({
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -6, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 0 },
+    ],
+    covers: crate ? [{ name: "shield", x: 0, z: -2 }, { name: "post", x: 0, z: -6 }] : [{ name: "post", x: 0, z: -6 }],
+  });
+  const run = (crate: boolean): number => {
+    const sim = new SquadSim(mk(crate), { seed: 5 });
+    for (let i = 0; i < 45 && sim.world.actors.get("P")!.alive; i++) sim.step();
+    return sim.world.actors.get("P")!.hp;
+  };
+  const openHp = run(false);
+  const coverHp = run(true);
+  assert.ok(openHp < 100, "the exposed target actually took fire");
+  assert.ok(coverHp > openHp + 20, `cover kept the target alive longer (cover=${coverHp} vs open=${openHp})`);
+});
+
 // ---------------------------------------------------------------- F: multi-enemy belief
 
 test("squad: perception tracks each known hostile individually (multi-enemy belief)", () => {
