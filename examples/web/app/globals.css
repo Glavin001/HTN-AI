@@ -350,6 +350,17 @@ input[type="range"] {
 .hud-legend span { display: flex; align-items: center; gap: 5px; }
 .hud-legend .dot { width: 9px; height: 9px; border-radius: 999px; display: inline-block; }
 .hud-legend .dash { width: 12px; height: 0; border-top: 2px dashed; display: inline-block; }
+.hud-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  color: var(--accent);
+  cursor: pointer;
+}
+.hud-toggle input { accent-color: var(--accent); cursor: pointer; }
 
 .hud-narration {
   position: absolute;
@@ -415,4 +426,26 @@ input[type="range"] {
   letter-spacing: 0.8px;
   color: var(--text);
   font-weight: 700;
+}
+
+.risk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.risk-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+.risk-tag.good {
+  color: var(--good);
+  border-color: rgba(52, 211, 153, 0.4);
 }

@@ -67,6 +67,7 @@ export default function Page() {
   const [speed, setSpeed] = useState(450);
   const [liveStepMs, setLiveStepMs] = useState(90);
   const [selected, setSelected] = useState<string | null>(null);
+  const [showThinking, setShowThinking] = useState(true);
   const [heatMode, setHeatMode] = useState<"belief" | "truth">("belief");
 
   const isLive = scenario === "companion";
@@ -130,7 +131,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} heatMode={heatMode} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} heatMode={heatMode} showThinking={showThinking} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {squad && (
           <div className="hud-top">
@@ -149,12 +150,16 @@ export default function Page() {
             <span><i className="dot" style={{ background: "#ef4444" }} />Red team</span>
             <span><i className="dot" style={{ background: "#3b82f6" }} />Blue team</span>
             <span><i className="dash" style={{ background: "#34d399" }} />line of fire</span>
-            <span><i className="dash" style={{ background: "#ef4444" }} />blocked</span>
+            <span><i className="dash" style={{ background: "#ef4444" }} />blocked / incoming</span>
+            <label className="hud-toggle">
+              <input type="checkbox" checked={showThinking} onChange={(e) => setShowThinking(e.target.checked)} />
+              show what it&apos;s thinking
+            </label>
           </div>
         )}
-        {squad && (
+        {squad && showThinking && (
           <div className="hud-heat mono" style={{ position: "absolute", left: 12, bottom: 12, display: "flex", gap: 8, alignItems: "center", fontSize: 11, background: "rgba(11,14,20,0.7)", padding: "5px 9px", borderRadius: 6, color: "#9fb0c8" }}>
-            <span>spot field:</span>
+            <span>score positions vs:</span>
             {(["belief", "truth"] as const).map((m) => (
               <button
                 key={m}
@@ -247,7 +252,7 @@ export default function Page() {
           </div>
         )}
 
-        {squad && <SquadDirector frame={squad.frame} units={squad.units} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadDirector frame={squad.frame} instance={squad.instance} spots={squad.spots} heatMode={heatMode} units={squad.units} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {run?.kind === "grid" && (
           <div className="card">
