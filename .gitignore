@@ -96,3 +96,7 @@ test/output
 
 # Local Netlify folder
 .netlify
+
+# External reference repos cloned locally as reading material (not vendored)
+/yuka/
+/dive/
