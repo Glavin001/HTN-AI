@@ -137,6 +137,16 @@ export class StateView implements Snap {
     return this.get(CLOCK_SLOT);
   }
 
+  /** State key with the clock's contribution removed, so a time-independent search
+   *  can treat states that differ ONLY in elapsed time as the same node. The base
+   *  hash is an XOR fold, so removing one slot's term is just XOR-ing it back out.
+   *  Only sound when plan validity does not depend on the absolute clock (no active
+   *  deadlines / clock-reading preconditions). */
+  spatialKey(): number {
+    const c = this.get(CLOCK_SLOT);
+    return c === 0 ? this.hash : (this.hash ^ slotValueHash(CLOCK_SLOT, c)) >>> 0;
+  }
+
   key(): number {
     return this.hash;
   }

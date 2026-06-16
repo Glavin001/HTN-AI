@@ -49,6 +49,8 @@ export interface PlannerOptions {
   driftTolerance?: number;
   /** optional domain heuristic for goal searches — see PlanRequest.customHeuristic */
   customHeuristic?: (s: Snap) => number;
+  /** dedup goal-search nodes by position, ignoring the clock — see PlanRequest.spatialDedup */
+  spatialDedup?: boolean;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -211,6 +213,7 @@ export class Planner {
     maxDepth?: number;
     collectRejections?: boolean;
     customHeuristic?: (s: Snap) => number;
+    spatialDedup?: boolean;
   } {
     return {
       goals: this.goals,
@@ -219,6 +222,7 @@ export class Planner {
       maxDepth: this.opts.maxDepth,
       collectRejections: this.opts.collectRejections,
       customHeuristic: this.opts.customHeuristic,
+      spatialDedup: this.opts.spatialDedup,
       ...extra,
     };
   }

@@ -124,6 +124,11 @@ export interface PlanRequest {
   novelty?: boolean;
   /** goal-search heuristic: h_add (fast, may overestimate — default), h_max (admissible: use with weight 1 for guaranteed-optimal plans), or none (Dijkstra) */
   heuristic?: "hadd" | "hmax" | "none";
+  /** dedup goal-search nodes by position, IGNORING the projected clock. For spatial /
+   *  navigation goals the clock advances every move, so otherwise-identical positions
+   *  never collapse and A* re-expands them combinatorially. Only sound when the goal is
+   *  time-independent (no scoped deadlines, no clock-reading preconditions). */
+  spatialDedup?: boolean;
   /** optional DOMAIN heuristic over the raw state — an estimate of remaining cost to
    *  the goal. When set it overrides the symbolic relaxation, letting a domain inject
    *  knowledge the atom-based heuristic can't see (e.g. a spatial / navigation potential
@@ -676,6 +681,7 @@ export class Engine {
     const closed = new Map<number, number>();
     const seenAtoms = new Set<number>();
     const descs = goalDescs(model, item.atoms);
+    const dedupKey = this.req.spatialDedup ? (s: StateView): number => s.spatialKey() : (s: StateView): number => s.key();
     let seq = 0;
 
     const h0 = this.heuristic(start, descs);
@@ -684,7 +690,7 @@ export class Engine {
       return null;
     }
     open.push({ f: weight * h0, novelty: 0, g: 0, seq: seq++, state: start, ops: null, parent: null, via: null });
-    closed.set(start.key(), 0);
+    closed.set(dedupKey(start), 0);
 
     while (open.size > 0) {
       this.expansions++;
@@ -743,7 +749,7 @@ export class Engine {
         const dur = g.op.duration.fn(node.state, g.b);
         if (dur !== 0) child.set(CLOCK_SLOT, node.state.get(CLOCK_SLOT) + dur);
         if (!this.scopesOkQuiet(child, scopes)) continue;
-        const key = child.key();
+        const key = dedupKey(child);
         const cost = g.op.cost.fn(node.state, g.b);
         const g2 = node.g + (cost > 0 ? cost : 1e-6);
         const known = closed.get(key);
@@ -783,7 +789,7 @@ export class Engine {
     // heuristic is blind to, which is what makes search over a fine spatial action
     // space goal-directed instead of a uniform-cost wander.
     if (this.req.customHeuristic) {
-      const key = state.key();
+      const key = this.req.spatialDedup ? state.spatialKey() : state.key();
       const cached = this.hCache.get(key);
       if (cached !== undefined) return cached;
       this.heuristicEvals++;
@@ -792,7 +798,7 @@ export class Engine {
       return h;
     }
     if (descs.length === 0 || this.req.heuristic === "none") return 0;
-    const key = state.key();
+    const key = this.req.spatialDedup ? state.spatialKey() : state.key();
     const cached = this.hCache.get(key);
     if (cached !== undefined) return cached;
     this.heuristicEvals++;

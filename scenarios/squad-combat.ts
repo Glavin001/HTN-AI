@@ -1277,6 +1277,8 @@ export interface UnitPlanner {
   /** the unit's current goal, in plain words + how the library expresses it */
   goalText: string;
   goalExpr: string;
+  /** this unit's positioning engine (resolved from SquadSimOptions.positioning) */
+  mode: "spotgraph" | "goap";
 }
 
 const DEFAULT_GOAL = { text: "Win the firefight — neutralize the enemy squad", expr: 'task("Fight")' };
@@ -1352,8 +1354,9 @@ export interface SquadSimOptions {
   bark?: BarkAuthor;
   /** positioning engine: "spotgraph" (bespoke route search, default) or "goap" (the
    *  generic planner search over move+engage, guided by a domain potential-field
-   *  heuristic). Exposed to compare the two approaches. */
-  positioning?: "spotgraph" | "goap";
+   *  heuristic). A `(side) => mode` function selects per side, so the two engines can
+   *  be pitted head-to-head. Exposed to compare the two approaches. */
+  positioning?: "spotgraph" | "goap" | ((side: Side) => "spotgraph" | "goap");
 }
 
 /**
@@ -1369,8 +1372,9 @@ export class SquadSim {
   private readonly dt: number;
   private readonly nodes: number;
   private readonly barkAuthor: BarkAuthor;
-  /** positioning engine — see SquadSimOptions.positioning */
-  public readonly positioning: "spotgraph" | "goap";
+  /** positioning engine ("mixed" when chosen per-side) — see SquadSimOptions.positioning */
+  public readonly positioning: "spotgraph" | "goap" | "mixed";
+  private readonly modeOf: (side: Side) => "spotgraph" | "goap";
   private playerLeg = 0;
   private playerLegT = 0;
 
@@ -1379,7 +1383,9 @@ export class SquadSim {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
     this.barkAuthor = opts.bark ?? barkFor;
-    this.positioning = opts.positioning ?? "spotgraph";
+    const pos = opts.positioning ?? "spotgraph";
+    this.modeOf = typeof pos === "function" ? pos : () => pos;
+    this.positioning = typeof pos === "function" ? "mixed" : pos;
     // augment the map with invisible tactical standing positions (grid + cover edges)
     // the planner can reposition to — fluid movement, not a handful of waypoints
     const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...generateTacticalSpots(inst)] };
@@ -1403,8 +1409,9 @@ export class SquadSim {
         why: [],
         goalText: DEFAULT_GOAL.text,
         goalExpr: DEFAULT_GOAL.expr,
+        mode: this.modeOf(u.side),
       };
-      const goap = this.positioning === "goap";
+      const goap = entry.mode === "goap";
       entry.planner = new Planner(model, {
         goals: [{ kind: "task", name: "Fight" }],
         now: () => this.world.clock,
@@ -1417,6 +1424,10 @@ export class SquadSim {
         // GOAP mode: feed the generic search the spatial potential-field heuristic so
         // it stays goal-directed instead of wandering over the fine move space.
         customHeuristic: goap ? (s) => squadEngageHeuristic(this.world, model, entry.foes, s) : undefined,
+        // the kill goal is time-independent (no deadline), so collapse positions that
+        // differ only in elapsed clock — turns the move search from combinatorial into
+        // ~a Dijkstra over positions.
+        spatialDedup: goap,
         trace: (e) => {
           trace.push(e);
           this.trace.push({ unit: entry.name, e });
@@ -1474,8 +1485,8 @@ export class SquadSim {
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
     }
     setBelief(p, "flankerReady", [], this.world.team(p.side).flankerReady);
-    setBelief(p, "useGoap", [], this.positioning === "goap");
-    if (this.positioning === "goap") {
+    setBelief(p, "useGoap", [], p.mode === "goap");
+    if (p.mode === "goap") {
       // GOAP mode: the planner's own search (guided by the heuristic) decides — clear
       // the spot-graph route beliefs so its methods stay inactive.
       setBelief(p, "engageHere", [], false);

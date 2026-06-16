@@ -518,6 +518,48 @@ test("squad: the engine consults a domain customHeuristic on a numeric goal (pot
   assert.equal(result.status, "success", "and found a plan for the numeric goal");
 });
 
+test("squad: spatialDedup makes a spatial kill-goal tractable (vs clock-polluted blowup)", () => {
+  // E already has a clear shot, so the optimal plan is a single engageFrom. But the
+  // move space is fine and every move advances the clock, so WITHOUT spatialDedup the
+  // uniform-cost search treats each position-at-a-different-time as a fresh node and
+  // never settles — it can't even find the 1-step plan inside a generous budget. WITH
+  // spatialDedup those time-equivalent positions collapse and it solves it at once.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: -8, z: 0 },
+      { name: "player", side: "player", x: 8, z: 0 },
+    ],
+    covers: [
+      { name: "a", x: 0, z: 3 },
+      { name: "b", x: 0, z: -3 },
+      { name: "c", x: 4, z: 2 },
+      { name: "d", x: -4, z: 2 },
+    ],
+  };
+  const model = squadModel(inst, "E");
+  const mkState = () => {
+    const s = model.createExecState();
+    s.set(model.slotOf("hasThreat"), 1);
+    s.buffer[model.slotOf("threatPos")] = 8; // player at (8,0): E has a clear shot
+    s.set(model.slotOf("useGoap"), 1);
+    return s;
+  };
+  const plan = (spatialDedup: boolean) =>
+    planOnce(model, mkState(), {
+      goals: [goal(F.lte(N.fl("threatHp"), N.c(0)))],
+      customHeuristic: () => 0, // uniform-cost: isolates the dedup effect
+      spatialDedup,
+      weight: 1,
+      maxNodes: 20000,
+    });
+  const on = plan(true);
+  assert.equal(on.status, "success", "spatialDedup solves the spatial goal");
+  assert.equal(on.plan!.steps.length, 1, "and finds the optimum: engage from here (already has a line of fire)");
+  const off = plan(false);
+  assert.equal(off.status, "failure", "without it, the clock-polluted state space exhausts the budget");
+  assert.ok(off.stats.expansions > on.stats.expansions * 4, `dedup explores far less (off=${off.stats.expansions} on=${on.stats.expansions})`);
+});
+
 // ---------------------------------------------------------------- F: GOAP positioning mode (engine search)
 
 test("squad: GOAP positioning (generic search + potential-field heuristic) also fights from cover", () => {
