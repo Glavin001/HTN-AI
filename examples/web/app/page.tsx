@@ -3,6 +3,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
 import { runScenario, scenarioHeavyMs, traceSummary, type RunResult } from "../lib/run";
 import { runBlocks, type BlocksRun } from "../lib/runBlocks";
+import { runWall, type WallRun } from "../lib/runWall";
 import {
   runSquad,
   squadNarration,
@@ -20,14 +21,19 @@ import type { TraceEvent } from "htn-ai";
 
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
+const WallScene = dynamic(() => import("../components/WallScene"), { ssr: false });
 const SquadScene = dynamic(() => import("../components/SquadScene"), { ssr: false });
 import SquadDirector from "../components/SquadDirector";
 
 type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
-type ScenarioId = GridId | "blocks" | SquadScenarioId;
-type Kind = "grid" | "blocks" | "squad";
+type ScenarioId = GridId | "blocks" | "wall" | SquadScenarioId;
+type Kind = "grid" | "blocks" | "wall" | "squad";
 
-type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun } | { kind: "squad"; data: SquadRun };
+type Run =
+  | { kind: "grid"; data: RunResult }
+  | { kind: "blocks"; data: BlocksRun }
+  | { kind: "wall"; data: WallRun }
+  | { kind: "squad"; data: SquadRun };
 
 const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }> = {
   skirmish: { name: "★ Skirmish: Red vs Blue", kind: "squad", blurb: "Two AI squads fight autonomously. Each unit plans from its OWN belief (no shared memory across teams) and reactively readjusts as it discovers the other's moves." },
@@ -41,11 +47,13 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerBig: { name: "Scavenger XL", kind: "grid", blurb: "A bigger 4×3 grid, a height-3 goal, seven scattered blocks. The planner harvests a pillar and stacks a 3-level structure." },
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
+  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — it's a SHAPE made of blocks: a ring that encloses a courtyard. Blocks start scattered; the planner (HTN) decomposes the wall into per-slot pickup-and-place sub-goals and lays them in order." },
 };
 
 function buildRun(id: ScenarioId): Run {
   const kind = SCENARIOS[id].kind;
   if (kind === "blocks") return { kind: "blocks", data: runBlocks() };
+  if (kind === "wall") return { kind: "wall", data: runWall() };
   if (kind === "squad") return { kind: "squad", data: runSquad(id as SquadScenarioId) };
   return { kind: "grid", data: runScenario(id as GridId) };
 }
@@ -116,7 +124,7 @@ export default function Page() {
 
   const narration = squad ? squadNarration(squad.frame) : "";
   const watch = SCENARIOS[scenario].kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
-  const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : "—";
+  const status = run?.kind === "grid" || run?.kind === "wall" ? run.data.status : squad ? outcome(squad.frame) : "—";
 
   return (
     <div className="app">
@@ -128,6 +136,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
+        {run?.kind === "wall" && <WallScene key="wall" frame={run.data.frames[step]} cells={run.data.cells} targets={run.data.targets} sources={run.data.sources} core={run.data.core} reached={step === lastStep && status === "succeeded"} />}
         {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {squad && (
@@ -236,6 +245,21 @@ export default function Page() {
           <div className="card">
             <h2>Goal</h2>
             <div className="mono">be at 3D position <span style={{ color: "var(--accent-2)" }}>({run.data.target.x}, {run.data.target.y}, {run.data.target.z})</span></div>
+          </div>
+        )}
+
+        {run?.kind === "wall" && (
+          <div className="card">
+            <h2>Goal · a structure, not a position</h2>
+            <div className="mono">{run.data.goalText}</div>
+            <div className="row" style={{ marginTop: 8, gap: 8 }}>
+              <span className="mono" style={{ color: "var(--muted)" }}>wall laid</span>
+              <input type="range" min={0} max={run.data.targets.length} step={1} value={run.data.frames[Math.min(step, lastStep)]?.placed ?? 0} readOnly style={{ flex: 1, accentColor: "#34d399" }} />
+              <span className="mono" style={{ color: "#34d399" }}>{run.data.frames[Math.min(step, lastStep)]?.placed ?? 0}/{run.data.targets.length}</span>
+            </div>
+            <div className="mono" style={{ color: "var(--muted)", marginTop: 6, fontSize: 11 }}>
+              ◻ amber wireframe = goal slot &nbsp;·&nbsp; ▮ green = block laid &nbsp;·&nbsp; ◆ courtyard core
+            </div>
           </div>
         )}
 

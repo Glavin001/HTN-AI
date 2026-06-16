@@ -66,6 +66,17 @@ Each scene below drives the same reactive `Planner`:
 - **Blocks World (Sussman)** ([`../../scenarios/blocks.ts`](../../scenarios/blocks.ts)) —
   the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
   The naive order deadlocks, so the planner interleaves subgoals.
+- **Build a wall (structure goal)** ([`../../scenarios/wall.ts`](../../scenarios/wall.ts)) —
+  the goal is **not a position to stand at** but a **shape made of blocks**: a ring
+  of cells that must each hold a block, enclosing a central courtyard. Blocks start
+  **scattered** around the yard. Laying all eight slots in one flat GOAP search
+  blows up combinatorially (symmetric block↔slot assignments × free movement), so
+  the wall is an **HTN compound** (`BuildWall`) that decomposes the structure into
+  ordered, *cumulative* per-slot `achieve` sub-goals — each a small pickup-and-place
+  the GOAP layer solves on its own. Same planner that times out on the flat goal
+  finishes the decomposed one in milliseconds; the cumulative sub-goals also stop a
+  later placement from robbing a block already in the wall. The yard ends tidy
+  (eight blocks, eight slots). See [`../../tests/wall.ts`](../../tests/wall.ts).
 
 The right-hand panel shows the live world state, the **plan the search
 discovered**, and the planner's **`TraceEvent` stream** (so repair/replan show up
@@ -103,6 +114,7 @@ library repo).
 | World-state panel | `model.read(state, fluent, …)` over typed fluents |
 | Trace events panel | the `trace:` `TraceEvent` stream (`plan.*`, `step.*`, `repair.*`, …) |
 | Goal = a 3D coordinate | a position-only goal (`agentAt ∧ agentY`), not a prescriptive structure |
+| Goal = a block structure (wall) | an HTN compound (`BuildWall`) decomposing a shape into ordered `achieve` sub-goals |
 
 This is an intentionally small seed of the planned `@htn-ai/devtools` inspector
 and `@htn-ai/react` adapter described in `ROADMAP.md`.
