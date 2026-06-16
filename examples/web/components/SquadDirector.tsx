@@ -10,18 +10,13 @@ import type { SquadFrame, UnitFrame } from "@scenarios/squad-combat";
 
 const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
 
-/** Turn a raw plan step ("0. flankTo(fNE) [t=…]") into a readable instruction. */
+/** Turn a raw plan step ("3. step(k2_4, k3_5) [t=…]") into a readable instruction. */
 function humanize(raw: string): string {
   const s = raw.replace(/^\d+\.\s*/, "").replace(/\s*\[t=.*$/, "");
-  if (s.startsWith("flankTo")) return "flank to a covered angle";
-  if (s.startsWith("advanceTo")) return "move up to cover";
-  if (s.startsWith("climbTo")) return "take the high ground";
-  if (s.startsWith("moveToBreach")) return "stack on the door";
+  if (s.startsWith("step")) return "move to the next covered cell";
   if (s.startsWith("breach")) return "breach the door";
   if (s.startsWith("takeShot")) return "fire on the enemy";
-  if (s.startsWith("suppress")) return "lay down suppressing fire";
   if (s.startsWith("reload")) return "reload";
-  if (s.startsWith("retreatTo")) return "fall back to cover";
   if (s.startsWith("enter:")) return `▸ begin ${s.slice(6).replace(/-/g, " ")}`;
   if (s.startsWith("exit:")) return `◂ end ${s.slice(5).replace(/-/g, " ")}`;
   if (s.startsWith("wait") || s.startsWith("hold")) return "hold position";
@@ -29,9 +24,9 @@ function humanize(raw: string): string {
 }
 
 const tacticWord: Record<string, string> = {
-  flank: "flank — one pins while one swings wide",
   breach: "breach — stack the door, enter together",
-  hold: "hold — fight from cover",
+  hold: "hold — search a route, fight from cover",
+  flank: "flank",
   regroup: "regroup",
 };
 

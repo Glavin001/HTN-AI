@@ -30,8 +30,8 @@ type Kind = "grid" | "blocks" | "squad";
 type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun } | { kind: "squad"; data: SquadRun };
 
 const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }> = {
-  skirmish: { name: "★ Skirmish: Red vs Blue", kind: "squad", blurb: "Two AI squads fight autonomously. Each unit plans from its OWN belief (no shared memory across teams) and reactively readjusts as it discovers the other's moves." },
-  blockedFlank: { name: "★ Emergent flank: Red vs Blue", kind: "squad", blurb: "A barricade blocks every direct shot. No flank is scripted — each squad DISCOVERS it must reach a cover that can see the enemy, and they contest the same flanks." },
+  skirmish: { name: "★ Skirmish: Red vs Blue", kind: "squad", blurb: "Two AI squads fight over a fluid grid of positions. With NO scripted waypoints, each unit SEARCHES a covered, multi-step route to a firing line — trading exposure against closing the distance — and plans from its own belief." },
+  blockedFlank: { name: "★ Emergent flank: Red vs Blue", kind: "squad", blurb: "A central barricade blocks every direct shot. No flank is scripted — each unit's route search DERIVES the long way around to a cell that can see the enemy, which a greedy push toward the enemy would never find." },
   breach: { name: "★ Timed breach: Red vs Blue", kind: "squad", blurb: "A Red fire-team breaches a door a Blue team holds — stacking and breaching in sync inside a deadline window enforced inside the planner's search." },
   companion: { name: "★ Command your squad (LIVE)", kind: "squad", blurb: "A LIVE battle: your Blue squad fights Red autonomously. Issue an order to a unit and watch it replan in real time — the order hits the running planner, it isn't a re-baked recording." },
   staircase: { name: "Staircase", kind: "grid", blurb: "Goal: stand at a coordinate in the air. The only way up is to stack boxes — so the planner discovers it must build a staircase and climb it." },
