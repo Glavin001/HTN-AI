@@ -1,13 +1,37 @@
-# htn-ai — Web Preview (Staircase World)
+# htn-ai — Web Preview (Squad Combat + Staircase World)
 
 A small Next.js + [react-three-fiber](https://github.com/pmndrs/react-three-fiber)
-app that **visualizes the `htn-ai` planner running in the browser**. It is the
-implementation of "Task 4" in [`../../PLAN-web-demo-and-block-stacking.md`](../../PLAN-web-demo-and-block-stacking.md).
+app that **visualizes the `htn-ai` planner running in the browser**.
 
 ## What it shows
 
-Three scenes, selectable from the scenario dropdown, each driving the **real
-reactive `Planner`** in the browser (the app never re-implements planning):
+Scenes selectable from the scenario dropdown, each driving the **real reactive
+`Planner`** in the browser (the app never re-implements planning).
+
+### ★ Squad combat (F.E.A.R.-style game AI)
+
+Four scenarios where coordinated NPCs run one reactive `Planner` each over a
+shared world + blackboard (see [`../../scenarios/squad-combat.ts`](../../scenarios/squad-combat.ts)).
+Select an NPC (click it, or use the **glass-box AI-director** panel) to watch its
+live plan, the executing step, recent trace events, and **why a branch was
+rejected**. The playback slider is a deterministic **replay** of the engagement.
+
+- **Skirmish** — two NPCs flush a target with coordinated **suppress-and-flank**:
+  one pins inside a `scoped({ maintain: !flankerReady })` block while the other
+  swings to a flank cover; reaching position releases the suppressor to push.
+- **Emergent flank** — a barricade blocks the direct line of fire. The flank is
+  **not scripted**: method selection *derives* that the unit must reposition to a
+  cover that geometrically sees the target (the staircase emergence, on combat).
+- **Timed breach** — a fire-team **stacks and breaches in sync** inside a
+  `scoped({ deadline })` window; the projected-clock deadline prunes anyone who
+  can't make it *in search*.
+- **Companion + orders** — an allied companion auto-assists, and takes orders
+  (**Engage / Regroup / Hold fire**) routed through `Planner.setGoals` — the LLM
+  seam. Issue an order at any scrubbed moment and watch the plan change on replay.
+
+### Staircase World (spatial GOAP)
+
+Each scene below drives the same reactive `Planner`:
 
 - **Staircase** (flagship, [`../../scenarios/staircase.ts`](../../scenarios/staircase.ts)) —
   the goal is a pure **3D coordinate** (*"be up in the air at (x, y, z)"*). It does

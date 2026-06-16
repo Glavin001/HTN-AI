@@ -28,15 +28,45 @@ body {
 
 .app {
   display: grid;
-  grid-template-columns: 1fr 380px;
+  grid-template-columns: 1fr 384px;
   height: 100vh;
   width: 100vw;
 }
 
-@media (max-width: 860px) {
+/* Mobile: stop being a fixed-height split; let the whole page scroll, stage on
+   top at a comfortable height, the panel flowing full-width below it. */
+@media (max-width: 900px) {
+  html,
+  body {
+    height: auto;
+  }
   .app {
-    grid-template-columns: 1fr;
-    grid-template-rows: 60vh 40vh;
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+    width: 100%;
+  }
+  .stage {
+    height: 58vh;
+    min-height: 320px;
+    flex: none;
+  }
+  .panel {
+    border-left: none;
+    border-top: 1px solid var(--border);
+    overflow: visible;
+  }
+  .stage .title p {
+    display: none;
+  }
+  .stage .title h1 {
+    font-size: 15px;
+  }
+  button,
+  select {
+    padding: 10px 14px;
+    font-size: 14px;
   }
 }
 
@@ -225,4 +255,164 @@ input[type="range"] {
   border-radius: 3px;
   margin-right: 5px;
   vertical-align: middle;
+}
+
+/* ---- in-stage HUD (squad combat) ---- */
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--muted);
+  background: rgba(11, 14, 20, 0.55);
+  z-index: 3;
+}
+
+.hud-top {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(11, 14, 20, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 12px;
+  max-width: 92%;
+  backdrop-filter: blur(4px);
+}
+
+.team-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 0 4px;
+}
+.team-chip .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  display: inline-block;
+}
+.team-chip b {
+  font-weight: 800;
+  letter-spacing: 0.3px;
+}
+.team-hint {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.banner-tag {
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+.banner-val {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
+.tactic-flank { color: var(--accent-2); }
+.tactic-breach { color: #f43f5e; }
+.tactic-hold { color: var(--accent); }
+.banner-hint {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hud-legend {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: rgba(11, 14, 20, 0.6);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.hud-legend span { display: flex; align-items: center; gap: 5px; }
+.hud-legend .dot { width: 9px; height: 9px; border-radius: 999px; display: inline-block; }
+.hud-legend .dash { width: 12px; height: 0; border-top: 2px dashed; display: inline-block; }
+
+.hud-narration {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  width: min(680px, 92%);
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--text);
+  background: rgba(11, 14, 20, 0.78);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 14px;
+  backdrop-filter: blur(4px);
+}
+
+.hud-order {
+  position: absolute;
+  bottom: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  color: var(--accent-2);
+  background: rgba(11, 14, 20, 0.8);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: 8px;
+  padding: 4px 10px;
+}
+
+@media (max-width: 900px) {
+  .banner-hint { display: none; }
+  .hud-narration { font-size: 13px; bottom: 10px; padding: 8px 12px; }
+  .hud-order { bottom: 58px; font-size: 11px; }
+  .hud-legend { top: 8px; right: 8px; font-size: 9px; }
+}
+
+/* ---- "what to watch" educator card ---- */
+.card.watch {
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.08), rgba(22, 27, 39, 0.6));
+  border-color: rgba(56, 189, 248, 0.3);
+}
+.card.watch ol {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.card.watch li {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.dir-h {
+  margin: 0 0 4px;
+  font-size: 10px;
+  letter-spacing: 0.8px;
+  color: var(--text);
+  font-weight: 700;
 }
