@@ -133,6 +133,77 @@ test("squad: identical seed + fixed timestep ⇒ byte-identical traces", () => {
   assert.equal(run(mk()), run(mk()), "two runs with the same seed are identical");
 });
 
+// ---------------------------------------------------------------- B: suppress-while-flank coordination
+
+test("squad: two NPCs coordinate — one suppresses while the other flanks (scoped, reactive)", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "E1", side: "enemy", x: -7, z: -2 },
+      { name: "E2", side: "enemy", x: -7, z: 2 },
+      { name: "player", side: "player", x: 7, z: 0 },
+    ],
+    covers: [
+      { name: "cA", x: -3, z: -2 },
+      { name: "cB", x: -3, z: 2 },
+      { name: "fN", x: 2, z: 7, flank: true },
+      { name: "fS", x: 2, z: -7, flank: true },
+      { name: "rally", x: -10, z: 0, rally: true },
+    ],
+  };
+  const sim = new SquadSim(inst, { seed: 9 });
+  const frames = sim.run(600);
+
+  // coordinator promoted them to the flank tactic
+  assert.equal(sim.world.squadTactic, "flank", "≥2 in contact ⇒ coordinated flank");
+  // the suppressor opened a suppress-cover scope (cover fire)
+  const e1Scopes = sim.trace.filter((t) => t.unit === "E1" && t.e.t === "scope.enter");
+  assert.ok(
+    e1Scopes.some((t) => (t.e as { label: string }).label.includes("suppress")),
+    "the suppressor laid down covering fire inside a scope",
+  );
+  // the flanker actually flanked, and reaching position flipped the squad flag
+  assert.ok(stepStarts(sim, "E2").some((l) => l.startsWith("flankTo")), "the flanker moved to a flank cover");
+  assert.ok(frames.some((f) => f.flankerReady), "the flanker reached position (squad flag set)");
+});
+
+// ---------------------------------------------------------------- B: cover reservation under contention
+
+test("squad: cover reservation — two NPCs never share a slot and split to distinct cover", () => {
+  // both spawns are blocked from the target; the only cover with a line of fire is
+  // contested, so the reservation must push the loser to the other LOS cover.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E1", side: "enemy", x: -1, z: -1 },
+      { name: "E2", side: "enemy", x: -1, z: 1 },
+      { name: "player", side: "player", x: 0, z: 11 },
+    ],
+    covers: [
+      { name: "cBlocked", x: 0, z: 2 }, // still behind the wall — useless
+      { name: "cL", x: -5, z: 7 }, // LOS, nearest to both
+      { name: "cR", x: 5, z: 7 }, // LOS, the fallback
+    ],
+    walls: [{ x: -3, z: 4, w: 6, d: 1 }],
+  };
+  const sim = new SquadSim(inst, { seed: 4 });
+  const frames = sim.run(700);
+
+  // invariant: at no frame do two alive units hold the same claimed cover
+  for (const f of frames) {
+    const claimed = f.units.filter((u) => u.alive && u.cover).map((u) => u.cover);
+    assert.equal(new Set(claimed).size, claimed.length, `distinct covers @ t=${f.clock}`);
+  }
+  // the reservation pushed the two NPCs onto BOTH line-of-fire covers (they would
+  // both have greedily taken the nearer one)
+  const claimedEver = new Set<string>();
+  for (const f of frames) for (const [c, owner] of Object.entries(f.reservations)) if (owner) claimedEver.add(c);
+  assert.ok(claimedEver.has("cL") && claimedEver.has("cR"), "the NPCs split across both line-of-fire covers");
+  // the loser reacted to the slot being taken (fluent-precise replan)
+  assert.ok(
+    sim.trace.some((t) => t.e.t === "replan.dirty"),
+    "contention triggered reactive replanning",
+  );
+});
+
 // ---------------------------------------------------------------- exports sanity
 
 test("squad: TraceEvent type is re-exported through scenarios", () => {

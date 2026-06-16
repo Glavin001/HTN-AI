@@ -51,6 +51,7 @@ export const AMMO_MAX = 8;
 export const MOVE_SPEED = 3.2; // world units / second
 export const SHOT_TIME = 0.32; // seconds to take a shot
 export const RELOAD_TIME = 1.6;
+export const SUPPRESS_MAX = 5; // a suppressor sustains fire up to this long (or until the flanker is set)
 export const MEMORY_SECONDS = 4; // how long a lost target is remembered before "search"
 export const LOW_HP = 34; // retreat threshold
 export const SIGHT_RANGE = 22;
@@ -240,9 +241,15 @@ export class SquadWorld {
     return best;
   }
 
-  /** release any cover `self` holds, then claim `cover` (single-owner). */
+  /** release any cover `self` holds, evict any prior owner, then claim `cover`
+   *  (strict single-owner — the invariant the reservation test relies on). */
   claimCover(self: string, cover: string): void {
     for (const [c, owner] of this.coverOwner) if (owner === self) this.coverOwner.set(c, null);
+    const prev = this.coverOwner.get(cover);
+    if (prev && prev !== self) {
+      const pa = this.actors.get(prev);
+      if (pa) pa.cover = null;
+    }
     this.coverOwner.set(cover, self);
     const a = this.actors.get(self);
     if (a) a.cover = cover;
@@ -297,6 +304,8 @@ export const squadDomain: DomainDoc = {
       name: "advanceTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.not(F.lit("coverTaken", ["?c"])),
+      // abort the instant a rival claims this slot mid-move → repair to a free one
+      verify: F.not(F.lit("coverTaken", ["?c"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -310,6 +319,7 @@ export const squadDomain: DomainDoc = {
       name: "flankTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.and(F.lit("coverFlank", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
+      verify: F.not(F.lit("coverTaken", ["?c"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -323,6 +333,7 @@ export const squadDomain: DomainDoc = {
       name: "climbTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.and(F.lit("coverHigh", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
+      verify: F.not(F.lit("coverTaken", ["?c"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -349,6 +360,7 @@ export const squadDomain: DomainDoc = {
       name: "retreatTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.and(F.lit("coverRally", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
+      verify: F.not(F.lit("coverTaken", ["?c"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -551,13 +563,19 @@ function suppressExecutor(self: string, world: SquadWorld): (api: ExecutorApi) =
     const a = world.actors.get(self);
     if (!a || !a.alive) return "failure";
     const target = world.nearestHostile(self, true);
-    if (!target) return "failure";
-    a.ammo = Math.max(0, a.ammo - 1);
-    target.suppressedFor = 1.0; // pinned this beat
-    target.hp = Math.max(0, target.hp - SUPPRESS_DAMAGE * api.rng.next());
-    // a short burst, then the step completes (the scope keeps us re-suppressing)
-    if (api.elapsedInStep() < 1.0) return "continue";
-    return "success";
+    if (!target) return "failure"; // lost line of sight → repair
+    // sustain suppressing fire at a controlled rate; this keeps the
+    // `suppress-cover` scope active so it can be interrupted the instant the
+    // flanker reaches position (scope.violated{maintain}) — the F.E.A.R. beat.
+    const mem = api.remember(() => ({ nextShot: 0 })) as { nextShot: number };
+    if (api.elapsedInStep() >= mem.nextShot && a.ammo > 0) {
+      a.ammo -= 1;
+      mem.nextShot += 0.4;
+      target.suppressedFor = 1.0; // pinned
+      target.hp = Math.max(0, target.hp - SUPPRESS_DAMAGE * api.rng.next());
+    }
+    if (world.flankerReady || a.ammo <= 0 || api.elapsedInStep() > SUPPRESS_MAX) return "success";
+    return "continue";
   };
 }
 
