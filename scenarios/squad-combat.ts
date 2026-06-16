@@ -32,8 +32,10 @@ import {
   type DomainDoc,
   type ExecutorApi,
   type Formula,
+  type GoalSpec,
   type Model,
   type Planner as PlannerT,
+  type Rejection,
   type TaskStatus,
   type TraceEvent,
   E,
@@ -41,6 +43,7 @@ import {
   N,
   Planner,
   createModel,
+  planSummary,
 } from "../src/index";
 
 // ---------------------------------------------------------------- tunables
@@ -651,6 +654,8 @@ export interface UnitPlanner {
   planner: PlannerT;
   lastSeen: number;
   trace: TraceEvent[];
+  /** most recent "why a branch was rejected" reasons (glass-box director, E3) */
+  why: string[];
 }
 
 // ---------------------------------------------------------------- the sim
@@ -671,6 +676,12 @@ export interface UnitFrame {
   bark: string;
   tactic: string;
   status: string;
+  /** the unit's current plan, as readable step labels (glass-box director) */
+  plan: string[];
+  /** recent trace event kinds (glass-box director) */
+  events: string[];
+  /** most recent "why a branch was rejected" reasons (glass-box director) */
+  why: string[];
 }
 
 export interface SquadFrame {
@@ -688,6 +699,8 @@ export interface SquadSimOptions {
   dt?: number;
   /** per-unit planning node budget per tick */
   nodes?: number;
+  /** override the bark author (the LLM-rewrite seam, Phase D); defaults to `barkFor` */
+  bark?: BarkAuthor;
 }
 
 /**
@@ -702,6 +715,7 @@ export class SquadSim {
   private readonly inst: SquadInstance;
   private readonly dt: number;
   private readonly nodes: number;
+  private readonly barkAuthor: BarkAuthor;
   private playerLeg = 0;
   private playerLegT = 0;
 
@@ -709,6 +723,7 @@ export class SquadSim {
     this.inst = inst;
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
+    this.barkAuthor = opts.bark ?? barkFor;
     this.world = new SquadWorld(inst);
     if (inst.breach) this.world.squadTactic = "breach";
     let seedBump = 0;
@@ -716,8 +731,17 @@ export class SquadSim {
       if (u.side === "player") continue;
       const model = buildUnitModel(u.name, this.world, inst);
       const trace: TraceEvent[] = [];
-      const name = u.name;
-      const planner = new Planner(model, {
+      const entry: UnitPlanner = {
+        name: u.name,
+        side: u.side,
+        role: u.role ?? "assault",
+        model,
+        planner: undefined as unknown as PlannerT,
+        lastSeen: -Infinity,
+        trace,
+        why: [],
+      };
+      entry.planner = new Planner(model, {
         goals: [{ kind: "task", name: "Fight" }],
         now: () => this.world.clock,
         seed: (opts.seed ?? 1) + seedBump++,
@@ -725,10 +749,11 @@ export class SquadSim {
         collectRejections: true,
         trace: (e) => {
           trace.push(e);
-          this.trace.push({ unit: name, e });
+          this.trace.push({ unit: entry.name, e });
+          if (e.t === "plan.failed" && e.rejections) entry.why = summarizeRejections(e.rejections);
         },
       });
-      this.units.push({ name: u.name, side: u.side, role: u.role ?? "assault", model, planner, lastSeen: -Infinity, trace });
+      this.units.push(entry);
     }
   }
 
@@ -856,7 +881,7 @@ export class SquadSim {
     for (const p of this.units) {
       const recent = p.trace.slice(-6);
       for (const e of recent) {
-        const text = barkFor(e);
+        const text = this.barkAuthor(e, p.name);
         if (text) this.world.bark(p.name, text);
       }
     }
@@ -872,6 +897,7 @@ export class SquadSim {
         const up = this.units.find((u) => u.name === a.name);
         const step = up?.planner.currentStep();
         const stepLabel = step && step.k === "op" ? up!.model.describeGroundOp(step.g) : step ? step.k : "—";
+        const plan = up?.planner.getPlan();
         return {
           name: a.name,
           side: a.side,
@@ -887,6 +913,9 @@ export class SquadSim {
           bark: this.world.barks.get(a.name)?.text ?? "",
           tactic: up ? (this.world.squadTactic === "breach" ? "breach" : this.world.squadTactic) : "—",
           status: up?.planner.getStatus() ?? "—",
+          plan: up && plan ? planSummary(up.model, plan) : [],
+          events: up ? up.trace.slice(-6).map((e) => e.t) : [],
+          why: up ? up.why : [],
         };
       }),
     };
@@ -913,9 +942,44 @@ function round(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+// ---------------------------------------------------------------- LLM-ready seams (Phase D)
+
+/**
+ * Phase D — typed seams where an LLM can later drive cognition over the planner's
+ * *verified* actions (the NVIDIA-ACE pattern). No model calls in the slice; these
+ * are the hook points, aligned with ROADMAP P3.
+ *
+ *  • GoalSelector — choose/score a unit's goals from a context. The symbolic
+ *    stand-ins today are the SquadCoordinator (enemies) and SquadSim.command
+ *    (the player, routed through Planner.setGoals). An LLM would slot in here,
+ *    picking from goals the planner can *prove* reachable (applicableGoals).
+ *  • BarkAuthor — turn a trace event into an utterance. `barkFor` is the default
+ *    rule table; pass `SquadSimOptions.bark` to swap in a persona-driven rewriter.
+ */
+export interface GoalContext {
+  unit: string;
+  side: Side;
+  role: Role;
+  hp: number;
+  hasThreat: boolean;
+  squadTactic: string;
+}
+export type GoalSelector = (ctx: GoalContext) => GoalSpec[];
+export type BarkAuthor = (e: TraceEvent, unit: string) => string | null;
+
+/** Dedupe + cap rejection reasons for the glass-box "why not X" view. */
+function summarizeRejections(rejections: Rejection[]): string[] {
+  const counts = new Map<string, number>();
+  for (const r of rejections) {
+    const key = `${r.at}: ${r.reason}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, n]) => (n > 1 ? `${k} (×${n})` : k));
+}
+
 // ---------------------------------------------------------------- barks (trace → utterance)
 
-/** Map a trace event to a combat bark — the seam an LLM later rewrites. */
+/** Map a trace event to a combat bark — the seam an LLM later rewrites (BarkAuthor). */
 export function barkFor(e: TraceEvent): string | null {
   if (e.t === "step.start") {
     if (e.label.startsWith("flankTo")) return "Flanking — moving!";
