@@ -702,7 +702,14 @@ export interface UnitFrame {
   cover: string | null;
   /** label of the step currently executing (drives the bark) */
   step: string;
+  /** a clear, human-readable verb for what the unit is doing right now */
+  action: string;
   bark: string;
+  /** the unit this one is currently firing on (beam target), if any */
+  firingAt: string | null;
+  firingKind: "shot" | "suppress" | "breach" | null;
+  /** the hostile this unit currently has a line of sight to (sight line) */
+  sees: string | null;
   tactic: string;
   status: string;
   /** the unit's current plan, as readable step labels (glass-box director) */
@@ -927,6 +934,16 @@ export class SquadSim {
         const step = up?.planner.currentStep();
         const stepLabel = step && step.k === "op" ? up!.model.describeGroundOp(step.g) : step ? step.k : "—";
         const plan = up?.planner.getPlan();
+        const status = up?.planner.getStatus() ?? "—";
+        let firingAt: string | null = null;
+        let firingKind: UnitFrame["firingKind"] = null;
+        let sees: string | null = null;
+        if (up && a.alive) {
+          sees = this.world.nearestHostile(a.name, true)?.name ?? null;
+          if (stepLabel.startsWith("takeShot")) { firingKind = "shot"; firingAt = sees; }
+          else if (stepLabel.startsWith("suppress")) { firingKind = "suppress"; firingAt = sees; }
+          else if (stepLabel.startsWith("breach")) { firingKind = "breach"; firingAt = this.world.nearestHostile(a.name, false)?.name ?? null; }
+        }
         return {
           name: a.name,
           side: a.side,
@@ -939,9 +956,13 @@ export class SquadSim {
           elevation: a.elevation,
           cover: a.cover,
           step: stepLabel,
+          action: up ? describeAction(stepLabel, status, a.alive, firingAt) : a.alive ? "target" : "down",
           bark: this.world.barks.get(a.name)?.text ?? "",
+          firingAt,
+          firingKind,
+          sees,
           tactic: up ? (this.world.squadTactic === "breach" ? "breach" : this.world.squadTactic) : "—",
-          status: up?.planner.getStatus() ?? "—",
+          status,
           plan: up && plan ? planSummary(up.model, plan) : [],
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
           why: up ? up.why : [],
@@ -1004,6 +1025,24 @@ function summarizeRejections(rejections: Rejection[]): string[] {
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, n]) => (n > 1 ? `${k} (×${n})` : k));
+}
+
+/** A clear, human-readable verb for what a unit is doing right now (for the view). */
+function describeAction(step: string, status: string, alive: boolean, firingAt: string | null): string {
+  if (!alive) return "down";
+  if (step.startsWith("takeShot")) return firingAt ? `firing on ${firingAt}` : "firing";
+  if (step.startsWith("suppress")) return firingAt ? `suppressing ${firingAt}` : "suppressing";
+  if (step.startsWith("flankTo")) return "flanking";
+  if (step.startsWith("climbTo")) return "taking high ground";
+  if (step.startsWith("advanceTo")) return "moving to cover";
+  if (step.startsWith("moveToBreach")) return "stacking on door";
+  if (step.startsWith("breach")) return "breaching";
+  if (step.startsWith("reload")) return "reloading";
+  if (step.startsWith("retreatTo")) return "falling back";
+  if (step === "wait" || step === "hold") return "holding";
+  if (status === "planning") return "thinking…";
+  if (status === "failed") return "looking for a shot";
+  return "holding";
 }
 
 // ---------------------------------------------------------------- barks (trace → utterance)

@@ -100,3 +100,73 @@ export function squadTraceSummary(trace: { unit: string; e: TraceEvent }[]): { l
   for (const { e } of trace) counts.set(e.t, (counts.get(e.t) ?? 0) + 1);
   return [...counts.entries()].map(([label, count]) => ({ label, count }));
 }
+
+/** The squad's current coordination state, as a short banner. */
+export function squadTacticBanner(frame: SquadFrame): { label: string; hint: string } {
+  const tactic = frame.squadTactic;
+  if (tactic === "breach") return { label: "BREACH", hint: "stack on the door + breach inside the deadline window" };
+  if (tactic === "flank") return { label: "FLANK", hint: frame.flankerReady ? "flanker in position — suppressor pushing up" : "one suppresses while the other swings wide" };
+  return { label: "HOLD", hint: "engaging from cover" };
+}
+
+/** A plain-English caption of what's happening this frame — the live educator. */
+export function squadNarration(frame: SquadFrame): string {
+  const enemies = frame.units.filter((u) => u.side === "enemy");
+  const friends = frame.units.filter((u) => u.side !== "enemy");
+  if (enemies.length && enemies.every((u) => !u.alive)) return "✓ Enemies neutralized — the engagement is over.";
+  if (friends.length && friends.every((u) => !u.alive)) return "✓ Target down — the squad cleared the area.";
+
+  const ai = frame.units.filter((u) => u.side !== "player" && u.alive);
+  const names = (verb: (a: string) => boolean) => ai.filter((u) => verb(u.action)).map((u) => u.name);
+  const breaching = names((a) => a === "breaching" || a === "stacking on door");
+  const suppressing = names((a) => a.startsWith("suppress"));
+  const flanking = names((a) => a === "flanking");
+  const firing = names((a) => a.startsWith("firing"));
+  const moving = names((a) => a.includes("moving") || a.includes("high ground"));
+  const fallingBack = names((a) => a === "falling back");
+
+  if (breaching.length) return `${list(breaching)} stacking on the door — breaching in sync inside the deadline window.`;
+  if (suppressing.length && flanking.length) return `${list(suppressing)} pins the target with covering fire while ${list(flanking)} swings to a flank — coordinated, not scripted.`;
+  if (suppressing.length) return `${list(suppressing)} laying down suppressing fire to free up the flank.`;
+  if (flanking.length) return `${list(flanking)} routing to a cover that can actually see the target — a flank the planner discovered.`;
+  if (fallingBack.length) return `${list(fallingBack)} breaking contact and falling back on orders.`;
+  if (moving.length && firing.length) return `${list(firing)} engaging while ${list(moving)} repositions for a better angle.`;
+  if (firing.length) return `${list(firing)} engaging the target from cover.`;
+  if (moving.length) return `${list(moving)} repositioning — no clean line of fire from here yet.`;
+  return "Sizing up the engagement…";
+}
+
+function list(xs: string[]): string {
+  if (xs.length <= 1) return xs[0] ?? "";
+  return `${xs.slice(0, -1).join(", ")} & ${xs[xs.length - 1]}`;
+}
+
+/** Per-scenario "what to watch for" — the unique thing each shows off. */
+export function whatToWatch(id: SquadScenarioId): string[] {
+  switch (id) {
+    case "skirmish":
+      return [
+        "One NPC pins the target with covering fire while the other swings wide to a flank cover.",
+        "The moment the flanker is set, the suppressor reactively stops and pushes — watch the AI Director plan change.",
+        "Every move is the real planner's; the barks announce the tactic, F.E.A.R.-style.",
+      ];
+    case "blockedFlank":
+      return [
+        "The barricade blocks the direct line of fire (try selecting an NPC — its sight line turns red).",
+        "Nobody scripted a route: the planner DISCOVERS it must reach a cover that can see the target.",
+        "Compare with Skirmish (no wall) where they just shoot — proof this is search, not a script.",
+      ];
+    case "breach":
+      return [
+        "The fire-team stacks on the door, then breaches together.",
+        "It happens inside a deadline window enforced INSIDE the planner's search (projected clock).",
+        "Anyone who can't reach the door in time is pruned from the plan — temporal coordination.",
+      ];
+    case "companion":
+      return [
+        "Your ally fights on its own and never targets a friendly.",
+        "Tap an order (Engage / Regroup / Hold fire) — it's routed through Planner.setGoals, not a state machine.",
+        "Watch the ally's plan change in the AI Director the instant you give the order.",
+      ];
+  }
+}
