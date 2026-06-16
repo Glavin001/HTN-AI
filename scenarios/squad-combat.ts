@@ -60,6 +60,16 @@ export const LOW_HP = 48; // pull back to cover once this hurt (react to taking 
 export const SIGHT_RANGE = 22;
 export const BREACH_WINDOW = 6; // seconds the synchronized breach must complete within
 
+// --- probabilistic hit model: range + cover + suppression change the odds ---
+export const BASE_HIT = 0.92; // point-blank, clear shot, not suppressed
+export const COVER_HIT_MULT = 0.3; // a target in soft cover is much harder to hit
+export const SUPPRESSED_HIT_MULT = 0.4; // a suppressed shooter's aim is spoiled
+
+/** Accuracy vs range: ~1 up close, decaying to ~0.35 at the edge of sight. */
+function rangeFactor(dist: number): number {
+  return Math.max(0.35, Math.min(1, 1.15 - 0.038 * dist));
+}
+
 // ---------------------------------------------------------------- instance shapes
 
 export type Side = "enemy" | "ally" | "player";
@@ -94,7 +104,9 @@ export interface CoverSpec {
   rally?: boolean;
 }
 
-/** Axis-aligned obstacle that blocks line of sight AND movement (a wall / crate). */
+/** An obstacle. Full-height walls block sight AND movement; half-height cover
+ *  blocks movement only (you path around it) and gives DIRECTIONAL soft cover —
+ *  it shields you from shooters it sits between you and, not from your flank/back. */
 export interface WallSpec {
   x: number;
   z: number;
@@ -102,6 +114,8 @@ export interface WallSpec {
   d: number;
   /** a breachable door: blocks sight + movement until a breach action breaks it */
   door?: boolean;
+  /** half-height cover: blocks movement + gives soft cover, but NOT line of sight */
+  half?: boolean;
 }
 
 export interface SquadInstance {
@@ -272,20 +286,42 @@ export class SquadWorld {
   /** the breach door has been broken — it no longer blocks sight or movement */
   public doorBroken = false;
 
-  /** obstacles currently blocking sight + movement (the door drops once breached) */
-  activeWalls(): WallSpec[] {
+  /** obstacles that block line of sight: full walls + the intact door (NOT half cover) */
+  sightWalls(): WallSpec[] {
+    return this.walls.filter((w) => !w.half && !(w.door && this.doorBroken));
+  }
+
+  /** obstacles that block movement: everything solid (full walls, half cover, intact door) */
+  moveWalls(): WallSpec[] {
     return this.doorBroken ? this.walls.filter((w) => !w.door) : this.walls;
   }
 
   losClear(ax: number, az: number, bx: number, bz: number): boolean {
-    for (const w of this.activeWalls()) if (segHitsBox(ax, az, bx, bz, w)) return false;
+    for (const w of this.sightWalls()) if (segHitsBox(ax, az, bx, bz, w)) return false;
     return true;
+  }
+
+  /** Is the position (px,pz) in soft cover from a shooter at (sx,sz)? True when a
+   *  half-cover obstacle sits between them, close to the position — i.e. the cover
+   *  is "active" against that specific shooting direction. Directional: a shooter on
+   *  the far side is blocked; one on your flank/back is not. */
+  coveredFrom(px: number, pz: number, sx: number, sz: number): boolean {
+    for (const w of this.walls) {
+      if (!w.half) continue;
+      if (!segHitsBox(px, pz, sx, sz, w)) continue;
+      // the cover must be NEAR me (between me and the shooter, on my side), not just
+      // somewhere on the long line — so I'm actually tucked behind it
+      const cx = w.x + w.w / 2;
+      const cz = w.z + w.d / 2;
+      if (dist2(px, pz, cx, cz) <= 2.6) return true;
+    }
+    return false;
   }
 
   /** Shortest walkable path from (ax,az) to (bx,bz) around obstacles (visibility
    *  graph over padded box corners + Dijkstra). Returns waypoints incl. the goal. */
   findPath(ax: number, az: number, bx: number, bz: number): Vec2[] {
-    const walls = this.activeWalls();
+    const walls = this.moveWalls();
     if (walls.every((w) => !segHitsBox(ax, az, bx, bz, w))) return [{ x: bx, z: bz }];
     const inside = (p: Vec2) => walls.some((w) => p.x > w.x - 0.01 && p.x < w.x + w.w + 0.01 && p.z > w.z - 0.01 && p.z < w.z + w.d + 0.01);
     const nodes: Vec2[] = [{ x: ax, z: az }, ...walls.flatMap((w) => boxCorners(w, UNIT_RADIUS)).filter((c) => !inside(c)), { x: bx, z: bz }];
@@ -721,9 +757,15 @@ function shootExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => T
     if (!target) return "failure"; // lost line of sight → repair
     if (api.elapsedInStep() < SHOT_TIME) return "continue"; // aiming
     a.ammo = Math.max(0, a.ammo - 1);
-    const dmg = SHOT_DAMAGE * (0.85 + 0.3 * api.rng.next());
-    target.hp = Math.max(0, target.hp - dmg);
-    if (target.hp <= 0) target.alive = false;
+    // hit chance: closer is deadlier, a target in cover is hard to hit, and a
+    // suppressed shooter's aim is spoiled — so position is a real trade-off
+    const d = dist2(a.x, a.z, target.x, target.z);
+    const covered = world.coveredFrom(target.x, target.z, a.x, a.z);
+    const pHit = BASE_HIT * rangeFactor(d) * (covered ? COVER_HIT_MULT : 1) * (a.suppressedFor > 0 ? SUPPRESSED_HIT_MULT : 1);
+    if (api.rng.next() < pHit) {
+      target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
+      if (target.hp <= 0) target.alive = false;
+    }
     return "success";
   };
 }
