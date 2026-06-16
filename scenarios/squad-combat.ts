@@ -31,6 +31,7 @@
 import {
   type DomainDoc,
   type ExecutorApi,
+  type ExtQuery,
   type Formula,
   type GoalSpec,
   type Model,
@@ -77,6 +78,28 @@ export const PEEK_PENALTY = 0.82; // your OWN outgoing accuracy when you shoot f
 // over the *average* shot; execution rolls the seeded RNG around it)
 export const EXPECTED_HIT = 0.78;
 
+// ---- search weights: the tactical trade-off the planner OPTIMISES OVER ----
+// These live in operator COST, not a greedy one-shot utility, so the planner's
+// weighted-A* composes multi-step plans (stage through cover, then push to the
+// strong angle) that a one-hop greedy score would miss.
+// The planner is myopic (it plans one shot per beat, then replans), so a single
+// exposed shot must stand in for the SUSTAINED danger of holding an exposed spot —
+// hence W_EXPOSE is large relative to the one-off cost of relocating. This is what
+// makes "break contact and reach cover" win over "trade shots in the open".
+export const W_MOVE = 0.35; // cost per world-unit travelled
+export const W_EXPOSE = 5.0; // cost per enemy with a clear shot on you (the danger lever)
+export const W_PATH_EXPOSE = 0.8; // cost for crossing exposed ground to reach a spot
+export const W_RANGE = 0.12; // mild pull toward comfortable firing range (don't let it dominate cover)
+export const IDEAL_RANGE = 12; // closer than this you fight well; far costs a little accuracy
+export const SPOT_GRID = 4.2; // spacing of the auto-generated walkable grid
+export const MAX_SPOTS = 22; // cap on tactical points exposed to the planner (branching)
+
+/** Fluents every tactical external reads — listed so a foe moving (perception) or a
+ *  reposition dirties the cost/precondition and the unit re-decides each beat. */
+const TACTICAL_READS = ["myPos", "coverPos", "threatPos", "foePos", "foeAlive"];
+/** Same, plus threatHp (the engagement-cost utilities also depend on how hurt it is). */
+const MOVE_ENGAGE_READS = ["myPos", "coverPos", "threatPos", "threatHp", "foePos", "foeAlive"];
+
 // ---------------------------------------------------------------- instance shapes
 
 export type Side = "enemy" | "ally" | "player";
@@ -109,6 +132,9 @@ export interface CoverSpec {
   breach?: boolean;
   /** a fall-back / rally point used when retreating */
   rally?: boolean;
+  /** an auto-generated tactical standing position (grid / cover edge) — invisible,
+   *  not a crate, evaluated by the planner as a candidate firing/cover spot */
+  spot?: boolean;
 }
 
 /** Axis-aligned obstacle that blocks line of sight AND movement (a wall / crate). */
@@ -219,12 +245,61 @@ function boxCorners(w: WallSpec, pad: number): Vec2[] {
  *  unless it's a maneuver anchor (flank / high / breach / rally), which are open
  *  waypoints, not crates. Only soft cover blocks incoming fire directionally. */
 export function isSoftCover(c: CoverSpec): boolean {
-  return !c.flank && !c.high && !c.breach && !c.rally;
+  return !c.flank && !c.high && !c.breach && !c.rally && !c.spot;
 }
 
 /** The axis-aligned footprint of a soft-cover crate (used for directional cover). */
 export function coverFootprint(c: CoverSpec): WallSpec {
   return { x: c.x - COVER_HALF_W, z: c.z - COVER_HALF_D, w: 2 * COVER_HALF_W, d: 2 * COVER_HALF_D };
+}
+
+/**
+ * Auto-generate the invisible tactical standing positions the planner evaluates:
+ * the padded corners of every wall + crate (the "peek the edge" spots) plus a
+ * coarse walkable grid over the play area. These are NOT crates (spot:true ⇒ not
+ * soft cover) and are not drawn — only real geometry is. Deterministic + capped so
+ * the planner's branching stays bounded.
+ */
+export function generateTacticalSpots(inst: SquadInstance): CoverSpec[] {
+  const walls = inst.walls ?? [];
+  const obstacles: WallSpec[] = [...walls, ...inst.covers.filter(isSoftCover).map(coverFootprint)];
+  const insideWall = (x: number, z: number) => walls.some((w) => x > w.x - 0.3 && x < w.x + w.w + 0.3 && z > w.z - 0.3 && z < w.z + w.d + 0.3);
+  const pts: Vec2[] = [];
+  // cover-edge spots first (kept preferentially under the cap): the 4 corners (peek
+  // an angle) AND the 4 edge-midpoints (tuck directly behind cover from a head-on
+  // shooter). Together these are the "go around the crate to block their line" spots.
+  const EDGE = UNIT_RADIUS + 0.7;
+  for (const o of obstacles) {
+    const cx = o.x + o.w / 2;
+    const cz = o.z + o.d / 2;
+    const offs: [number, number][] = [
+      [-1, -1], [1, -1], [-1, 1], [1, 1], // corners
+      [0, -1], [0, 1], [-1, 0], [1, 0], // edge midpoints (head-on cover)
+    ];
+    for (const [sx, sz] of offs) {
+      const x = cx + sx * (o.w / 2 + EDGE);
+      const z = cz + sz * (o.d / 2 + EDGE);
+      if (!insideWall(x, z)) pts.push({ x, z });
+    }
+  }
+  // coarse walkable grid over the bounding area
+  const xs = [...inst.units.map((u) => u.x), ...inst.covers.map((c) => c.x)];
+  const zs = [...inst.units.map((u) => u.z), ...inst.covers.map((c) => c.z)];
+  const pad = 3;
+  const minX = Math.min(...xs) - pad;
+  const maxX = Math.max(...xs) + pad;
+  const minZ = Math.min(...zs) - pad;
+  const maxZ = Math.max(...zs) + pad;
+  for (let x = minX; x <= maxX; x += SPOT_GRID) for (let z = minZ; z <= maxZ; z += SPOT_GRID) if (!insideWall(x, z)) pts.push({ x, z });
+  // dedupe + drop points that coincide with a named cover (already a candidate)
+  const near = (a: Vec2, b: { x: number; z: number }) => Math.hypot(a.x - b.x, a.z - b.z) < SPOT_GRID * 0.6;
+  const kept: Vec2[] = [];
+  for (const p of pts) {
+    if (kept.some((k) => near(k, p))) continue;
+    if (inst.covers.some((c) => near(p, c))) continue;
+    kept.push(p);
+  }
+  return kept.slice(0, MAX_SPOTS).map((p, i) => ({ name: `spot${i}`, x: round(p.x), z: round(p.z), spot: true }));
 }
 
 /** Distance from a point to an axis-aligned box (0 if inside). */
@@ -516,6 +591,31 @@ export const squadDomain: DomainDoc = {
       executor: "move",
     },
     {
+      // the fluid tactical move: relocate to ANY useful standing position (grid spot,
+      // cover edge, or named cover). Its COST carries the whole positional trade-off —
+      // travel + the danger of crossing exposed ground to get there + being out of
+      // comfortable range — so the planner's weighted-A* composes multi-step plans
+      // (stage through cover, then push to the strong angle) a greedy score can't.
+      // Destination exposure isn't charged here; the following takeShot pays for
+      // firing while exposed, so "move to cover then fire" is what gets optimised.
+      name: "moveToSpot",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("spotUseful", ["?c"], TACTICAL_READS)),
+      // abort the move the instant the slot is taken OR the spot stops being useful
+      // (a foe moved, a new one appeared on your flank — your cover just lapsed)
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("spotUseful", ["?c"], TACTICAL_READS)),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+      ],
+      cost: N.add(
+        N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
+        N.add(N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE)), N.mul(N.ext("spotRange", ["?c"], TACTICAL_READS), N.c(W_RANGE))),
+      ),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
       // move to a flanking cover (coordinated flank tactic); same motion, tagged
       name: "flankTo",
       params: [{ name: "c", type: "cover" }],
@@ -588,9 +688,31 @@ export const squadDomain: DomainDoc = {
       // a target not in cover ⇒ more damage per shot, so the planner values closing in
       // and denying the target its cover (execution rolls the seeded RNG around this).
       eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.ext("shotDamage", [], ["myPos", "threatPos"]), "planOnly")],
-      cost: 1,
+      // firing from an exposed position is COSTLY (every enemy with a clear shot on you
+      // costs W_EXPOSE), so the planner prefers to reach cover before it opens up —
+      // and weighs that against the travel it would take. This is the lever that makes
+      // "fight from cover" emerge instead of trading shots in the open.
+      cost: N.add(N.c(1), N.mul(N.ext("myExposure", [], ["myPos", "foePos", "foeAlive"]), N.c(W_EXPOSE))),
       duration: SHOT_TIME,
       executor: "shoot",
+    },
+    {
+      // ENGAGE FROM HERE — the macro the kill-search reasons over. It stands for
+      // "fight the threat from this position to the finish": its planning COST is the
+      // whole engagement (shots-to-kill × the per-shot exposure of THIS spot), so the
+      // search compares "engage from the open" against "move to cover, then engage"
+      // over the full firefight, not one beat — which is what makes fighting from cover
+      // (and closing for accuracy) win. Search stays shallow (it's one op per position),
+      // while execution fires a burst and hands control back so the unit re-reads the
+      // room between magazines. The planOnly effect optimistically projects the kill so
+      // a single engageFrom satisfies the goal during search.
+      name: "engageFrom",
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("threatHp"), N.c(0))),
+      verify: F.ext("canSee", [], ["myPos", "threatPos"]),
+      eff: [E.set("threatHp", [], N.c(0), "planOnly")],
+      cost: N.ext("engageCost", [], ["myPos", "threatPos", "threatHp", "foePos", "foeAlive"]),
+      duration: N.ext("engageDur", [], ["myPos", "threatPos", "threatHp"]),
+      executor: "engage",
     },
     {
       // suppressing fire: pins the target so a flanker can move (chips little HP)
@@ -598,7 +720,9 @@ export const squadDomain: DomainDoc = {
       pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
       verify: F.ext("canSee", [], ["myPos", "threatPos"]),
       eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.c(SUPPRESS_DAMAGE), "planOnly")],
-      cost: 1,
+      // suppressing is firing too — it exposes you, so the solo kill-search won't pick
+      // it over aimed shots; it earns its keep only in the coordinated suppress-and-flank
+      cost: N.add(N.c(1), N.mul(N.ext("myExposure", [], ["myPos", "foePos", "foeAlive"]), N.c(W_EXPOSE))),
       duration: 1.2,
       executor: "suppress",
     },
@@ -693,28 +817,32 @@ export const squadDomain: DomainDoc = {
     // --- Neutralize: reload if dry, fire if there's a line of sight, else
     // reposition to a cover that geometrically has one (the flank EMERGES from
     // method selection; short reactive plans, re-entered each beat).
+    // Neutralize = pick the best PLACE to fight from, then fight. Rather than an
+    // uninformed search over move-sequences (which wanders), the planner ranks a small
+    // set of meaningful options by UTILITY — the negative of the WHOLE-engagement cost
+    // (travel + danger of crossing + the per-shot exposure summed over every shot it'll
+    // take from there). So "engage from here" is weighed directly against "relocate to
+    // each candidate firing spot, then engage", and the cheapest wins. This is bounded
+    // (O(firing positions), evaluated once), deterministic, and reads the room: it
+    // fights from cover, closes for accuracy, and breaks contact when outgunned — and
+    // because it re-ranks every beat as the world moves, the repositioning is fluid and
+    // multi-step emerges over time (move to a safer spot now, push to a stronger one as
+    // the fight shifts). The engageFrom macro keeps the action abstract so the choice
+    // stays at the human level of "take that cover", not "step 0.3m".
     {
-      name: "reloadDry",
-      task: "Neutralize",
-      pre: F.and(F.lit("hasThreat"), F.lte(N.fl("myAmmo"), N.c(0))),
-      subtasks: [{ do: "reload" }, { do: "Neutralize" }],
-    },
-    {
-      name: "fireNow",
-      task: "Neutralize",
-      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"])),
-      subtasks: [{ do: "takeShot" }],
-    },
-    {
-      name: "reposition",
+      name: "repositionEngage",
       task: "Neutralize",
       params: [{ name: "c", type: "cover" }],
-      pre: F.and(
-        F.lit("hasThreat"),
-        F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]),
-        F.not(F.lit("coverTaken", ["?c"])),
-      ),
-      subtasks: [{ do: "advanceTo", args: ["?c"] }, { do: "takeShot" }],
+      pre: F.and(F.lit("hasThreat"), F.not(F.lit("coverTaken", ["?c"])), F.ext("spotUseful", ["?c"], TACTICAL_READS)),
+      utility: N.sub(N.c(0), N.ext("moveEngageCost", ["?c"], MOVE_ENGAGE_READS)),
+      subtasks: [{ do: "moveToSpot", args: ["?c"] }, { do: "engageFrom" }],
+    },
+    {
+      name: "engageHere",
+      task: "Neutralize",
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"])),
+      utility: N.sub(N.c(0), N.ext("engageCost", [], MOVE_ENGAGE_READS)),
+      subtasks: [{ do: "engageFrom" }],
     },
     // player order: fall back to a rally point (HTN — a direct decomposition, no
     // goal search; the `setGoals` seam routes "regroup" here)
@@ -730,6 +858,26 @@ export const squadDomain: DomainDoc = {
     },
   ],
 };
+
+// ---------------------------------------------------------------- tactical belief reads
+
+/** The believed positions of every hostile this unit currently thinks is alive —
+ *  read from belief (not ground truth), so reasoning is honest about what it knows. */
+function believedFoes(q: ExtQuery, foes: string[]): { x: number; z: number }[] {
+  const out: { x: number; z: number }[] = [];
+  for (const f of foes) {
+    if (q.get("foeAlive", f) < 0.5) continue;
+    const p = q.vec("foePos", f);
+    out.push({ x: p[0], z: p[1] });
+  }
+  return out;
+}
+
+/** Whether a position has a line of fire to the believed primary threat. */
+function spotHasLos(world: SquadWorld, x: number, z: number, t: number[]): boolean {
+  if (x === t[0] && z === t[1]) return false;
+  return world.losClear(x, z, t[0], t[1]) && dist2(x, z, t[0], t[1]) <= SIGHT_RANGE;
+}
 
 // ---------------------------------------------------------------- registry / model per unit
 
@@ -776,6 +924,29 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           if (c[0] === t[0] && c[1] === t[1]) return false;
           return world.losClear(c[0], c[1], t[0], t[1]) && dist2(c[0], c[1], t[0], t[1]) <= SIGHT_RANGE;
         },
+        // Is moving to spot `c` a useful FIRING position to relocate to? This bounds the
+        // kill-search hard: a candidate must have a line of fire on the threat (the move
+        // executor still pathfinds AROUND walls to reach it, so flanking a barricade is
+        // one move), so the search never wanders through arbitrary open ground — every
+        // hop lands somewhere you can shoot from. It must also be a genuine improvement
+        // (gain a line of fire we lack, get safer, or get closer for accuracy), which
+        // makes the recursion strictly progress and terminate. The cost model then
+        // chooses BETWEEN the qualifying firing spots (and vs engaging from here).
+        spotUseful: (q) => {
+          const c = q.vec("coverPos", q.args[0]);
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          if (t[0] === 0 && t[1] === 0) return false;
+          if (!spotHasLos(world, c[0], c[1], t)) return false; // must be a firing position
+          const fb = believedFoes(q, foes);
+          const meSeen = spotHasLos(world, m[0], m[1], t);
+          if (!meSeen) return true; // we have no shot → any firing position is progress
+          const expC = world.exposureAt(c[0], c[1], fb);
+          const expMe = world.exposureAt(m[0], m[1], fb);
+          if (expC < expMe) return true; // a safer firing position
+          const closer = dist2(c[0], c[1], t[0], t[1]) < dist2(m[0], m[1], t[0], t[1]) - 2;
+          return expC === expMe && closer; // better range at no extra risk
+        },
       },
       numerics: {
         coverX: (q) => q.vec("coverPos", q.args[0])[0],
@@ -789,10 +960,81 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
           return SHOT_DAMAGE * Math.max(0.12, p);
         },
+        // --- tactical costs (the trade-off the search optimises over) ---
+        // how exposed a candidate spot is (enemies with a clear shot, cover discounted)
+        spotExposure: (q) => {
+          const c = q.vec("coverPos", q.args[0]);
+          return world.exposureAt(c[0], c[1], believedFoes(q, foes));
+        },
+        // how exposed I am RIGHT NOW — makes firing from the open costly in takeShot
+        myExposure: (q) => {
+          const m = q.vec("myPos");
+          return world.exposureAt(m[0], m[1], believedFoes(q, foes));
+        },
+        // danger of CROSSING to a spot (sampled along the straight approach) — this is
+        // what makes a staged route through cover beat a direct dash over open ground
+        pathExposure: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          const fb = believedFoes(q, foes);
+          let e = 0;
+          for (const t of [0.34, 0.67]) e += world.exposureAt(m[0] + (c[0] - m[0]) * t, m[1] + (c[1] - m[1]) * t, fb);
+          return e * 0.5;
+        },
+        // cost for a spot being beyond comfortable firing range of the threat
+        spotRange: (q) => {
+          const c = q.vec("coverPos", q.args[0]);
+          const t = q.vec("threatPos");
+          return Math.max(0, dist2(c[0], c[1], t[0], t[1]) - IDEAL_RANGE);
+        },
+        // the WHOLE-engagement cost of fighting the threat from my current position:
+        // shots-to-kill (range + the target's cover decide damage/shot) × the per-shot
+        // danger of standing here (1 + every enemy that can shoot me). This is the lever
+        // the kill-search optimises — exposed positions are dear over a full firefight.
+        engageCost: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          let p = rangeFalloff(dist2(m[0], m[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
+          const dmg = SHOT_DAMAGE * Math.max(0.12, p);
+          const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
+          const exposure = world.exposureAt(m[0], m[1], believedFoes(q, foes));
+          return shots * (1 + W_EXPOSE * exposure);
+        },
+        // the total cost of RELOCATING to a candidate firing spot and fighting from it:
+        // travel + the danger of crossing to it + the whole-engagement cost once there.
+        // Used as -utility, this is what lets the planner rank "move to that cover and
+        // fight" against "fight from here" and pick the cheaper — a bounded, direct
+        // choice instead of an unbounded move-sequence search.
+        moveEngageCost: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          const t = q.vec("threatPos");
+          const fb = believedFoes(q, foes);
+          let path = 0;
+          for (const k of [0.34, 0.67]) path += world.exposureAt(m[0] + (c[0] - m[0]) * k, m[1] + (c[1] - m[1]) * k, fb);
+          const moveCost = W_MOVE * dist2(m[0], m[1], c[0], c[1]) + W_PATH_EXPOSE * (path * 0.5);
+          let p = rangeFalloff(dist2(c[0], c[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], c[0], c[1])) p *= COVER_HIT_MULT;
+          const dmg = SHOT_DAMAGE * Math.max(0.12, p);
+          const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
+          return moveCost + shots * (1 + W_EXPOSE * world.exposureAt(c[0], c[1], fb));
+        },
+        // projected duration of that engagement (shots-to-kill × aim time), so a scoped
+        // deadline or a racing flanker is reasoned about over the real firefight length
+        engageDur: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          let p = rangeFalloff(dist2(m[0], m[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
+          const dmg = SHOT_DAMAGE * Math.max(0.12, p);
+          return Math.max(1, Math.ceil(q.get("threatHp") / dmg)) * SHOT_TIME;
+        },
       },
       executors: {
         move: moveExecutor(self, world),
         shoot: shootExecutor(self, world),
+        engage: engageExecutor(self, world),
         suppress: suppressExecutor(self, world),
         breach: breachExecutor(self, world),
         reload: reloadExecutor(self, world),
@@ -850,6 +1092,36 @@ function shootExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => T
       if (target.hp <= 0) target.alive = false;
     }
     return "success";
+  };
+}
+
+function engageExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => TaskStatus {
+  return (api) => {
+    const a = world.actors.get(self);
+    if (!a || !a.alive) return "failure";
+    const target = world.nearestHostile(self, true);
+    if (!target) return "failure"; // lost the line of fire → repair / re-search a position
+    const mem = api.remember(() => ({ next: 0, reloadAt: -1 })) as { next: number; reloadAt: number };
+    const el = api.elapsedInStep();
+    // out of ammo → reload, then hand back so the unit re-reads the room with a fresh mag
+    if (a.ammo <= 0 && mem.reloadAt < 0) mem.reloadAt = el;
+    if (mem.reloadAt >= 0) {
+      if (el - mem.reloadAt < RELOAD_TIME) return "continue";
+      a.ammo = AMMO_MAX;
+      return "success";
+    }
+    if (el >= mem.next) {
+      a.ammo -= 1;
+      mem.next = el + SHOT_TIME;
+      if (api.rng.next() < world.hitChance(a, target)) {
+        target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
+        if (target.hp <= 0) {
+          target.alive = false;
+          return "success"; // threat down — the goal is met
+        }
+      }
+    }
+    return "continue"; // keep firing this magazine
   };
 }
 
@@ -1041,12 +1313,15 @@ export class SquadSim {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
     this.barkAuthor = opts.bark ?? barkFor;
-    this.world = new SquadWorld(inst);
+    // augment the map with invisible tactical standing positions (grid + cover edges)
+    // the planner can reposition to — fluid movement, not a handful of waypoints
+    const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...generateTacticalSpots(inst)] };
+    this.world = new SquadWorld(augmented);
     if (inst.breach) this.world.team("enemy").tactic = "breach"; // the attacking team breaches
     let seedBump = 0;
     for (const u of inst.units) {
       if (u.side === "player") continue;
-      const model = buildUnitModel(u.name, this.world, inst);
+      const model = buildUnitModel(u.name, this.world, augmented);
       const trace: TraceEvent[] = [];
       const entry: UnitPlanner = {
         name: u.name,
@@ -1272,7 +1547,7 @@ export class SquadSim {
         let sees: string | null = null;
         if (up && a.alive) {
           sees = this.world.nearestHostile(a.name, true)?.name ?? null;
-          if (stepLabel.startsWith("takeShot")) { firingKind = "shot"; firingAt = sees; }
+          if (stepLabel.startsWith("takeShot") || stepLabel.startsWith("engageFrom")) { firingKind = "shot"; firingAt = sees; }
           else if (stepLabel.startsWith("suppress")) { firingKind = "suppress"; firingAt = sees; }
           else if (stepLabel.startsWith("breach")) { firingKind = "breach"; firingAt = this.world.nearestHostile(a.name, false)?.name ?? null; }
         }
@@ -1365,10 +1640,11 @@ function summarizeRejections(rejections: Rejection[]): string[] {
 /** A clear, human-readable verb for what a unit is doing right now (for the view). */
 function describeAction(step: string, status: string, alive: boolean, firingAt: string | null): string {
   if (!alive) return "down";
-  if (step.startsWith("takeShot")) return firingAt ? `firing on ${firingAt}` : "firing";
+  if (step.startsWith("takeShot") || step.startsWith("engageFrom")) return firingAt ? `firing on ${firingAt}` : "firing";
   if (step.startsWith("suppress")) return firingAt ? `suppressing ${firingAt}` : "suppressing";
   if (step.startsWith("flankTo")) return "flanking";
   if (step.startsWith("climbTo")) return "taking high ground";
+  if (step.startsWith("moveToSpot")) return "repositioning to cover";
   if (step.startsWith("advanceTo")) return "moving to cover";
   if (step.startsWith("moveToBreach")) return "stacking on door";
   if (step.startsWith("breach")) return "breaching";
@@ -1386,11 +1662,12 @@ function describeAction(step: string, status: string, alive: boolean, firingAt: 
 export function barkFor(e: TraceEvent): string | null {
   if (e.t === "step.start") {
     if (e.label.startsWith("flankTo")) return "Flanking — moving!";
+    if (e.label.startsWith("moveToSpot")) return "Repositioning — working the angle!";
     if (e.label.startsWith("advanceTo")) return "Moving up!";
     if (e.label.startsWith("climbTo")) return "Taking the high ground!";
     if (e.label.startsWith("moveToBreach")) return "Stacking up!";
     if (e.label.startsWith("breach")) return "Breaching — go go go!";
-    if (e.label.startsWith("takeShot")) return "Engaging!";
+    if (e.label.startsWith("takeShot") || e.label.startsWith("engageFrom")) return "Engaging!";
     if (e.label.startsWith("suppress")) return "Suppressing — flank now!";
     if (e.label.startsWith("reload")) return "Reloading — cover me!";
     if (e.label.startsWith("retreatTo")) return "Falling back!";

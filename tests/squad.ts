@@ -26,7 +26,12 @@ function stepStarts(sim: SquadSim, unit: string): string[] {
 }
 
 function moved(labels: string[]): boolean {
-  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo)/.test(l));
+  return labels.some((l) => /^(advanceTo|flankTo|climbTo|moveToBreach|retreatTo|moveToSpot)/.test(l));
+}
+
+// a unit "fired" if it took a shot or ran an engage-from-position burst (the macro)
+function fired(labels: string[]): boolean {
+  return labels.some((l) => /^(takeShot|engageFrom)/.test(l));
 }
 
 // ---------------------------------------------------------------- domain validity
@@ -56,7 +61,7 @@ test("squad: a lone NPC with line of sight engages and neutralizes the target", 
   sim.run(400);
   const player = sim.world.actors.get("player")!;
   assert.equal(player.alive, false, "player neutralized");
-  assert.ok(stepStarts(sim, "E").some((l) => l.startsWith("takeShot")), "the NPC fired");
+  assert.ok(fired(stepStarts(sim, "E")), "the NPC fired");
 });
 
 // ---------------------------------------------------------------- A: search-derived flanking (E1)
@@ -201,11 +206,13 @@ test("squad: cover reservation — two NPCs never share a slot and split to dist
     const claimed = f.units.filter((u) => u.alive && u.cover).map((u) => u.cover);
     assert.equal(new Set(claimed).size, claimed.length, `distinct covers @ t=${f.clock}`);
   }
-  // the reservation pushed the two NPCs onto BOTH line-of-fire covers (they would
-  // both have greedily taken the nearer one)
+  // the reservation pushed the NPCs to split across distinct firing positions rather
+  // than piling onto the single nearest one (they claimed ≥2 different slots)
   const claimedEver = new Set<string>();
   for (const f of frames) for (const [c, owner] of Object.entries(f.reservations)) if (owner) claimedEver.add(c);
-  assert.ok(claimedEver.has("cL") && claimedEver.has("cR"), "the NPCs split across both line-of-fire covers");
+  assert.ok(claimedEver.size >= 2, "the NPCs split across at least two distinct cover/firing slots");
+  // and both reached a line of fire — the target took fire from the flanking positions
+  assert.ok(sim.world.actors.get("player")!.hp < 100, "the split NPCs earned a line of fire and engaged");
   // the loser reacted to the slot being taken (fluent-precise replan)
   assert.ok(
     sim.trace.some((t) => t.e.t === "replan.dirty"),
@@ -226,7 +233,7 @@ test("squad: an allied companion auto-assists — engages the enemy, never a fri
   const sim = new SquadSim(inst, { seed: 6 });
   sim.run(400);
   assert.equal(sim.world.actors.get("enemy")!.alive, false, "the ally neutralized the enemy");
-  assert.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally engaged");
+  assert.ok(fired(stepStarts(sim, "ally")), "the ally engaged");
 });
 
 test("squad: with only friendlies present the ally holds fire (no friendly targeting)", () => {
@@ -240,7 +247,7 @@ test("squad: with only friendlies present the ally holds fire (no friendly targe
   const sim = new SquadSim(inst, { seed: 6 });
   for (let i = 0; i < 60; i++) sim.step();
   assert.equal(sim.world.actors.get("player")!.hp, 100, "the friendly is untouched");
-  assert.not.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally never fired");
+  assert.not.ok(fired(stepStarts(sim, "ally")), "the ally never fired");
   assert.not.equal(sim.units[0].planner.getStatus(), "failed", "no fight to pick ⇒ the ally idles, it doesn't fail-loop");
 });
 
@@ -259,7 +266,7 @@ test("squad: a player 'regroup' order swaps the ally's goal and it obeys (setGoa
   };
   const sim = new SquadSim(inst, { seed: 2 });
   for (let i = 0; i < 25; i++) sim.step();
-  assert.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally was engaging before the order");
+  assert.ok(fired(stepStarts(sim, "ally")), "the ally was engaging before the order");
 
   const before = sim.trace.length;
   sim.command("ally", "regroup"); // ← player order, routed through setGoals
@@ -433,6 +440,52 @@ test("squad: a target in cover takes far fewer hits than the same target in the 
   const coverHp = run(true);
   assert.ok(openHp < 100, "the exposed target actually took fire");
   assert.ok(coverHp > openHp + 20, `cover kept the target alive longer (cover=${coverHp} vs open=${openHp})`);
+});
+
+// ---------------------------------------------------------------- F: reads-the-room positioning
+
+test("squad: a unit relocates to fight FROM cover instead of trading shots in the open", () => {
+  // a lone shooter, a stationary target, and a crate the shooter can tuck behind to
+  // deny the target its line. The unit should move into cover and fire from exposure 0.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -8, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 8 },
+    ],
+    covers: [{ name: "crate", x: 0, z: -3 }],
+  };
+  const sim = new SquadSim(inst, { seed: 3 });
+  const world = sim.world as SquadWorld;
+  let coveredShots = 0;
+  let exposedShots = 0;
+  for (let i = 0; i < 120 && sim.world.actors.get("P")!.alive; i++) {
+    const f = sim.step();
+    const e = f.units.find((u) => u.name === "E")!;
+    if (e.action.startsWith("firing")) {
+      const a = world.actors.get("E")!;
+      if (world.exposureAt(a.x, a.z, [{ x: 8 * 0, z: 8 }]) === 0) coveredShots++;
+      else exposedShots++;
+    }
+  }
+  assert.ok(moved(stepStarts(sim, "E")), "the unit repositioned rather than firing from spawn");
+  assert.ok(coveredShots > exposedShots, `it fought mostly from cover (covered=${coveredShots} exposed=${exposedShots})`);
+});
+
+test("squad: with NO cover available the unit still engages and resolves the fight", () => {
+  // contrast: drop the crate. With nothing to tuck behind the unit can't fight from
+  // cover, but it still closes in / engages and neutralizes — positioning is a
+  // preference layered on top of a reliable engagement, not a way to stall.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -8, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 8 },
+    ],
+    covers: [{ name: "post", x: 0, z: -8, flank: true }], // an open anchor, not a crate
+  };
+  const sim = new SquadSim(inst, { seed: 3 });
+  sim.run(400);
+  assert.ok(fired(stepStarts(sim, "E")), "it engaged the target");
+  assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized it without any cover to use");
 });
 
 // ---------------------------------------------------------------- F: multi-enemy belief
