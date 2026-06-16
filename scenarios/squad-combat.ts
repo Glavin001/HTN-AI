@@ -283,7 +283,8 @@ export const squadDomain: DomainDoc = {
     // --- threat (belief; perception gates by line-of-sight + memory) ---
     { name: "threatPos", kind: "vec2" },
     { name: "threatHp", kind: "float", initial: 100 },
-    { name: "threatSeen", kind: "boolean", initial: false },
+    { name: "threatSeen", kind: "boolean", initial: false }, // have a current line of sight
+    { name: "hasThreat", kind: "boolean", initial: false }, // have a position fix at all (sight OR hearing)
     // --- squad blackboard (belief; written by the coordinator) ---
     { name: "flankerReady", kind: "boolean", initial: false },
     { name: "stackedReady", kind: "boolean", initial: false },
@@ -297,7 +298,7 @@ export const squadDomain: DomainDoc = {
     // a claim by one unit dirties this for the others, who then replan to a free slot
     { name: "coverTaken", params: [{ name: "c", type: "cover" }], kind: "boolean", initial: false },
   ],
-  compounds: [{ name: "Fight" }],
+  compounds: [{ name: "Fight" }, { name: "Regroup" }],
   operators: [
     {
       // seek a free cover (the workhorse move; GOAP picks WHICH cover gives LOS)
@@ -373,6 +374,7 @@ export const squadDomain: DomainDoc = {
       // fire on the threat; reactively aborts the instant line-of-sight is lost
       name: "takeShot",
       pre: F.and(
+        F.lit("hasThreat"),
         F.ext("canSee", [], ["myPos", "threatPos"]),
         F.gt(N.fl("myAmmo"), N.c(0)),
         F.gt(N.fl("threatHp"), N.c(0)),
@@ -386,7 +388,7 @@ export const squadDomain: DomainDoc = {
     {
       // suppressing fire: pins the target so a flanker can move (chips little HP)
       name: "suppress",
-      pre: F.and(F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
       verify: F.ext("canSee", [], ["myPos", "threatPos"]),
       eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.c(SUPPRESS_DAMAGE), "planOnly")],
       cost: 1,
@@ -449,11 +451,27 @@ export const squadDomain: DomainDoc = {
         { achieve: F.lte(N.fl("threatHp"), N.c(0)) },
       ],
     },
-    // 5. default → neutralize the threat (GOAP discovers seek-LOS-cover + fire)
+    // 5. no threat fix at all → stand by in short beats (reactively wakes on contact)
+    {
+      name: "idle",
+      task: "Fight",
+      pre: F.not(F.lit("hasThreat")),
+      subtasks: [{ hold: 0.5 }],
+    },
+    // 6. default → neutralize the threat (GOAP discovers seek-LOS-cover + fire)
     {
       name: "assault",
       task: "Fight",
       subtasks: [{ achieve: F.lte(N.fl("threatHp"), N.c(0)) }],
+    },
+    // player order: fall back to a rally point (HTN — a direct decomposition, no
+    // goal search; the `setGoals` seam routes "regroup" here)
+    {
+      name: "regroupTo",
+      task: "Regroup",
+      params: [{ name: "r", type: "cover" }],
+      pre: F.and(F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
+      subtasks: [{ do: "retreatTo", args: ["?r"] }],
     },
   ],
 };
@@ -727,6 +745,8 @@ export class SquadSim {
       setBeliefVec(p, "threatPos", heard.x, heard.z);
       setBelief(p, "threatHp", [], heard.hp);
     }
+    setBelief(p, "hasThreat", [], !!heard);
+    setBelief(p, "myCover", [], a.cover ?? false); // reconcile claimed cover (for the regroup goal)
     for (const c of this.world.covers) {
       const owner = this.world.coverOwner.get(c.name) ?? null;
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
@@ -737,6 +757,32 @@ export class SquadSim {
 
   private countBreachers(): number {
     return Math.max(1, this.units.filter((u) => u.side === "enemy").length);
+  }
+
+  /** a fallen unit releases its cover reservation (so the slot frees up). */
+  private reapDead(): void {
+    for (const a of this.world.actors.values()) {
+      if (a.alive) continue;
+      for (const [c, owner] of this.world.coverOwner) if (owner === a.name) this.world.coverOwner.set(c, null);
+      a.cover = null;
+    }
+  }
+
+  /**
+   * Issue a player order to a unit — the `setGoals` seam (a stand-in for an LLM
+   * goal selector). The companion ally otherwise auto-assists; a command swaps its
+   * active goal, which the reactive planner picks up on the next tick.
+   */
+  command(unit: string, order: "engage" | "regroup" | "holdFire"): void {
+    const p = this.units.find((u) => u.name === unit);
+    if (!p) return;
+    if (order === "regroup") {
+      p.planner.setGoals([{ kind: "task", name: "Regroup" }]);
+    } else if (order === "holdFire") {
+      p.planner.setGoals([]); // stand down
+    } else {
+      p.planner.setGoals([{ kind: "task", name: "Fight" }]);
+    }
   }
 
   // ---- the squad coordinator: assigns roles/tactic into each unit's belief ----
@@ -795,6 +841,7 @@ export class SquadSim {
       if (!(this.world.actors.get(p.name)?.alive ?? false)) continue;
       p.planner.tick({ nodes: this.nodes });
     }
+    this.reapDead();
     this.emitBarks();
     return this.snapshot();
   }

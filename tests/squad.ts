@@ -204,6 +204,65 @@ test("squad: cover reservation — two NPCs never share a slot and split to dist
   );
 });
 
+// ---------------------------------------------------------------- C: ally companion
+
+test("squad: an allied companion auto-assists — engages the enemy, never a friendly", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "ally", side: "ally", x: 0, z: 0 },
+      { name: "enemy", side: "enemy", x: 8, z: 0 },
+    ],
+    covers: [{ name: "c", x: 0, z: 0 }],
+  };
+  const sim = new SquadSim(inst, { seed: 6 });
+  sim.run(400);
+  assert.equal(sim.world.actors.get("enemy")!.alive, false, "the ally neutralized the enemy");
+  assert.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally engaged");
+});
+
+test("squad: with only friendlies present the ally holds fire (no friendly targeting)", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "ally", side: "ally", x: 0, z: 0 },
+      { name: "player", side: "player", x: 3, z: 0 },
+    ],
+    covers: [{ name: "c", x: 0, z: 0 }],
+  };
+  const sim = new SquadSim(inst, { seed: 6 });
+  for (let i = 0; i < 60; i++) sim.step();
+  assert.equal(sim.world.actors.get("player")!.hp, 100, "the friendly is untouched");
+  assert.not.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally never fired");
+  assert.not.equal(sim.units[0].planner.getStatus(), "failed", "no fight to pick ⇒ the ally idles, it doesn't fail-loop");
+});
+
+// ---------------------------------------------------------------- E2: player command via setGoals
+
+test("squad: a player 'regroup' order swaps the ally's goal and it obeys (setGoals seam)", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "ally", side: "ally", x: 0, z: 0 },
+      { name: "enemy", side: "enemy", x: 10, z: 0, hp: 30 }, // a brief contact the ally wins
+    ],
+    covers: [
+      { name: "post", x: 1, z: 0 },
+      { name: "rally", x: -9, z: 0, rally: true },
+    ],
+  };
+  const sim = new SquadSim(inst, { seed: 2 });
+  for (let i = 0; i < 25; i++) sim.step();
+  assert.ok(stepStarts(sim, "ally").some((l) => l.startsWith("takeShot")), "the ally was engaging before the order");
+
+  const before = sim.trace.length;
+  sim.command("ally", "regroup"); // ← player order, routed through setGoals
+  for (let i = 0; i < 150 && sim.world.actors.get("ally")!.cover !== "rally"; i++) sim.step();
+
+  assert.equal(sim.world.actors.get("ally")!.cover, "rally", "the ally fell back to the rally point on command");
+  assert.ok(
+    sim.trace.slice(before).some((t) => t.unit === "ally" && (t.e.t === "plan.new" || t.e.t === "step.start")),
+    "the order triggered a fresh plan",
+  );
+});
+
 // ---------------------------------------------------------------- exports sanity
 
 test("squad: TraceEvent type is re-exported through scenarios", () => {
