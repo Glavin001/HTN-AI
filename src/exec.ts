@@ -63,9 +63,17 @@ export interface PlannerOptions {
    * serializable subgoals — e.g. "every one of these cells ends up holding a
    * block". Handing such a conjunction to ONE search blows up combinatorially
    * (every ordering and object↔slot assignment is a distinct state); serializing
-   * turns it into N small searches. It is only complete when the subgoals don't
-   * clobber one another, so the domain/caller is responsible for that independence
-   * (in the wall demo, source-gated grab guarantees a placed block is never undone).
+   * turns it into N small searches.
+   *
+   * CAVEAT — completeness. Solving subgoals one at a time *with commitment* (no
+   * backtracking across them) is only complete when they are independent: a later
+   * subgoal must never require undoing an earlier one. Blind serialization is
+   * incomplete in general (cf. the Sussman anomaly, where "A on B" and "B on C"
+   * interfere). So this is an opt-in search strategy, and the DOMAIN is responsible
+   * for the independence it assumes — e.g. in the wall demo, source-gated `grab`
+   * makes a laid block ungrabbable and `place` reaches one level up, so cells never
+   * clobber one another. When a subgoal genuinely can't be met from the committed
+   * state the planner reports `failed`; it never silently returns a wrong result.
    */
   goalAgenda?: boolean;
 }
