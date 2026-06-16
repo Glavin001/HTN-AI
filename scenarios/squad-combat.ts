@@ -1413,6 +1413,10 @@ export class SquadSim {
   private readonly barkAuthor: BarkAuthor;
   /** positioning engine ("mixed" when chosen per-side) — see SquadSimOptions.positioning */
   public readonly positioning: "spotgraph" | "goap" | "mixed";
+  /** the invisible tactical standing positions the planner chooses among (grid + cover
+   *  edges) — the discrete candidate set the spot search/route scores each beat. The
+   *  view renders these so you can watch which the planner considers and picks. */
+  public readonly spots: { name: string; x: number; z: number }[];
   private readonly modeOf: (side: Side) => "spotgraph" | "goap";
   private playerLeg = 0;
   private playerLegT = 0;
@@ -1427,7 +1431,9 @@ export class SquadSim {
     this.positioning = typeof pos === "function" ? "mixed" : pos;
     // augment the map with invisible tactical standing positions (grid + cover edges)
     // the planner can reposition to — fluid movement, not a handful of waypoints
-    const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...generateTacticalSpots(inst)] };
+    const tacticalSpots = generateTacticalSpots(inst);
+    this.spots = tacticalSpots.map((c) => ({ name: c.name, x: c.x, z: c.z }));
+    const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...tacticalSpots] };
     this.world = new SquadWorld(augmented);
     if (inst.breach) this.world.team("enemy").tactic = "breach"; // the attacking team breaches
     let seedBump = 0;

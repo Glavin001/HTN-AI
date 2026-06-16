@@ -28,8 +28,29 @@ function actionIcon(action: string): string {
 interface SceneProps {
   frame: SquadFrame;
   instance: SquadInstance;
+  /** the discrete tactical positions the planner scores + chooses among */
+  spots?: { name: string; x: number; z: number }[];
   selected: string | null;
   onSelect: (name: string) => void;
+}
+
+/** The candidate positions the spot search considers, drawn as faint floor markers so
+ *  you can see the discrete option space. The one the SELECTED unit is currently moving
+ *  to (parsed from its plan step) lights up — that's the choice the search just made. */
+function TacticalSpots({ spots, chosen }: { spots: { name: string; x: number; z: number }[]; chosen: string | null }) {
+  return (
+    <group>
+      {spots.map((s) => {
+        const isChosen = s.name === chosen;
+        return (
+          <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.015, s.z]}>
+            <circleGeometry args={[isChosen ? 0.34 : 0.12, isChosen ? 24 : 10]} />
+            <meshBasicMaterial color={isChosen ? "#38bdf8" : "#3b4763"} transparent opacity={isChosen ? 0.85 : 0.28} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      })}
+    </group>
+  );
 }
 
 function unitPos(u: UnitFrame): THREE.Vector3 {
@@ -197,7 +218,7 @@ function Wall({ x, z, w, d, door, broken }: { x: number; z: number; w: number; d
   );
 }
 
-function Scene({ frame, instance, selected, onSelect }: SceneProps) {
+function Scene({ frame, instance, spots = [], selected, onSelect }: SceneProps) {
   const center = useMemo<[number, number, number]>(() => {
     const xs = instance.units.map((u) => u.x).concat(instance.covers.map((c) => c.x));
     const zs = instance.units.map((u) => u.z).concat(instance.covers.map((c) => c.z));
@@ -229,6 +250,19 @@ function Scene({ frame, instance, selected, onSelect }: SceneProps) {
     return best;
   }, [sel, frame]);
 
+  // the spot the selected unit is currently moving to — parsed from its plan step
+  // (e.g. "moveFree(spot12)" / "moveToSpot(crNW)"). This is the search's live choice.
+  const chosenSpot = useMemo(() => {
+    if (!sel || !sel.alive) return null;
+    const m = /\((\w+)\)/.exec(sel.step ?? "");
+    return m ? m[1] : null;
+  }, [sel]);
+  const chosenPos = useMemo(() => {
+    if (!chosenSpot) return null;
+    const s = spots.find((p) => p.name === chosenSpot) ?? instance.covers.find((c) => c.name === chosenSpot);
+    return s ? new THREE.Vector3(s.x, 0.05, s.z) : null;
+  }, [chosenSpot, spots, instance]);
+
   return (
     <>
       <PerspectiveCamera makeDefault position={[center[0], 20, center[2] + 13]} fov={40} />
@@ -247,6 +281,14 @@ function Scene({ frame, instance, selected, onSelect }: SceneProps) {
       {(instance.walls ?? []).map((w, i) => (
         <Wall key={i} {...w} broken={frame.doorBroken} />
       ))}
+
+      {/* the discrete candidate positions the planner scores each beat */}
+      <TacticalSpots spots={spots} chosen={chosenSpot} />
+
+      {/* the move the SELECTED unit's search just committed to (unit → chosen spot) */}
+      {sel && sel.alive && chosenPos && (
+        <Line points={[unitPos(sel).setY(0.05), chosenPos]} color="#38bdf8" lineWidth={1.5} dashed dashSize={0.3} gapSize={0.2} transparent opacity={0.8} />
+      )}
 
       {instance.covers.map((c) => {
         const owner = frame.reservations[c.name] ?? null;

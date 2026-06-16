@@ -55,6 +55,7 @@ interface SquadView {
   trace: { unit: string; e: TraceEvent }[];
   units: string[];
   instance: SquadInstance;
+  spots: { name: string; x: number; z: number }[];
 }
 
 export default function Page() {
@@ -104,10 +105,10 @@ export default function Page() {
   // unified squad view (live OR replay)
   const squad: SquadView | null = isLive
     ? live.frame && live.instance
-      ? { frame: live.frame, trace: live.trace, units: live.units, instance: live.instance }
+      ? { frame: live.frame, trace: live.trace, units: live.units, instance: live.instance, spots: live.spots }
       : null
     : run?.kind === "squad"
-      ? { frame: run.data.frames[Math.min(step, lastStep)], trace: run.data.trace, units: run.data.units, instance: run.data.instance }
+      ? { frame: run.data.frames[Math.min(step, lastStep)], trace: run.data.trace, units: run.data.units, instance: run.data.instance, spots: run.data.spots }
       : null;
 
   const trace = squad ? squad.trace.map((t) => t.e) : run && run.kind !== "squad" ? run.data.trace : [];
@@ -128,7 +129,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {squad && (
           <div className="hud-top">

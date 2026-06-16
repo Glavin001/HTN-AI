@@ -18,6 +18,7 @@ export interface LiveSquad {
   trace: { unit: string; e: TraceEvent }[];
   units: string[];
   instance: SquadInstance | null;
+  spots: { name: string; x: number; z: number }[];
   playing: boolean;
   setPlaying: (p: boolean) => void;
   reset: () => void;
@@ -44,7 +45,7 @@ export function useLiveSquad(scenario: SquadScenarioId | null, stepMs: number): 
     }
     const inst = squadInstance(scenario);
     instRef.current = inst;
-    simRef.current = new SquadSim(inst, { seed: 1 });
+    simRef.current = new SquadSim(inst, { seed: 1, positioning: "goap" });
     setFrame(simRef.current.snapshot());
     setLastOrder(null);
     setPlaying(true);
@@ -91,6 +92,7 @@ export function useLiveSquad(scenario: SquadScenarioId | null, stepMs: number): 
     trace: simRef.current?.trace ?? [],
     units: simRef.current?.units.map((u) => u.name) ?? [],
     instance: instRef.current,
+    spots: simRef.current?.spots ?? [],
     playing,
     setPlaying,
     reset,
