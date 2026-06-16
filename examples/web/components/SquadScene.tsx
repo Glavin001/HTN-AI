@@ -426,6 +426,45 @@ function Wall({ x, z, w, d, door, broken }: { x: number; z: number; w: number; d
   );
 }
 
+/** Where the selected unit BELIEVES the enemy is, when that diverges from reality —
+ *  a translucent "ghost" at the last-known position with a dotted leash to the real
+ *  position. Makes stale belief (a unit acting on outdated info, getting flanked)
+ *  visible: the unit plans/scores against the ghost, not the truth. */
+function BeliefGhosts({ believed, actual, color }: { believed: { x: number; z: number }[]; actual: { x: number; z: number }[]; color: string }) {
+  return (
+    <group>
+      {believed.map((b, i) => {
+        let nearest = Infinity;
+        let near: { x: number; z: number } | null = null;
+        for (const a of actual) {
+          const d = Math.hypot(a.x - b.x, a.z - b.z);
+          if (d < nearest) { nearest = d; near = a; }
+        }
+        if (nearest <= 1.4) return null; // belief matches reality → nothing to show
+        const g = new THREE.Vector3(b.x, 0.45, b.z);
+        return (
+          <group key={i}>
+            <mesh position={[b.x, 0.45 + CHEST, b.z]}>
+              <sphereGeometry args={[0.34, 12, 12]} />
+              <meshBasicMaterial color={color} transparent opacity={0.22} />
+            </mesh>
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[b.x, 0.02, b.z]}>
+              <ringGeometry args={[0.42, 0.54, 24]} />
+              <meshBasicMaterial color={color} transparent opacity={0.4} side={THREE.DoubleSide} />
+            </mesh>
+            {near && (
+              <Line points={[g.clone().setY(0.05), new THREE.Vector3(near.x, 0.05, near.z)]} color={color} lineWidth={1} dashed dashSize={0.12} gapSize={0.12} transparent opacity={0.4} />
+            )}
+            <Html position={[b.x, 1.1, b.z]} center distanceFactor={18} style={{ pointerEvents: "none" }}>
+              <div style={{ fontSize: 8, color, fontFamily: "monospace", opacity: 0.8, whiteSpace: "nowrap" }}>thinks enemy here</div>
+            </Html>
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 /** The selected unit's line of sight to its target — green if it has a shot, red if blocked. */
 function SightLine({ from, to, hasShot }: { from: THREE.Vector3; to: THREE.Vector3; hasShot: boolean }) {
   const a = from.clone().setY(from.y + CHEST);
@@ -603,6 +642,11 @@ function Scene({ frame, instance, spots = [], heatMode = "belief", showThinking,
             <meshBasicMaterial color="#38bdf8" transparent opacity={0.45} side={THREE.DoubleSide} />
           </mesh>
           {selTarget && <SightLine from={selPos} to={unitPos(selTarget)} hasShot={sel.sees === selTarget.name} />}
+          <BeliefGhosts
+            believed={sel.believedFoes}
+            actual={frame.units.filter((e) => e.alive && (HOSTILE[sel.side] ?? []).includes(e.side)).map((e) => ({ x: e.x, z: e.z }))}
+            color={SIDE_COLOR[(HOSTILE[sel.side] ?? [])[0] ?? ""] ?? "#ef4444"}
+          />
           {incoming.map((e) => (
             <Line
               key={`in-${e.name}`}
