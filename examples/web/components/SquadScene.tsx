@@ -30,6 +30,8 @@ interface SceneProps {
   instance: SquadInstance;
   /** the discrete tactical positions the planner scores + chooses among */
   spots?: { name: string; x: number; z: number }[];
+  /** score spots against the unit's BELIEF (what it knows) or ground TRUTH */
+  heatMode?: "belief" | "truth";
   selected: string | null;
   onSelect: (name: string) => void;
 }
@@ -254,7 +256,7 @@ function Wall({ x, z, w, d, door, broken }: { x: number; z: number; w: number; d
   );
 }
 
-function Scene({ frame, instance, spots = [], selected, onSelect }: SceneProps) {
+function Scene({ frame, instance, spots = [], heatMode = "belief", selected, onSelect }: SceneProps) {
   const center = useMemo<[number, number, number]>(() => {
     const xs = instance.units.map((u) => u.x).concat(instance.covers.map((c) => c.x));
     const zs = instance.units.map((u) => u.z).concat(instance.covers.map((c) => c.z));
@@ -291,12 +293,17 @@ function Scene({ frame, instance, spots = [], selected, onSelect }: SceneProps) 
   const world = useMemo(() => new SquadWorld(instance), [instance]);
 
   // the potential field FOR THE SELECTED UNIT: score every candidate spot by its
-  // risk/reward against the enemies' CURRENT positions this frame (so it shifts as
-  // they move). Drives the heatmap tint.
+  // risk/reward. "belief" = against what the unit KNOWS (the positions it's actually
+  // planning against); "truth" = against the enemies' real positions this frame. Either
+  // way it shifts as the fight moves.
   const heat = useMemo<Heat | null>(() => {
-    if (!sel || !sel.alive || !selTarget || spots.length === 0) return null;
-    const foes = frame.units.filter((u) => u.alive && (HOSTILE[sel.side] ?? []).includes(u.side)).map((u) => ({ x: u.x, z: u.z }));
-    const threat = { x: selTarget.x, z: selTarget.z };
+    if (!sel || !sel.alive || spots.length === 0) return null;
+    const threat = heatMode === "belief" ? sel.believedThreat : selTarget ? { x: selTarget.x, z: selTarget.z } : null;
+    if (!threat) return null; // belief: the unit knows of no threat → no field to paint
+    const foes =
+      heatMode === "belief"
+        ? sel.believedFoes
+        : frame.units.filter((u) => u.alive && (HOSTILE[sel.side] ?? []).includes(u.side)).map((u) => ({ x: u.x, z: u.z }));
     const evals = new Map<string, SpotEval>();
     let lo = Infinity;
     let hi = -Infinity;
@@ -306,7 +313,7 @@ function Scene({ frame, instance, spots = [], selected, onSelect }: SceneProps) 
       if (e.firing) { lo = Math.min(lo, e.cost); hi = Math.max(hi, e.cost); }
     }
     return { evals, lo, hi };
-  }, [sel, selTarget, spots, frame, world]);
+  }, [sel, selTarget, spots, frame, world, heatMode]);
 
   // the spot the selected unit is currently moving to — parsed from its plan step
   // (e.g. "moveFree(spot12)" / "moveToSpot(crNW)"). This is the search's live choice.

@@ -67,6 +67,7 @@ export default function Page() {
   const [speed, setSpeed] = useState(450);
   const [liveStepMs, setLiveStepMs] = useState(90);
   const [selected, setSelected] = useState<string | null>(null);
+  const [heatMode, setHeatMode] = useState<"belief" | "truth">("belief");
 
   const isLive = scenario === "companion";
   const live = useLiveSquad(isLive ? "companion" : null, liveStepMs);
@@ -129,7 +130,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} heatMode={heatMode} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {squad && (
           <div className="hud-top">
@@ -149,6 +150,21 @@ export default function Page() {
             <span><i className="dot" style={{ background: "#3b82f6" }} />Blue team</span>
             <span><i className="dash" style={{ background: "#34d399" }} />line of fire</span>
             <span><i className="dash" style={{ background: "#ef4444" }} />blocked</span>
+          </div>
+        )}
+        {squad && (
+          <div className="hud-heat mono" style={{ position: "absolute", left: 12, bottom: 12, display: "flex", gap: 8, alignItems: "center", fontSize: 11, background: "rgba(11,14,20,0.7)", padding: "5px 9px", borderRadius: 6, color: "#9fb0c8" }}>
+            <span>spot field:</span>
+            {(["belief", "truth"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setHeatMode(m)}
+                style={{ fontSize: 11, padding: "2px 8px", borderRadius: 4, cursor: "pointer", border: "1px solid " + (heatMode === m ? "#38bdf8" : "#2a3650"), background: heatMode === m ? "rgba(56,189,248,0.18)" : "transparent", color: heatMode === m ? "#7dd3fc" : "#7c8aa3" }}
+              >
+                {m === "belief" ? "what it knows" : "ground truth"}
+              </button>
+            ))}
+            <span style={{ opacity: 0.7 }}>· select a unit · 🟢 safe → 🔴 exposed · grey = no shot</span>
           </div>
         )}
         {narration && <div className="hud-narration">{narration}</div>}

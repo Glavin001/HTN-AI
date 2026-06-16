@@ -1387,6 +1387,11 @@ export interface UnitFrame {
   /** plain-English read of the unit's current tactical posture (glass-box director):
    *  whether it is in cover, how many enemies can shoot it, and its range to the threat */
   posture: string;
+  /** the unit's BELIEVED primary threat position (null when it knows of no threat) —
+   *  what it scores spots against, for a belief-honest heatmap */
+  believedThreat: { x: number; z: number } | null;
+  /** the unit's BELIEVED positions of foes it thinks are alive */
+  believedFoes: { x: number; z: number }[];
 }
 
 export interface TeamFrame {
@@ -1821,11 +1826,21 @@ export class SquadSim {
         let firingAt: string | null = null;
         let firingKind: UnitFrame["firingKind"] = null;
         let sees: string | null = null;
+        // the unit's BELIEF of where the enemy is — what it actually scores spots
+        // against (vs ground truth), captured so the view can paint a belief-honest field
+        let believedThreat: { x: number; z: number } | null = null;
+        let believedFoes: { x: number; z: number }[] = [];
         if (up && a.alive) {
           sees = this.world.nearestHostile(a.name, true)?.name ?? null;
           if (stepLabel.startsWith("takeShot") || stepLabel.startsWith("engageFrom")) { firingKind = "shot"; firingAt = sees; }
           else if (stepLabel.startsWith("suppress")) { firingKind = "suppress"; firingAt = sees; }
           else if (stepLabel.startsWith("breach")) { firingKind = "breach"; firingAt = this.world.nearestHostile(a.name, false)?.name ?? null; }
+          const st = up.planner.state;
+          if (st.get(up.model.slotOf("hasThreat")) > 0.5) {
+            const tp = up.model.slotOf("threatPos");
+            believedThreat = { x: round(st.get(tp)), z: round(st.get(tp + 1)) };
+          }
+          believedFoes = this.believedFoePositions(up).map((f) => ({ x: round(f.x), z: round(f.z) }));
         }
         return {
           name: a.name,
@@ -1853,6 +1868,8 @@ export class SquadSim {
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
           why: up ? up.why : [],
           posture: up && a.alive ? this.describePosture(a) : "—",
+          believedThreat,
+          believedFoes,
         };
       }),
     };
