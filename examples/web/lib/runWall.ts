@@ -7,12 +7,12 @@
  * a block. The planner decomposes that structure into per-slot pickup-and-place
  * sub-goals and we record the build, frame by frame.
  */
-import { Planner, task, type TraceEvent } from "htn-ai";
+import { Planner, type TraceEvent } from "htn-ai";
 import {
-  WALL_SLOT_HEIGHT,
+  BLOCK_HEIGHT,
+  wallGoals,
   wallInstance,
   wallModel,
-  wallSources,
   type WallInstance,
 } from "@scenarios/wall";
 
@@ -48,7 +48,7 @@ export interface WallRun {
   goalText: string;
 }
 
-const SLOT = WALL_SLOT_HEIGHT;
+const SLOT = BLOCK_HEIGHT;
 
 export function runWall(): WallRun {
   const inst: WallInstance = wallInstance();
@@ -58,7 +58,9 @@ export function runWall(): WallRun {
   const trace: TraceEvent[] = [];
   let t = 0;
   const planner = new Planner(model, {
-    goals: [task("BuildWall")],
+    // the wall is a COMPOSITION of the generic PlaceBlockAt building block — one
+    // goal per slot, not a bespoke "build wall" task
+    goals: wallGoals(inst.targets),
     now: () => t,
     seed: 1,
     trace: (e) => trace.push(e),
@@ -91,7 +93,7 @@ export function runWall(): WallRun {
   return {
     cells: inst.cells.map((c) => ({ name: c.name, x: c.x, z: c.z })),
     targets: inst.targets,
-    sources: wallSources(inst),
+    sources: inst.sources,
     core: inst.core,
     frames,
     status: planner.getStatus(),

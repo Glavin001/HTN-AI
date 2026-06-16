@@ -47,7 +47,7 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerBig: { name: "Scavenger XL", kind: "grid", blurb: "A bigger 4×3 grid, a height-3 goal, seven scattered blocks. The planner harvests a pillar and stacks a 3-level structure." },
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
-  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — it's a SHAPE made of blocks: a ring that encloses a courtyard. Blocks start scattered; the planner (HTN) decomposes the wall into per-slot pickup-and-place sub-goals and lays them in order." },
+  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — it's a SHAPE made of blocks: a ring that encloses a courtyard. There's no bespoke 'build wall' task: the agent composes two generic, reusable HTN methods — FetchBlock and PlaceBlockAt(cell) — once per slot. A different structure is just a different list of PlaceBlockAt targets. Blocks are only grabbed from the scattered pile, so a laid block is never cannibalised." },
 };
 
 function buildRun(id: ScenarioId): Run {
@@ -252,6 +252,9 @@ export default function Page() {
           <div className="card">
             <h2>Goal · a structure, not a position</h2>
             <div className="mono">{run.data.goalText}</div>
+            <div className="mono" style={{ color: "var(--muted)", marginTop: 6, fontSize: 11 }}>
+              composed from reusable methods: <span style={{ color: "var(--accent-2)" }}>PlaceBlockAt(c)</span> × {run.data.targets.length} → <span style={{ color: "var(--accent-2)" }}>FetchBlock</span> → grab/place
+            </div>
             <div className="row" style={{ marginTop: 8, gap: 8 }}>
               <span className="mono" style={{ color: "var(--muted)" }}>wall laid</span>
               <input type="range" min={0} max={run.data.targets.length} step={1} value={run.data.frames[Math.min(step, lastStep)]?.placed ?? 0} readOnly style={{ flex: 1, accentColor: "#34d399" }} />

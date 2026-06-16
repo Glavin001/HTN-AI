@@ -71,12 +71,18 @@ Each scene below drives the same reactive `Planner`:
   of cells that must each hold a block, enclosing a central courtyard. Blocks start
   **scattered** around the yard. Laying all eight slots in one flat GOAP search
   blows up combinatorially (symmetric block↔slot assignments × free movement), so
-  the wall is an **HTN compound** (`BuildWall`) that decomposes the structure into
-  ordered, *cumulative* per-slot `achieve` sub-goals — each a small pickup-and-place
-  the GOAP layer solves on its own. Same planner that times out on the flat goal
-  finishes the decomposed one in milliseconds; the cumulative sub-goals also stop a
-  later placement from robbing a block already in the wall. The yard ends tidy
-  (eight blocks, eight slots). See [`../../tests/wall.ts`](../../tests/wall.ts).
+  instead of a bespoke "build wall" task the domain ships two **composable, reusable
+  HTN methods**: `FetchBlock` (be holding a block) and `PlaceBlockAt(cell)` (fetch
+  one, deliver it — composes `FetchBlock`). A *structure* is then just a
+  **composition** of them — a list of `PlaceBlockAt(c)` goals, one per cell of the
+  shape — so a wall, a tower, an L, or a line all reuse the exact same methods; only
+  the cell list (pure data) changes. Two domain rules keep the composition robust
+  without any shape-aware coordination: `grab` may only take from a **`source`**
+  cell (the scatter pile), so a laid block is never cannibalised and each placement
+  is independent/order-free; and the same one-level climb + `height(stand) ≥
+  height(at)` spatial gating as Scavenger World. The yard ends tidy (eight blocks,
+  eight slots). See [`../../tests/wall.ts`](../../tests/wall.ts), which also builds a
+  *different* structure from the same two methods.
 
 The right-hand panel shows the live world state, the **plan the search
 discovered**, and the planner's **`TraceEvent` stream** (so repair/replan show up
@@ -114,7 +120,7 @@ library repo).
 | World-state panel | `model.read(state, fluent, …)` over typed fluents |
 | Trace events panel | the `trace:` `TraceEvent` stream (`plan.*`, `step.*`, `repair.*`, …) |
 | Goal = a 3D coordinate | a position-only goal (`agentAt ∧ agentY`), not a prescriptive structure |
-| Goal = a block structure (wall) | an HTN compound (`BuildWall`) decomposing a shape into ordered `achieve` sub-goals |
+| Goal = a block structure (wall) | a composition of reusable HTN methods (`PlaceBlockAt(c)` → `FetchBlock`), one goal per cell |
 
 This is an intentionally small seed of the planned `@htn-ai/devtools` inspector
 and `@htn-ai/react` adapter described in `ROADMAP.md`.
