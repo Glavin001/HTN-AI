@@ -94,12 +94,9 @@ export const IDEAL_RANGE = 12; // closer than this you fight well; far costs a l
 export const SPOT_GRID = 4.2; // spacing of the auto-generated walkable grid
 export const MAX_SPOTS = 22; // cap on tactical points exposed to the planner (branching)
 
-/** Fluents every tactical external reads — listed so a foe moving (perception) or a
- *  reposition dirties the cost/precondition and the unit re-decides each beat. */
+/** Fluents the move-cost externals read — listed so a foe moving (perception) dirties
+ *  the cost and the unit re-decides each beat. */
 const TACTICAL_READS = ["myPos", "coverPos", "threatPos", "foePos", "foeAlive"];
-/** Same, plus threatHp + caution (the engagement-cost utilities weigh exposure by how
- *  hurt the target is and how cautious this unit currently is). */
-const MOVE_ENGAGE_READS = ["myPos", "coverPos", "threatPos", "threatHp", "caution", "foePos", "foeAlive"];
 
 // ---------------------------------------------------------------- instance shapes
 
@@ -553,6 +550,12 @@ export const squadDomain: DomainDoc = {
     // it when a unit is outgunned or hurt, so it values cover + breaking contact more —
     // an outnumbered unit flows to cover/escape instead of trading in the open.
     { name: "caution", kind: "float", initial: 1 },
+    // the spot-graph route's decision for THIS beat (written by perception): either
+    // "engage from where I am" or the next hop of the optimal multi-step route. The
+    // deliberation (pick a spot now because it unlocks a better one) lives in that
+    // search; the planner just enacts the decision and re-decides as the world moves.
+    { name: "engageHere", kind: "boolean", initial: false },
+    { name: "chosenSpot", kind: "entity", entityType: "cover" },
     // --- threat (belief; perception gates by line-of-sight + memory) ---
     { name: "threatPos", kind: "vec2" },
     { name: "threatHp", kind: "float", initial: 100 },
@@ -605,10 +608,10 @@ export const squadDomain: DomainDoc = {
       // firing while exposed, so "move to cover then fire" is what gets optimised.
       name: "moveToSpot",
       params: [{ name: "c", type: "cover" }],
-      pre: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("spotUseful", ["?c"], TACTICAL_READS)),
-      // abort the move the instant the slot is taken OR the spot stops being useful
-      // (a foe moved, a new one appeared on your flank — your cover just lapsed)
-      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("spotUseful", ["?c"], TACTICAL_READS)),
+      pre: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("isChosen", ["?c"], ["chosenSpot"])),
+      // abort the move the instant the slot is taken OR the route re-decides (a foe
+      // moved, a new one appeared on your flank — the chosen hop is no longer best)
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("isChosen", ["?c"], ["chosenSpot"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -822,32 +825,41 @@ export const squadDomain: DomainDoc = {
     // --- Neutralize: reload if dry, fire if there's a line of sight, else
     // reposition to a cover that geometrically has one (the flank EMERGES from
     // method selection; short reactive plans, re-entered each beat).
-    // Neutralize = pick the best PLACE to fight from, then fight. Rather than an
-    // uninformed search over move-sequences (which wanders), the planner ranks a small
-    // set of meaningful options by UTILITY — the negative of the WHOLE-engagement cost
-    // (travel + danger of crossing + the per-shot exposure summed over every shot it'll
-    // take from there). So "engage from here" is weighed directly against "relocate to
-    // each candidate firing spot, then engage", and the cheapest wins. This is bounded
-    // (O(firing positions), evaluated once), deterministic, and reads the room: it
-    // fights from cover, closes for accuracy, and breaks contact when outgunned — and
-    // because it re-ranks every beat as the world moves, the repositioning is fluid and
-    // multi-step emerges over time (move to a safer spot now, push to a stronger one as
-    // the fight shifts). The engageFrom macro keeps the action abstract so the choice
-    // stays at the human level of "take that cover", not "step 0.3m".
-    {
-      name: "repositionEngage",
-      task: "Neutralize",
-      params: [{ name: "c", type: "cover" }],
-      pre: F.and(F.lit("hasThreat"), F.not(F.lit("coverTaken", ["?c"])), F.ext("spotUseful", ["?c"], TACTICAL_READS)),
-      utility: N.sub(N.c(0), N.ext("moveEngageCost", ["?c"], MOVE_ENGAGE_READS)),
-      subtasks: [{ do: "moveToSpot", args: ["?c"] }, { do: "engageFrom" }],
-    },
+    // Neutralize ENACTS the spot-graph route computed in perception. That search is a
+    // bounded A*/Dijkstra over the discrete tactical-spot graph (≈two dozen nodes):
+    // edges are walkable hops costed by travel + the danger of crossing, and each node
+    // with a line of fire is a terminal costed by the whole engagement from there
+    // (shots-to-kill × the per-shot exposure of that spot). It returns the min-cost
+    // route to a killing position and we take its FIRST move — so the hop is chosen for
+    // the whole-route optimum (it will step through a so-so covered spot now precisely
+    // because that unlocks a much stronger angle next), which a greedy one-hop score
+    // can't do. Re-solved each beat, so it adapts as the fight moves. Two outcomes:
+    //   • engage from here (the route says this spot is already the best place), or
+    //   • move to the route's next hop, then re-decide.
     {
       name: "engageHere",
       task: "Neutralize",
-      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"])),
-      utility: N.sub(N.c(0), N.ext("engageCost", [], MOVE_ENGAGE_READS)),
+      pre: F.and(F.lit("hasThreat"), F.lit("engageHere"), F.ext("canSee", [], ["myPos", "threatPos"])),
       subtasks: [{ do: "engageFrom" }],
+    },
+    {
+      name: "advanceRoute",
+      task: "Neutralize",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("hasThreat"), F.ext("isChosen", ["?c"], ["chosenSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      subtasks: [{ do: "moveToSpot", args: ["?c"] }],
+    },
+    // fallback: there's a threat but no actionable route right now (e.g. a defender
+    // behind a closed door — you can't yet walk to any angle on them). Hold ready in
+    // short beats rather than fail; a changed world (door breached, enemy steps out)
+    // re-solves the route and wakes it. This also lets methods that embed Neutralize
+    // (the breach assault) finish planning — the kill happens reactively once a line
+    // of fire opens up.
+    {
+      name: "holdEngage",
+      task: "Neutralize",
+      pre: F.lit("hasThreat"),
+      subtasks: [{ hold: 0.4 }],
     },
     // player order: fall back to a rally point (HTN — a direct decomposition, no
     // goal search; the `setGoals` seam routes "regroup" here)
@@ -929,29 +941,10 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           if (c[0] === t[0] && c[1] === t[1]) return false;
           return world.losClear(c[0], c[1], t[0], t[1]) && dist2(c[0], c[1], t[0], t[1]) <= SIGHT_RANGE;
         },
-        // Is moving to spot `c` a useful FIRING position to relocate to? This bounds the
-        // kill-search hard: a candidate must have a line of fire on the threat (the move
-        // executor still pathfinds AROUND walls to reach it, so flanking a barricade is
-        // one move), so the search never wanders through arbitrary open ground — every
-        // hop lands somewhere you can shoot from. It must also be a genuine improvement
-        // (gain a line of fire we lack, get safer, or get closer for accuracy), which
-        // makes the recursion strictly progress and terminate. The cost model then
-        // chooses BETWEEN the qualifying firing spots (and vs engaging from here).
-        spotUseful: (q) => {
-          const c = q.vec("coverPos", q.args[0]);
-          const m = q.vec("myPos");
-          const t = q.vec("threatPos");
-          if (t[0] === 0 && t[1] === 0) return false;
-          if (!spotHasLos(world, c[0], c[1], t)) return false; // must be a firing position
-          const fb = believedFoes(q, foes);
-          const meSeen = spotHasLos(world, m[0], m[1], t);
-          if (!meSeen) return true; // we have no shot → any firing position is progress
-          const expC = world.exposureAt(c[0], c[1], fb);
-          const expMe = world.exposureAt(m[0], m[1], fb);
-          if (expC < expMe) return true; // a safer firing position
-          const closer = dist2(c[0], c[1], t[0], t[1]) < dist2(m[0], m[1], t[0], t[1]) - 2;
-          return expC === expMe && closer; // better range at no extra risk
-        },
+        // Is `c` the next hop the spot-graph route chose this beat? (entities encode as
+        // gid+1; chosenSpot holds that, 0 = none.) Lets the planner bind the route's
+        // chosen spot as the move target while staying a normal precondition.
+        isChosen: (q) => Math.round(q.get("chosenSpot")) === q.args[0] + 1,
       },
       numerics: {
         coverX: (q) => q.vec("coverPos", q.args[0])[0],
@@ -965,12 +958,7 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
           return SHOT_DAMAGE * Math.max(0.12, p);
         },
-        // --- tactical costs (the trade-off the search optimises over) ---
-        // how exposed a candidate spot is (enemies with a clear shot, cover discounted)
-        spotExposure: (q) => {
-          const c = q.vec("coverPos", q.args[0]);
-          return world.exposureAt(c[0], c[1], believedFoes(q, foes));
-        },
+        // --- tactical costs (used by operator costs + the spot-graph route) ---
         // how exposed I am RIGHT NOW — makes firing from the open costly in takeShot
         myExposure: (q) => {
           const m = q.vec("myPos");
@@ -1005,25 +993,6 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
           const exposure = world.exposureAt(m[0], m[1], believedFoes(q, foes));
           return shots * (1 + q.get("caution") * W_EXPOSE * exposure);
-        },
-        // the total cost of RELOCATING to a candidate firing spot and fighting from it:
-        // travel + the danger of crossing to it + the whole-engagement cost once there.
-        // Used as -utility, this is what lets the planner rank "move to that cover and
-        // fight" against "fight from here" and pick the cheaper — a bounded, direct
-        // choice instead of an unbounded move-sequence search.
-        moveEngageCost: (q) => {
-          const m = q.vec("myPos");
-          const c = q.vec("coverPos", q.args[0]);
-          const t = q.vec("threatPos");
-          const fb = believedFoes(q, foes);
-          let path = 0;
-          for (const k of [0.34, 0.67]) path += world.exposureAt(m[0] + (c[0] - m[0]) * k, m[1] + (c[1] - m[1]) * k, fb);
-          const moveCost = W_MOVE * dist2(m[0], m[1], c[0], c[1]) + W_PATH_EXPOSE * (path * 0.5);
-          let p = rangeFalloff(dist2(c[0], c[1], t[0], t[1]));
-          if (world.inCoverVs(t[0], t[1], c[0], c[1])) p *= COVER_HIT_MULT;
-          const dmg = SHOT_DAMAGE * Math.max(0.12, p);
-          const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
-          return moveCost + shots * (1 + q.get("caution") * W_EXPOSE * world.exposureAt(c[0], c[1], fb));
         },
         // projected duration of that engagement (shots-to-kill × aim time), so a scoped
         // deadline or a racing flanker is reasoned about over the real firefight length
@@ -1408,6 +1377,110 @@ export class SquadSim {
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
     }
     setBelief(p, "flankerReady", [], this.world.team(p.side).flankerReady);
+    // the DEEP decision: solve the spot-graph route from belief and write the result
+    // the planner enacts this beat (engage from here, or the next hop toward the
+    // optimal killing position).
+    const route = this.computeEngageRoute(p);
+    setBelief(p, "engageHere", [], route.engageHere);
+    setBelief(p, "chosenSpot", [], route.nextSpot ?? false);
+  }
+
+  /** Believed positions of every hostile this unit currently thinks is alive (belief,
+   *  not ground truth) — the foes the route reasons about for exposure/cover. */
+  private believedFoePositions(p: UnitPlanner): { x: number; z: number }[] {
+    const out: { x: number; z: number }[] = [];
+    for (const f of p.foes) {
+      const fid = p.model.entityId(f);
+      if (p.planner.state.get(p.model.slotOf("foeAlive", fid)) < 0.5) continue;
+      const ps = p.model.slotOf("foePos", fid);
+      out.push({ x: p.planner.state.get(ps), z: p.planner.state.get(ps + 1) });
+    }
+    return out;
+  }
+
+  /**
+   * The spot-graph search — the genuinely deep, emergent positioning. Over the
+   * discrete graph of tactical positions (current spot + every cover/edge/grid spot
+   * not reserved by someone else), a Dijkstra finds the minimum-cost route to a
+   * KILLING position, where:
+   *   • a hop i→j costs travel (W_MOVE·dist) + the danger of crossing it
+   *     (W_PATH_EXPOSE · exposure sampled along the straight, walkable leg), and
+   *   • each node with a line of fire is a terminal costing the whole engagement from
+   *     there: shots-to-kill × (1 + caution·W_EXPOSE·exposure) — cover and range fold
+   *     in via shots-to-kill and exposure.
+   * It returns the FIRST hop of the optimal route (or "engage here" when staying put
+   * is the cheapest terminal). Because the whole route is costed, it will deliberately
+   * stage through a weaker covered spot when that unlocks a far better angle — the
+   * multi-step, non-greedy behaviour a one-hop score misses. Bounded (~two dozen
+   * nodes) so it is fast and deterministic, re-solved every beat.
+   */
+  private computeEngageRoute(p: UnitPlanner): { engageHere: boolean; nextSpot: string | null } {
+    const me = this.world.actors.get(p.name);
+    const st = p.planner.state;
+    const none = { engageHere: false, nextSpot: null };
+    if (!me || st.get(p.model.slotOf("hasThreat")) < 0.5) return none;
+    const tp = p.model.slotOf("threatPos");
+    const threat = { x: st.get(tp), z: st.get(tp + 1) };
+    const threatHp = st.get(p.model.slotOf("threatHp"));
+    const caution = st.get(p.model.slotOf("caution"));
+    const foes = this.believedFoePositions(p);
+    const w = this.world;
+
+    // nodes: my current position (index 0) + every available cover/spot
+    const nodes: { x: number; z: number; name: string | null }[] = [{ x: me.x, z: me.z, name: null }];
+    for (const c of w.covers) {
+      const owner = w.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue; // someone else holds it — not a candidate
+      nodes.push({ x: c.x, z: c.z, name: c.name });
+    }
+    const n = nodes.length;
+    const crossExposure = (a: { x: number; z: number }, b: { x: number; z: number }): number => {
+      let e = 0;
+      for (const k of [0.34, 0.67]) e += w.exposureAt(a.x + (b.x - a.x) * k, a.z + (b.z - a.z) * k, foes);
+      return e * 0.5;
+    };
+    // Dijkstra over straight walkable hops (the move executor pathfinds within a hop;
+    // routes around walls emerge by stepping through corner/edge spots)
+    const dist = new Array<number>(n).fill(Infinity);
+    const prev = new Array<number>(n).fill(-1);
+    const done = new Array<boolean>(n).fill(false);
+    dist[0] = 0;
+    for (let it = 0; it < n; it++) {
+      let u = -1;
+      let best = Infinity;
+      for (let k = 0; k < n; k++) if (!done[k] && dist[k] < best) { best = dist[k]; u = k; }
+      if (u < 0) break;
+      done[u] = true;
+      for (let v = 0; v < n; v++) {
+        if (v === u || done[v]) continue;
+        if (!w.losClear(nodes[u].x, nodes[u].z, nodes[v].x, nodes[v].z)) continue; // not a straight walkable hop
+        const step = W_MOVE * dist2(nodes[u].x, nodes[u].z, nodes[v].x, nodes[v].z) + W_PATH_EXPOSE * crossExposure(nodes[u], nodes[v]);
+        if (dist[u] + step < dist[v]) { dist[v] = dist[u] + step; prev[v] = u; }
+      }
+    }
+    // pick the cheapest KILLING terminal: route cost to a node with a line of fire +
+    // the whole-engagement cost from it
+    const engageCostAt = (node: { x: number; z: number }): number => {
+      let hit = rangeFalloff(dist2(node.x, node.z, threat.x, threat.z));
+      if (w.inCoverVs(threat.x, threat.z, node.x, node.z)) hit *= COVER_HIT_MULT;
+      const dmg = SHOT_DAMAGE * Math.max(0.12, hit);
+      const shots = Math.max(1, Math.ceil(threatHp / dmg));
+      return shots * (1 + caution * W_EXPOSE * w.exposureAt(node.x, node.z, foes));
+    };
+    let bestNode = -1;
+    let bestTotal = Infinity;
+    for (let i = 0; i < n; i++) {
+      if (dist[i] === Infinity) continue;
+      if (!spotHasLos(w, nodes[i].x, nodes[i].z, [threat.x, threat.z])) continue; // not a firing position
+      const total = dist[i] + engageCostAt(nodes[i]);
+      if (total < bestTotal) { bestTotal = total; bestNode = i; }
+    }
+    if (bestNode < 0) return none; // no reachable line of fire (boxed in) → hold
+    if (bestNode === 0) return { engageHere: true, nextSpot: null }; // here IS the best place
+    // walk the route back to the first hop out of the current node
+    let cur = bestNode;
+    while (prev[cur] !== 0 && prev[cur] !== -1) cur = prev[cur];
+    return { engageHere: false, nextSpot: nodes[cur].name };
   }
 
   /** a fallen unit releases its cover reservation (so the slot frees up). */

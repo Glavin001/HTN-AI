@@ -488,6 +488,33 @@ test("squad: with NO cover available the unit still engages and resolves the fig
   assert.equal(sim.world.actors.get("P")!.alive, false, "and neutralized it without any cover to use");
 });
 
+// ---------------------------------------------------------------- F: spot-graph multi-hop routing
+
+test("squad: the spot-graph route composes a multi-hop path around a barricade to earn a line of fire", () => {
+  // a wall sits between E and P; no single straight hop reaches a firing angle, so the
+  // route must STAGE through an intermediate spot then push to the spot that sees P.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 12 },
+    ],
+    covers: [
+      { name: "cNear", x: 0, z: 2 },
+      { name: "fSide", x: 8, z: 8, flank: true },
+    ],
+    walls: [{ x: -3, z: 5, w: 6, d: 1 }],
+  };
+  const sim = new SquadSim(inst, { seed: 3 });
+  const hops = new Set<string>();
+  for (let i = 0; i < 300 && sim.world.actors.get("P")!.alive; i++) {
+    const f = sim.step();
+    const e = f.units.find((u) => u.name === "E")!;
+    if (e.step.startsWith("moveToSpot")) hops.add(e.step);
+  }
+  assert.ok(hops.size >= 2, `the route staged through ≥2 distinct spots around the wall (saw ${hops.size}: ${[...hops]})`);
+  assert.equal(sim.world.actors.get("P")!.alive, false, "and reached a firing angle to neutralize the target");
+});
+
 // ---------------------------------------------------------------- F: caution (outgunned ⇒ value safety)
 
 test("squad: an outgunned unit becomes more cautious than one fighting even odds", () => {
