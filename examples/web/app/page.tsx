@@ -15,19 +15,33 @@ import {
   type SquadScenarioId,
 } from "../lib/runSquad";
 import { useLiveSquad, type Order } from "../lib/useLiveSquad";
+import {
+  SOLO_IDS,
+  type ProfileId,
+  type SoloScenarioId,
+  runSoloScenario,
+  soloComparison,
+  soloHasPersonalityToggle,
+  soloNarration,
+  soloScenarioBlurb,
+  soloScenarioName,
+  soloWhatToWatch,
+} from "../lib/runSolo";
 import type { SquadFrame, SquadInstance } from "@scenarios/squad-combat";
+import type { SoloRun } from "@scenarios/solo-combat";
 import type { TraceEvent } from "htn-ai";
 
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
 const SquadScene = dynamic(() => import("../components/SquadScene"), { ssr: false });
+const SoloScene = dynamic(() => import("../components/SoloScene"), { ssr: false });
 import SquadDirector from "../components/SquadDirector";
 
 type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
-type ScenarioId = GridId | "blocks" | SquadScenarioId;
-type Kind = "grid" | "blocks" | "squad";
+type ScenarioId = GridId | "blocks" | SquadScenarioId | SoloScenarioId;
+type Kind = "grid" | "blocks" | "squad" | "solo";
 
-type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun } | { kind: "squad"; data: SquadRun };
+type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun } | { kind: "squad"; data: SquadRun } | { kind: "solo"; data: SoloRun };
 
 const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }> = {
   skirmish: { name: "★ Skirmish: Red vs Blue", kind: "squad", blurb: "Two AI squads fight autonomously. Each unit plans from its OWN belief (no shared memory across teams) and reactively readjusts as it discovers the other's moves." },
@@ -41,12 +55,14 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerBig: { name: "Scavenger XL", kind: "grid", blurb: "A bigger 4×3 grid, a height-3 goal, seven scattered blocks. The planner harvests a pillar and stacks a 3-level structure." },
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
+  ...(Object.fromEntries(SOLO_IDS.map((id) => [id, { name: soloScenarioName(id), blurb: soloScenarioBlurb(id), kind: "solo" as Kind }])) as Record<SoloScenarioId, { name: string; blurb: string; kind: Kind }>),
 };
 
-function buildRun(id: ScenarioId): Run {
+function buildRun(id: ScenarioId, profile: ProfileId): Run {
   const kind = SCENARIOS[id].kind;
   if (kind === "blocks") return { kind: "blocks", data: runBlocks() };
   if (kind === "squad") return { kind: "squad", data: runSquad(id as SquadScenarioId) };
+  if (kind === "solo") return { kind: "solo", data: runSoloScenario(id as SoloScenarioId, profile) };
   return { kind: "grid", data: runScenario(id as GridId) };
 }
 
@@ -59,7 +75,7 @@ interface SquadView {
 }
 
 export default function Page() {
-  const [scenario, setScenario] = useState<ScenarioId>("skirmish");
+  const [scenario, setScenario] = useState<ScenarioId>("personality");
   const [run, setRun] = useState<Run | null>(null);
   const [computing, setComputing] = useState(true);
   const [step, setStep] = useState(0);
@@ -67,9 +83,11 @@ export default function Page() {
   const [speed, setSpeed] = useState(450);
   const [liveStepMs, setLiveStepMs] = useState(90);
   const [selected, setSelected] = useState<string | null>(null);
+  const [profile, setProfile] = useState<ProfileId>("aggressive");
   const [heatMode, setHeatMode] = useState<"belief" | "truth">("belief");
 
   const isLive = scenario === "companion";
+  const isSolo = SCENARIOS[scenario].kind === "solo";
   const live = useLiveSquad(isLive ? "companion" : null, liveStepMs);
 
   // build the deterministic replay for everything EXCEPT the live companion battle
@@ -79,7 +97,7 @@ export default function Page() {
     setRun(null);
     setStep(0);
     const id = setTimeout(() => {
-      const r = buildRun(scenario);
+      const r = buildRun(scenario, profile);
       setRun(r);
       setComputing(false);
       setPlaying(true);
@@ -87,7 +105,7 @@ export default function Page() {
     }, 30);
     return () => clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario]);
+  }, [scenario, profile]);
 
   const frameCount = run ? run.data.frames.length : 0;
   const lastStep = Math.max(frameCount - 1, 0);
@@ -116,9 +134,11 @@ export default function Page() {
   const summary = useMemo(() => (squad ? squadTraceSummary(squad.trace) : traceSummary(trace)), [squad, trace]);
   const interesting = useMemo(() => summary.filter((s) => /repair|replan|fail|scope|drift/.test(s.label)), [summary]);
 
-  const narration = squad ? squadNarration(squad.frame) : "";
-  const watch = SCENARIOS[scenario].kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
-  const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : "—";
+  const soloFrame = run?.kind === "solo" ? run.data.frames[Math.min(step, lastStep)] : null;
+  const narration = squad ? squadNarration(squad.frame) : soloFrame ? soloNarration(soloFrame) : "";
+  const comparison = useMemo(() => (isSolo ? soloComparison(scenario as SoloScenarioId, profile) : null), [isSolo, scenario, profile]);
+  const watch = isSolo ? soloWhatToWatch(scenario as SoloScenarioId) : SCENARIOS[scenario].kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
+  const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : soloFrame ? soloOutcome(soloFrame) : "—";
 
   return (
     <div className="app">
@@ -131,6 +151,7 @@ export default function Page() {
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
         {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} heatMode={heatMode} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {run?.kind === "solo" && soloFrame && <SoloScene key="solo" frame={soloFrame} instance={run.data.instance} />}
 
         {squad && (
           <div className="hud-top">
@@ -183,16 +204,47 @@ export default function Page() {
           <h2>Scenario</h2>
           <div className="row spread">
             <select value={scenario} onChange={(e) => { setScenario(e.target.value as ScenarioId); setSelected(null); }}>
+              <optgroup label="Single-agent (game AI)">
+                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind === "solo").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
+              </optgroup>
               <optgroup label="Squad combat (game AI)">
                 {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind === "squad").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
               </optgroup>
               <optgroup label="Spatial planning">
-                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind !== "squad").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
+                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind !== "squad" && SCENARIOS[id].kind !== "solo").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
               </optgroup>
             </select>
             <span className={`pill ${/eliminated|succeeded/.test(status) ? "good" : status === "failed" ? "bad" : "busy"}`}>{status}</span>
           </div>
         </div>
+
+        {isSolo && soloFrame && (
+          <div className="card">
+            <h2>Single-agent NPC · glass-box</h2>
+            <div className="row" style={{ marginBottom: 8, gap: 6, alignItems: "center" }}>
+              <span className="mono" style={{ color: soloHasPersonalityToggle(scenario as SoloScenarioId) ? "var(--accent-2)" : "var(--muted)" }}>
+                personality{soloHasPersonalityToggle(scenario as SoloScenarioId) ? " ← toggle me" : ""}
+              </span>
+              {(["aggressive", "defensive"] as ProfileId[]).map((p) => (
+                <button key={p} className={profile === p ? "primary" : ""} onClick={() => setProfile(p)}>{p}</button>
+              ))}
+            </div>
+            <div className="mono" style={{ lineHeight: 1.7 }}>
+              <div>posture: <span style={{ color: "var(--accent-2)" }}>{soloFrame.npc.posture}</span> · {soloFrame.npc.action}</div>
+              <div>exposure: <span style={{ color: soloFrame.npc.exposure > 0 ? "#ef4444" : "#22c55e" }}>{soloFrame.npc.exposure > 0 ? `in the open (×${soloFrame.npc.exposure})` : "shielded"}</span></div>
+              <div>HP: {soloFrame.npc.hp} · ammo: {soloFrame.npc.ammo}</div>
+              <div style={{ color: "var(--muted)" }}>data-only: same domain + library, only the profile differs</div>
+            </div>
+            {comparison && (
+              <div className="mono" style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--border)", lineHeight: 1.7 }}>
+                <div style={{ color: "var(--muted)", marginBottom: 2 }}>greedy vs lookahead (expected-HP cost):</div>
+                <div>🔴 greedy: <b>{comparison.greedy.label}</b> from the open — cost <b style={{ color: "#ef4444" }}>{comparison.greedy.cost.toFixed(1)}</b></div>
+                <div>🟢 lookahead: <b>{comparison.planner.steps.join(" → ") || "—"}</b> — cost <b style={{ color: "#22c55e" }}>{comparison.planner.cost.toFixed(1)}</b></div>
+                <div style={{ color: "var(--muted)" }}>the planner relocates to cover: {(100 - (100 * comparison.planner.cost) / Math.max(comparison.greedy.cost, 1e-6)).toFixed(0)}% cheaper over the fight</div>
+              </div>
+            )}
+          </div>
+        )}
 
         {isLive && (
           <div className="card">
@@ -273,5 +325,11 @@ export default function Page() {
 function outcome(f: SquadFrame): string {
   const dead = f.teams.filter((t) => t.alive === 0);
   if (dead.length) return `${teamName(dead[0].side)} eliminated`;
+  return "engaging";
+}
+
+function soloOutcome(f: SoloRun["frames"][number]): string {
+  if (!f.npc.alive) return "NPC down";
+  if (f.threats.length === 0 || f.threats.every((t) => !t.alive)) return "threat eliminated";
   return "engaging";
 }

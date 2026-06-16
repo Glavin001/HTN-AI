@@ -109,3 +109,16 @@ export { validatePlan, simulatePlan, applicableActions, planSummary, explainFail
 
 // Determinism
 export { createRng, type Rng } from "./rng";
+
+// Utility scoring (IAUS) — scored selection for the planner's `utility` seam
+export {
+  curve,
+  scoreOption,
+  rankOptions,
+  type ResponseCurve,
+  type Consideration,
+  type ScoredOption,
+} from "./iaus";
+
+// Expected-HP combat currency — multi-objective cost in one risk-aversion knob
+export { exchangeCost, type ShotParams, type ExchangeInput, type ExchangeCost } from "./combat-model";
