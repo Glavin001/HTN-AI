@@ -5,13 +5,14 @@
  * executed step. The goal is NOT a position to stand at: it is a *structure* — an
  * octagonal ring of cells that must each become two blocks tall.
  *
- * The wall is handed over as a COMPOSITION of the generic PlaceBlockAt building
- * block (one goal per cell), and the Planner runs in `goalAgenda` mode so it
- * serialises them: plan one placement, commit, plan the next — the standard fix for
- * a conjunction of independent sub-goals that would otherwise blow up one-shot.
+ * The wall is handed over as ONE declarative goal (`∧ height(cell) ≥ 2`); the
+ * domain has only goto/grab/place, so the planner DISCOVERS pickup-and-place by
+ * search. The Planner runs in `goalAgenda` mode, which splits the conjunction into
+ * per-cell subgoals and commits to them one at a time — the standard fix for a
+ * conjunction of independent sub-goals that would otherwise blow up one-shot.
  */
-import { Planner, type TraceEvent } from "htn-ai";
-import { wallGoals, wallInstance, wallModel, type WallInstance } from "@scenarios/wall";
+import { Planner, goal, type TraceEvent } from "htn-ai";
+import { wallGoal, wallInstance, wallModel, type WallInstance } from "@scenarios/wall";
 
 export interface WallCell {
   name: string;
@@ -56,9 +57,10 @@ export function runWall(): WallRun {
   const trace: TraceEvent[] = [];
   let t = 0;
   const planner = new Planner(model, {
-    // the wall is a COMPOSITION of the generic PlaceBlockAt building block — one
-    // goal per slot — and goalAgenda serialises them (plan one, commit, next)
-    goals: wallGoals(inst.targets),
+    // ONE declarative goal: "every wall cell ends up wantHeight tall". goalAgenda
+    // splits that conjunction into per-cell subgoals and serialises them; the
+    // planner discovers the goto/grab/place actions for each by search.
+    goals: [goal(wallGoal(inst))],
     goalAgenda: true,
     weight: 3,
     maxNodes: 200_000,

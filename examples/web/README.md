@@ -67,27 +67,23 @@ Each scene below drives the same reactive `Planner`:
   the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
   The naive order deadlocks, so the planner interleaves subgoals.
 - **Build a wall (structure goal)** ([`../../scenarios/wall.ts`](../../scenarios/wall.ts)) —
-  the goal is **not a position to stand at** but a **shape made of blocks**: an
-  octagonal ring (a 5×5 perimeter minus its corners — 12 cells), built **two courses
-  tall**, enclosing a central courtyard, on a 9×9 yard. Blocks start **scattered**
-  just outside the ring. This is the demo's *scale* lesson, and it has two parts:
+  the goal is **not a position to stand at**, and **not a recipe** either. It is one
+  **declarative end-state**: `∧ height(cell) ≥ 2` over an octagonal ring (a 5×5
+  perimeter minus its corners — 12 cells) enclosing a courtyard on a 9×9 yard. The
+  domain has only the primitive operators `goto` / `grab` / `place` — **no "build
+  wall" task, no "place a block here" method**. The planner is told *what the world
+  should look like*, never *how*, and **discovers** pickup-and-place by search.
 
-  - **Composable methods, not a macro.** There's no bespoke "build wall" task — that
-    wouldn't match a different shape. The domain ships two small, reusable HTN
-    building blocks: `FetchBlock` (be holding a block) and `PlaceBlockAt(cell)`
-    (raise a cell to its target height, composing `FetchBlock`). A *structure* is
-    just a **composition** of them — a list of `PlaceBlockAt(c)` goals, one per cell
-    — so a wall, a tower, an L, or a line all reuse the same methods; only the cell
-    list (data) changes. `tests/wall.ts` builds a free-standing 2-tall tower from the
-    same methods to prove it.
-  - **Goal-agenda serialization.** Laying an N-cell wall is a conjunction of N
-    near-identical, serializable sub-goals; one search over that conjunction blows up
-    combinatorially (every ordering and block↔slot assignment is a distinct state).
-    The standard symbolic-planning fix is to **serialize**: solve one sub-goal,
-    commit, plan the next from the reached state. The reactive `Planner`'s new
-    **`goalAgenda: true`** option does exactly this, turning one exponential search
-    into N small ones — cost grows *linearly* in cells, so a 9×9 / 24-block wall
-    plans in well under a second.
+  The lesson is *scale*. Laying an N-cell wall is a conjunction of N near-identical,
+  serializable sub-goals; one search over the whole conjunction blows up
+  combinatorially (every ordering and block↔slot assignment is a distinct state).
+  The standard symbolic-planning fix is to **serialize** — and the reactive
+  `Planner`'s **`goalAgenda: true`** option does it generically: it **splits a
+  declarative conjunction `goal(a ∧ b ∧ …)` into its conjuncts itself** and commits
+  to them one at a time (solve, commit, plan the next from the reached state). The
+  agenda comes from the goal's own structure, not from the caller naming a task per
+  cell — so one exponential search becomes N small ones, *linear* in cells (the
+  9×9 / 24-block wall plans in well under a second).
 
   Two domain rules make serialization **sound** (sub-goals never clobber each other):
   `grab` may only take from a **`source`** cell (the scatter pile), so a laid block
@@ -95,7 +91,8 @@ Each scene below drives the same reactive `Planner`:
   (`height(stand) ≥ height(at) − 1`, mirroring `grab`), so a 2-course wall is laid
   from the ground without ever climbing the half-built wall — each cell independent.
   The yard ends tidy (24 blocks, 24 slots; courtyard left clear). See
-  [`../../tests/wall.ts`](../../tests/wall.ts).
+  [`../../tests/wall.ts`](../../tests/wall.ts), which also builds a *different*
+  structure (a free-standing 2-tall tower) from the same operators and goal form.
 
 The right-hand panel shows the live world state, the **plan the search
 discovered**, and the planner's **`TraceEvent` stream** (so repair/replan show up
@@ -133,7 +130,7 @@ library repo).
 | World-state panel | `model.read(state, fluent, …)` over typed fluents |
 | Trace events panel | the `trace:` `TraceEvent` stream (`plan.*`, `step.*`, `repair.*`, …) |
 | Goal = a 3D coordinate | a position-only goal (`agentAt ∧ agentY`), not a prescriptive structure |
-| Goal = a block structure (wall) | composable methods (`PlaceBlockAt(c)` → `FetchBlock`) + `goalAgenda` serialization of the per-cell sub-goals |
+| Goal = a block structure (wall) | one declarative `∧ height(cell) ≥ k`; `goalAgenda` auto-splits the conjunction and serialises; placements are discovered, not prescribed |
 
 This is an intentionally small seed of the planned `@htn-ai/devtools` inspector
 and `@htn-ai/react` adapter described in `ROADMAP.md`.

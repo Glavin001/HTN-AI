@@ -1,27 +1,24 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
 import { Planner, goal, planOnce, type Model, type Snap } from "../src/index";
-import {
-  wallGoal,
-  wallGoals,
-  wallInstance,
-  wallModel,
-  type WallInstance,
-} from "../scenarios/wall";
+import { wallGoal, wallInstance, wallModel, type WallInstance } from "../scenarios/wall";
 
 /**
- * Construction World — a *structure-building* scenario (the goal is a shape made of
- * blocks, not a position), built from two composable HTN blocks (FetchBlock,
- * PlaceBlockAt) and solved by serialising the per-cell sub-goals. These tests pin:
+ * Construction World — a *structure-building* scenario whose goal is purely
+ * DECLARATIVE: a final-state condition ("every wall cell ends up wantHeight tall").
+ * The domain has only primitive operators (goto / grab / place) — no BuildWall
+ * task, no PlaceBlockAt method — so the planner must DISCOVER pickup-and-place by
+ * search. These tests pin:
  *
- *   1. The flat conjunctive goal (lay the whole wall in one GOAP search) is the
- *      hard case — it should NOT solve under a sane budget. That's why we serialise.
- *   2. The wall, composed of PlaceBlockAt goals and run with goalAgenda, builds
- *      every slot to full height, tidy (every scattered block consumed), courtyard
- *      left clear.
+ *   1. The declarative goal handed to one joint search blows up — that's the
+ *      motivation for serializing.
+ *   2. With `goalAgenda`, the single conjunctive goal is auto-split into per-cell
+ *      subgoals and solved tidily — every slot at height, every scattered block
+ *      consumed, courtyard left clear — having DISCOVERED goto/grab/place.
  *   3. source-gated grab means a placed block is never cannibalised.
- *   4. The same two methods build a *different* structure (a free-standing tower) —
- *      the methods are reusable building blocks, not a wall-specific macro.
+ *   4. The agenda advances through every subgoal before reporting success.
+ *   5. The same domain builds a *different* structure (a 2-tall tower) from the
+ *      same declarative goal form — nothing is wall-specific.
  */
 
 const runToEnd = (planner: Planner): void => {
@@ -33,17 +30,21 @@ const runToEnd = (planner: Planner): void => {
 const builtCount = (model: Model, snap: Snap, inst: WallInstance): number =>
   inst.targets.filter((c) => (model.read(snap, "height", c) as number) >= inst.wantHeight).length;
 
-test("construction: the flat conjunctive goal blows up one-shot GOAP (motivates serialization)", () => {
+test("construction: the declarative goal handed to one joint search blows up (motivates serialization)", () => {
   const inst = wallInstance();
   const model = wallModel(inst);
+  // no goalAgenda → the whole conjunction is one search
   const result = planOnce(model, model.createExecState(), { goals: [goal(wallGoal(inst))], weight: 3, heuristic: "hadd", maxNodes: 80_000 });
   assert.equal(result.status, "failure", "the whole wall in one search should exhaust the budget — that's why we serialize");
 });
 
-test("construction: the wall (composed PlaceBlockAt goals + goalAgenda) builds every slot, tidy", () => {
+test("construction: goalAgenda splits the declarative goal, discovers grab/place, builds tidily", () => {
   const inst = wallInstance();
   const model = wallModel(inst);
-  const planner = new Planner(model, { goals: wallGoals(inst.targets), goalAgenda: true, weight: 3, maxNodes: 200_000, now: () => 0, seed: 1 });
+  // ONE declarative goal — the planner splits the conjunction itself
+  const planner = new Planner(model, { goals: [goal(wallGoal(inst))], goalAgenda: true, weight: 3, maxNodes: 200_000, now: () => 0, seed: 1 });
+  assert.equal(planner.goalCount(), inst.targets.length, "the conjunction is auto-split into one subgoal per cell");
+
   runToEnd(planner);
   assert.equal(planner.getStatus(), "succeeded");
 
@@ -59,28 +60,17 @@ test("construction: the wall (composed PlaceBlockAt goals + goalAgenda) builds e
   assert.equal(model.read(planner.state, "height", inst.core), 0, "the courtyard core stays clear");
 });
 
-test("construction: goalAgenda reports succeeded only after the LAST sub-goal", () => {
+test("construction: the placement actions are DISCOVERED, not prescribed", () => {
   const inst = wallInstance();
   const model = wallModel(inst);
-  const planner = new Planner(model, { goals: wallGoals(inst.targets), goalAgenda: true, weight: 3, maxNodes: 200_000, now: () => 0, seed: 1 });
-  // it should march through the agenda, not finish after the first committed slot
-  let maxCursor = 0;
-  for (let i = 0; i < 20000 && planner.getStatus() !== "succeeded" && planner.getStatus() !== "failed"; i++) {
-    planner.tick({ ms: 30 });
-    maxCursor = Math.max(maxCursor, planner.activeGoalIndex());
-  }
-  assert.equal(planner.getStatus(), "succeeded");
-  assert.equal(planner.goalCount(), inst.targets.length);
-  assert.equal(maxCursor, inst.targets.length - 1, "the agenda cursor should advance to the final sub-goal");
-});
-
-test("construction: source-gated grab means a placed block is never cannibalised", () => {
-  const inst = wallInstance();
-  const model = wallModel(inst);
-  const start = model.createExecState();
-  // plan a single slot and check every grab targets a source cell
-  const result = planOnce(model, start, { goals: wallGoals([inst.targets[0]]), weight: 3 });
+  // a single cell's subgoal is solved by raw operator search over the declarative state
+  const result = planOnce(model, model.createExecState(), { goals: [goal(wallGoal({ ...inst, targets: [inst.targets[0]] }))], weight: 3 });
   assert.equal(result.status, "success");
+  const ops = result.plan!.steps.filter((s) => s.k === "op").map((s) => (s.k === "op" ? s.g.op.name : ""));
+  // the planner found it must grab and place — those were never named in the goal
+  assert.ok(ops.includes("grab"), "planner should discover it must grab a block");
+  assert.ok(ops.includes("place"), "planner should discover it must place a block");
+  // and every grab is from the scatter pile (so a laid block is never cannibalised)
   for (const step of result.plan!.steps) {
     if (step.k === "op" && step.g.op.name === "grab") {
       const at = model.entityName(step.g.b[step.g.b.length - 1]);
@@ -89,9 +79,22 @@ test("construction: source-gated grab means a placed block is never cannibalised
   }
 });
 
-test("construction: the SAME building blocks build a different structure (a 2-tall tower)", () => {
-  // a short corridor: blocks scattered on the ends, a single cell to stack 2 high
-  // in the middle. No new methods — just a different PlaceBlockAt target + wantHeight.
+test("construction: the agenda advances through every subgoal before succeeding", () => {
+  const inst = wallInstance();
+  const model = wallModel(inst);
+  const planner = new Planner(model, { goals: [goal(wallGoal(inst))], goalAgenda: true, weight: 3, maxNodes: 200_000, now: () => 0, seed: 1 });
+  let maxCursor = 0;
+  for (let i = 0; i < 20000 && planner.getStatus() !== "succeeded" && planner.getStatus() !== "failed"; i++) {
+    planner.tick({ ms: 30 });
+    maxCursor = Math.max(maxCursor, planner.activeGoalIndex());
+  }
+  assert.equal(planner.getStatus(), "succeeded");
+  assert.equal(maxCursor, inst.targets.length - 1, "the agenda cursor should reach the final subgoal");
+});
+
+test("construction: the SAME declarative domain builds a different structure (a 2-tall tower)", () => {
+  // a short corridor: blocks scattered on the ends, one middle cell to stack 2 high.
+  // Only the goal/wantHeight differs — no new domain knowledge.
   const nm = (x: number) => `c${x}`;
   const towerInst: WallInstance = {
     cells: [
@@ -108,9 +111,9 @@ test("construction: the SAME building blocks build a different structure (a 2-ta
     core: nm(2),
   };
   const model = wallModel(towerInst);
-  const planner = new Planner(model, { goals: wallGoals(towerInst.targets), goalAgenda: true, weight: 3, now: () => 0, seed: 1 });
+  const planner = new Planner(model, { goals: [goal(wallGoal(towerInst))], goalAgenda: true, weight: 3, now: () => 0, seed: 1 });
   runToEnd(planner);
-  assert.equal(planner.getStatus(), "succeeded", "the generic PlaceBlockAt method builds any structure, not just the wall");
+  assert.equal(planner.getStatus(), "succeeded", "the same operators + declarative goal build any structure");
   assert.equal(model.read(planner.state, "height", nm(2)), 2, "the tower must be two blocks tall");
 });
 

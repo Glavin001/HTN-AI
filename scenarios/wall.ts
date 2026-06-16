@@ -3,22 +3,21 @@
  * made of blocks at specific cells), not a position to stand at. The wall demo is
  * one instance; the domain itself is generic.
  *
- * Two ideas carry the scenario:
+ * The goal is purely DECLARATIVE: a final-state condition — "every wall cell ends
+ * up `wantHeight` blocks tall". The domain has only primitive operators (goto /
+ * grab / place); there is no `BuildWall` task, no `PlaceBlockAt` method, nothing
+ * telling the agent *how* to satisfy that state. The planner DISCOVERS that it
+ * must walk to a scattered block, pick it up, carry it, and set it down — and does
+ * so for each cell — purely from search over the operators.
  *
- * 1. COMPOSABLE METHODS. There is no bespoke "build wall" task. The domain ships
- *    two small, reusable HTN building blocks — FetchBlock (be holding a block) and
- *    PlaceBlockAt(cell) (raise a cell to its target height, composing FetchBlock).
- *    A *structure* is just a COMPOSITION: a list of PlaceBlockAt(c) goals, one per
- *    cell of the shape. A wall, a tower, a line, an L — all reuse the same methods;
- *    only the cell list (data) changes.
- *
- * 2. GOAL-AGENDA SERIALIZATION. Laying an N-cell wall is a conjunction of N
- *    near-identical, serializable sub-goals. Handed to ONE search that conjunction
- *    blows up combinatorially (every ordering and block↔slot assignment is a
- *    distinct state). The standard symbolic-planning fix is to *serialize*: solve
- *    one sub-goal, commit, then plan the next from the reached state. The Planner's
- *    `goalAgenda` mode does exactly this, turning one exponential search into N
- *    small ones — cost grows linearly in cells instead of factorially.
+ * The only non-obvious part is making that tractable at scale. Laying an N-cell
+ * wall is a conjunction of N near-identical, serializable sub-goals; one search
+ * over the whole conjunction blows up combinatorially (every ordering and block↔
+ * slot assignment is a distinct state). The standard symbolic-planning fix is to
+ * *serialize*: the Planner's `goalAgenda` mode automatically splits the declarative
+ * conjunction into its per-cell conjuncts and commits to them one at a time —
+ * turning one exponential search into N small ones, linear in cells. The agenda is
+ * derived from the goal's own structure, not prescribed by the caller.
  *
  * Serialization is only sound if the sub-goals don't clobber each other, which two
  * domain rules guarantee:
@@ -32,23 +31,19 @@
  */
 import {
   type DomainDoc,
-  type GoalSpec,
+  type Formula,
   type Model,
   E,
   F,
   N,
-  achieve,
   createModel,
-  doTask,
-  task,
 } from "../src/index";
 import type { CellSpec } from "./staircase";
 
 /**
- * The generic construction domain: spatial pickup-and-place plus the two
- * composable building blocks. Nothing here mentions a wall, a ring, or any
- * particular cell — the shape lives entirely in the goal list and in each cell's
- * `wantHeight`.
+ * The generic construction domain: just the primitive spatial actions. Nothing
+ * here mentions a wall, a ring, or how to build anything — the desired shape lives
+ * entirely in the declarative goal and in each cell's static `wantHeight`.
  */
 export const constructionDomain: DomainDoc = {
   name: "construction-world",
@@ -108,23 +103,6 @@ export const constructionDomain: DomainDoc = {
       cost: 1,
     },
   ],
-  compounds: [
-    { name: "FetchBlock" },
-    { name: "PlaceBlockAt", params: [{ name: "c", type: "cell" }] },
-  ],
-  methods: [
-    // FetchBlock — be holding a block.
-    { task: "FetchBlock", name: "alreadyHolding", pre: F.lit("holding"), subtasks: [] },
-    // otherwise let GOAP route to a source pile and grab one (grab is source-gated)
-    { task: "FetchBlock", name: "grabFromPile", subtasks: [achieve(F.lit("holding"))] },
-
-    // PlaceBlockAt(c) — raise c to its target height.
-    { task: "PlaceBlockAt", name: "atHeight", pre: F.gte(N.fl("height", "?c"), N.fl("wantHeight", "?c")), subtasks: [] },
-    // fetch a block, then let GOAP deliver it onto c (and fetch/deliver again until
-    // c reaches wantHeight). Can't re-grab while holding, and grab is source-gated,
-    // so nothing already laid moves.
-    { task: "PlaceBlockAt", name: "lay", subtasks: [doTask("FetchBlock"), achieve(F.gte(N.fl("height", "?c"), N.fl("wantHeight", "?c")))] },
-  ],
 };
 
 export interface WallInstance {
@@ -167,18 +145,16 @@ export function wallModel(inst: WallInstance): Model {
 }
 
 /**
- * The structure goal, *composed* from the reusable building block: one
- * `PlaceBlockAt(c)` per target cell. Swap the cell list and the same methods build
- * any other shape. Hand this list to a Planner with `goalAgenda: true` so the
- * sub-goals are serialized (one committed placement at a time).
+ * The DECLARATIVE structure goal: a final-state condition — every target cell ends
+ * up `wantHeight` blocks tall. This is the *only* thing describing the wall; it
+ * says nothing about picking up or placing blocks. Hand it to a Planner with
+ * `goalAgenda: true` and the planner splits the conjunction into per-cell subgoals,
+ * serializes them, and discovers the goto/grab/place actions for each by search.
+ *
+ * Handed to a planner WITHOUT goal-agenda it is solved as one joint search — which
+ * is the combinatorial blow-up the serialization exists to avoid.
  */
-export function wallGoals(targets: string[]): GoalSpec[] {
-  return targets.map((c) => task("PlaceBlockAt", c));
-}
-
-/** The equivalent FLAT goal — every target at its height at once. Kept for
- *  reference and to show why we serialize: one GOAP search over it blows up. */
-export function wallGoal(inst: WallInstance): import("../src/index").Formula {
+export function wallGoal(inst: WallInstance): Formula {
   return F.and(...inst.targets.map((c) => F.gte(N.fl("height", c), N.c(inst.wantHeight))));
 }
 

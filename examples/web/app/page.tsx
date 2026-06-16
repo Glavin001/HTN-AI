@@ -47,7 +47,7 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerBig: { name: "Scavenger XL", kind: "grid", blurb: "A bigger 4×3 grid, a height-3 goal, seven scattered blocks. The planner harvests a pillar and stacks a 3-level structure." },
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
-  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — it's a SHAPE made of blocks: an octagonal ring, two courses tall, enclosing a courtyard. No bespoke 'build wall' task exists: the agent composes two generic, reusable HTN methods — PlaceBlockAt(cell) → FetchBlock — once per slot. A flat 12-slot goal would blow up one search, so the planner runs in goal-agenda mode and serialises it: lay one slot, commit, plan the next. Blocks come only from the scattered pile, so a laid block is never cannibalised — which is what makes serialising sound." },
+  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — and it isn't a recipe either. It's one DECLARATIVE end-state: 'every cell of this octagonal ring ends up two blocks tall.' The domain has only goto / grab / place; nothing tells the agent to pick up or place anything. The planner DISCOVERS pickup-and-place by search. A single search over all 12 cells blows up, so the planner runs in goal-agenda mode: it splits the conjunction into per-cell subgoals and commits to them one at a time. Blocks come only from the scattered pile, so a laid block is never cannibalised — which is what makes serialising sound." },
 };
 
 function buildRun(id: ScenarioId): Run {
@@ -279,14 +279,15 @@ export default function Page() {
               <div className="card">
                 <h2>How the planner solves it</h2>
                 <div className="mono" style={{ fontSize: 11, lineHeight: 1.7 }}>
-                  <div>goal = <span style={{ color: "var(--accent-2)" }}>PlaceBlockAt(cell)</span> × {run.data.targets.length} &nbsp;<span style={{ color: "var(--muted)" }}>// a composition, not a bespoke task</span></div>
-                  <div style={{ paddingLeft: 14 }}>└─ <span style={{ color: "var(--accent-2)" }}>FetchBlock</span> → <span style={{ color: "var(--accent)" }}>grab</span> (from pile) → <span style={{ color: "var(--accent)" }}>place</span></div>
+                  <div><span style={{ color: "var(--muted)" }}>goal (declarative):</span> <span style={{ color: "var(--accent-2)" }}>∧ height(cell) ≥ {want}</span> over {run.data.targets.length} cells</div>
+                  <div><span style={{ color: "var(--muted)" }}>domain ops:</span> <span style={{ color: "var(--accent)" }}>goto · grab · place</span> &nbsp;<span style={{ color: "var(--muted)" }}>// no &quot;build&quot; task</span></div>
+                  <div style={{ marginTop: 2 }}>planner <b style={{ color: "var(--accent-2)" }}>discovers</b> grab→carry→place per cell</div>
                 </div>
                 <div className="mono" style={{ color: "var(--muted)", marginTop: 8, fontSize: 11 }}>
-                  <b style={{ color: "var(--accent-2)" }}>goalAgenda</b>: the 12 sub-goals are serialised — lay one slot, commit, plan the next. A flat conjunction would blow up; this stays linear.
+                  <b style={{ color: "var(--accent-2)" }}>goalAgenda</b>: splits the conjunction into {run.data.targets.length} per-cell subgoals and commits to them one at a time. A flat search over all of them blows up; this stays linear.
                 </div>
                 <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 8, background: "rgba(56,189,248,0.08)", border: "1px solid rgba(56,189,248,0.18)" }}>
-                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>now · laying slot {activeSlot}/{run.data.targets.length}</div>
+                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>now · subgoal {activeSlot}/{run.data.targets.length} (height(cell) ≥ {want})</div>
                   <div className="mono" style={{ marginTop: 2 }}><span style={{ color: phase.color }}>{phase.icon} {phase.text}</span></div>
                   <div className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{f?.action ?? "start"}</div>
                 </div>

@@ -7,7 +7,7 @@
  */
 
 import { Bindings, ExecutorApi, ExecutorFn, Model, TIMINGS_EXECUTION, TaskStatus } from "./compile";
-import { GoalSpec } from "./ir";
+import { Formula, GoalSpec } from "./ir";
 import { CLOCK_SLOT, ExecState } from "./state";
 import { Agenda, Plan, PlanResult, PlanStep, PlanningSession, Rejection, ScopeInstance, StepBudget } from "./search";
 import { Rng, createRng } from "./rng";
@@ -48,18 +48,24 @@ export interface PlannerOptions {
   /** drift tolerance: replan when actual time falls this many seconds behind projection (0 = off) */
   driftTolerance?: number;
   /**
-   * Goal-agenda (serialization) mode. When true, the `goals` list is treated as
-   * an ordered agenda of subgoals to be achieved ONE AT A TIME with commitment:
-   * the planner solves goals[0], executes it, then plans goals[1] from the
+   * Goal-agenda (serialization) mode. When true, the goal set is treated as an
+   * ordered agenda of subgoals to be achieved ONE AT A TIME with commitment: the
+   * planner solves the first subgoal, executes it, then plans the next from the
    * resulting state, and so on — only reporting `succeeded` once the last is done.
    *
+   * Crucially, a single *declarative* conjunctive goal — `goal(a ∧ b ∧ c …)` — is
+   * automatically split into its conjuncts, so the caller hands over only the
+   * desired END STATE and the planner derives the subgoals from the goal's own
+   * structure (it is not told a task per conjunct). Each subgoal is then solved by
+   * ordinary search (operators discovered, not prescribed).
+   *
    * This is the standard fix for a conjunction of (largely) independent,
-   * serializable subgoals — e.g. "place a block on each of these cells". Handing
-   * such a conjunction to ONE search blows up combinatorially (every ordering and
-   * object↔slot assignment is a distinct state); serializing turns it into N
-   * small searches. It is only complete when the subgoals don't clobber one
-   * another, so the caller is responsible for ordering/independence (in the wall
-   * demo, source-gated grab guarantees a placed block is never undone).
+   * serializable subgoals — e.g. "every one of these cells ends up holding a
+   * block". Handing such a conjunction to ONE search blows up combinatorially
+   * (every ordering and object↔slot assignment is a distinct state); serializing
+   * turns it into N small searches. It is only complete when the subgoals don't
+   * clobber one another, so the domain/caller is responsible for that independence
+   * (in the wall demo, source-gated grab guarantees a placed block is never undone).
    */
   goalAgenda?: boolean;
 }
@@ -106,7 +112,7 @@ export class Planner {
     this.state = model.createExecState();
     this.rng = createRng(opts.seed ?? 0x12345678);
     this.goalAgenda = opts.goalAgenda ?? false;
-    this.allGoals = opts.goals ?? [];
+    this.allGoals = this.buildAgenda(opts.goals ?? []);
     this.goalCursor = 0;
     this.goals = this.activeGoals();
     this.nowFn = opts.now ?? defaultNow;
@@ -116,15 +122,34 @@ export class Planner {
   }
 
   setGoals(goals: GoalSpec[]): void {
-    this.allGoals = goals;
+    this.allGoals = this.buildAgenda(goals);
     this.goalCursor = 0;
     this.goals = this.activeGoals();
     this.abandonPlan();
     this.status = "idle";
   }
 
-  /** the subgoal(s) actively being planned: a single agenda item in goal-agenda
-   *  mode, or the whole conjunction otherwise. */
+  /** In goal-agenda mode, derive the ordered subgoal agenda from the goal set by
+   *  splitting any declarative conjunction `goal(a ∧ b ∧ …)` into its conjuncts —
+   *  so the planner gets the subgoals from the goal's structure, not from the
+   *  caller naming a task per conjunct. Outside goal-agenda mode, goals are left
+   *  whole (solved as one joint plan). */
+  private buildAgenda(goals: GoalSpec[]): GoalSpec[] {
+    if (!this.goalAgenda) return goals;
+    const out: GoalSpec[] = [];
+    const pushGoal = (cond: Formula): void => {
+      if (cond.f === "and") cond.parts.forEach(pushGoal);
+      else out.push({ kind: "goal", condition: cond });
+    };
+    for (const g of goals) {
+      if (g.kind === "goal") pushGoal(g.condition);
+      else out.push(g);
+    }
+    return out;
+  }
+
+  /** the subgoal actively being planned: a single agenda item in goal-agenda
+   *  mode, or the whole goal set otherwise. */
   private activeGoals(): GoalSpec[] {
     if (!this.goalAgenda) return this.allGoals;
     const g = this.allGoals[this.goalCursor];
