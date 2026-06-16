@@ -43,19 +43,18 @@ function blockedFlankInstance(): SquadInstance {
 function companionInstance(): SquadInstance {
   return {
     units: [
-      { name: "ally", side: "ally", x: 2, z: 1 },
-      { name: "player", side: "player", x: 2, z: -1 },
-      { name: "E1", side: "enemy", x: -9, z: -2, role: "suppressor" },
-      { name: "E2", side: "enemy", x: -9, z: 3, role: "flanker" },
+      { name: "ally", side: "ally", x: 4, z: 0, hp: 240 },
+      { name: "player", side: "player", x: 7, z: 0, hp: 160 },
+      { name: "E1", side: "enemy", x: -9, z: -2, hp: 60, role: "suppressor" },
+      { name: "E2", side: "enemy", x: -9, z: 3, hp: 60, role: "flanker" },
     ],
     covers: [
-      { name: "cN", x: -2, z: -4 },
-      { name: "cS", x: -2, z: 4 },
-      { name: "fN", x: -6, z: -7, flank: true },
-      { name: "fS", x: -6, z: 7, flank: true },
-      { name: "rally", x: 7, z: 0, rally: true },
+      { name: "cN", x: 0, z: -4 },
+      { name: "cS", x: 0, z: 4 },
+      { name: "fN", x: -5, z: -7, flank: true },
+      { name: "fS", x: -5, z: 7, flank: true },
+      { name: "rally", x: 10, z: 0, rally: true },
     ],
-    walls: [{ x: -1, z: -1.5, w: 1.5, d: 3 }],
   };
 }
 
