@@ -831,6 +831,8 @@ export interface SquadFrame {
   teams: TeamFrame[];
   /** cover name → owner unit (for the view) */
   reservations: Record<string, string | null>;
+  /** the breach door has been broken open (E4) */
+  doorBroken: boolean;
 }
 
 export interface SquadSimOptions {
@@ -1042,6 +1044,7 @@ export class SquadSim {
     return {
       clock: round(this.world.clock),
       teams,
+      doorBroken: this.world.doorBroken,
       reservations: Object.fromEntries(this.world.coverOwner),
       units: [...this.world.actors.values()].map((a) => {
         const up = this.units.find((u) => u.name === a.name);

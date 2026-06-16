@@ -6,7 +6,7 @@ import * as THREE from "three";
 import type { SquadFrame, SquadInstance, UnitFrame } from "@scenarios/squad-combat";
 
 const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
-const COVER_COLOR = { free: "#475569", flank: "#f59e0b", high: "#a78bfa", breach: "#f43f5e", rally: "#22c55e" };
+const COVER_COLOR = { free: "#4b463d", flank: "#b45309", high: "#6d28d9", breach: "#7c2d12", rally: "#15803d" };
 const CHEST = 0.55;
 const HOSTILE: Record<string, string[]> = { enemy: ["player", "ally"], ally: ["enemy"], player: ["enemy"] };
 
@@ -146,33 +146,53 @@ function Unit({ u, target, selected, onSelect }: { u: UnitFrame; target: THREE.V
   );
 }
 
-function Cover({ name, x, z, kind, ownerColor }: { name: string; x: number; z: number; kind: keyof typeof COVER_COLOR; ownerColor: string | null }) {
+/** Cover is a low sandbag/crate you take position at — no cryptic floating label. */
+function Cover({ x, z, kind, ownerColor }: { x: number; z: number; kind: keyof typeof COVER_COLOR; ownerColor: string | null }) {
   return (
     <group position={[x, 0, z]}>
-      <mesh position={[0, 0.18, 0]} castShadow>
-        <boxGeometry args={[0.7, 0.36, 0.7]} />
-        <meshStandardMaterial color={COVER_COLOR[kind]} roughness={0.85} metalness={0.05} />
+      <mesh position={[0, 0.13, 0]} castShadow receiveShadow>
+        <boxGeometry args={[0.95, 0.26, 0.5]} />
+        <meshStandardMaterial color={COVER_COLOR[kind]} roughness={0.98} metalness={0.02} />
       </mesh>
       {ownerColor && (
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
-          <ringGeometry args={[0.5, 0.64, 24]} />
+          <ringGeometry args={[0.6, 0.74, 24]} />
           <meshBasicMaterial color={ownerColor} side={THREE.DoubleSide} />
         </mesh>
       )}
-      <Html position={[0, 0.62, 0]} center distanceFactor={22} style={{ pointerEvents: "none" }}>
-        <div style={{ fontSize: 9, color: kind === "free" ? "#64748b" : COVER_COLOR[kind], fontFamily: "monospace" }}>
-          {kind !== "free" ? `${kind} ` : ""}{name}
-        </div>
-      </Html>
     </group>
   );
 }
 
-function Wall({ x, z, w, d }: { x: number; z: number; w: number; d: number }) {
+function Wall({ x, z, w, d, door, broken }: { x: number; z: number; w: number; d: number; door?: boolean; broken?: boolean }) {
+  const cx = x + w / 2;
+  const cz = z + d / 2;
+  if (door) {
+    if (broken) {
+      // breached: low debris on an open threshold
+      return (
+        <mesh position={[cx, 0.08, cz]} receiveShadow>
+          <boxGeometry args={[w, 0.16, d]} />
+          <meshStandardMaterial color="#241712" roughness={1} />
+        </mesh>
+      );
+    }
+    return (
+      <group position={[cx, 0, cz]}>
+        <mesh position={[0, 1.0, 0]} castShadow>
+          <boxGeometry args={[w, 2.0, d]} />
+          <meshStandardMaterial color="#7c2d12" emissive="#3a1206" emissiveIntensity={0.4} roughness={0.7} />
+        </mesh>
+        <Html position={[0, 2.5, 0]} center distanceFactor={18} style={{ pointerEvents: "none" }}>
+          <div style={{ fontSize: 9, color: "#fbbf24", fontFamily: "monospace", background: "rgba(11,14,20,0.7)", padding: "1px 6px", borderRadius: 4 }}>DOOR</div>
+        </Html>
+      </group>
+    );
+  }
   return (
-    <mesh position={[x + w / 2, 0.55, z + d / 2]} castShadow receiveShadow>
-      <boxGeometry args={[w, 1.1, d]} />
-      <meshStandardMaterial color="#0c0f16" roughness={0.95} />
+    <mesh position={[cx, 1.1, cz]} castShadow receiveShadow>
+      <boxGeometry args={[w, 2.2, d]} />
+      <meshStandardMaterial color="#161c28" roughness={0.95} />
     </mesh>
   );
 }
@@ -225,13 +245,13 @@ function Scene({ frame, instance, selected, onSelect }: SceneProps) {
       </mesh>
 
       {(instance.walls ?? []).map((w, i) => (
-        <Wall key={i} {...w} />
+        <Wall key={i} {...w} broken={frame.doorBroken} />
       ))}
 
       {instance.covers.map((c) => {
         const owner = frame.reservations[c.name] ?? null;
         const oc = owner ? SIDE_COLOR[byName.get(owner)?.side ?? ""] ?? "#e2e8f0" : null;
-        return <Cover key={c.name} name={c.name} x={c.x} z={c.z} kind={coverKind(c)} ownerColor={oc} />;
+        return <Cover key={c.name} x={c.x} z={c.z} kind={coverKind(c)} ownerColor={oc} />;
       })}
 
       {/* fire beams for every unit currently shooting */}

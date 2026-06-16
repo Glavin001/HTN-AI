@@ -14,6 +14,9 @@ import {
   type SquadRun,
   type SquadScenarioId,
 } from "../lib/runSquad";
+import { useLiveSquad, type Order } from "../lib/useLiveSquad";
+import type { SquadFrame, SquadInstance } from "@scenarios/squad-combat";
+import type { TraceEvent } from "htn-ai";
 
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
@@ -24,16 +27,13 @@ type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | 
 type ScenarioId = GridId | "blocks" | SquadScenarioId;
 type Kind = "grid" | "blocks" | "squad";
 
-type Run =
-  | { kind: "grid"; data: RunResult }
-  | { kind: "blocks"; data: BlocksRun }
-  | { kind: "squad"; data: SquadRun };
+type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun } | { kind: "squad"; data: SquadRun };
 
 const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }> = {
   skirmish: { name: "★ Skirmish: Red vs Blue", kind: "squad", blurb: "Two AI squads fight autonomously. Each unit plans from its OWN belief (no shared memory across teams) and reactively readjusts as it discovers the other's moves." },
   blockedFlank: { name: "★ Emergent flank: Red vs Blue", kind: "squad", blurb: "A barricade blocks every direct shot. No flank is scripted — each squad DISCOVERS it must reach a cover that can see the enemy, and they contest the same flanks." },
-  breach: { name: "★ Timed breach: Red vs Blue", kind: "squad", blurb: "A Red fire-team breaches a room a Blue team holds — stacking and breaching in sync inside a deadline window enforced inside the planner's search." },
-  companion: { name: "★ Command your squad", kind: "squad", blurb: "Your Blue squad fights autonomously vs Red. You don't move anyone — you issue orders to a unit, routed through Planner.setGoals (the LLM seam)." },
+  breach: { name: "★ Timed breach: Red vs Blue", kind: "squad", blurb: "A Red fire-team breaches a door a Blue team holds — stacking and breaching in sync inside a deadline window enforced inside the planner's search." },
+  companion: { name: "★ Command your squad (LIVE)", kind: "squad", blurb: "A LIVE battle: your Blue squad fights Red autonomously. Issue an order to a unit and watch it replan in real time — the order hits the running planner, it isn't a re-baked recording." },
   staircase: { name: "Staircase", kind: "grid", blurb: "Goal: stand at a coordinate in the air. The only way up is to stack boxes — so the planner discovers it must build a staircase and climb it." },
   ledge: { name: "Climb the ledge", kind: "grid", blurb: "A 2-high wall the agent can't climb directly. The planner builds a single step, then walks up and over." },
   quarry: { name: "Quarry (advanced)", kind: "grid", blurb: "Reach a height-4 pillar. Blocks are scattered across two depots and a wall blocks the way — solved from a position-only goal." },
@@ -43,13 +43,18 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
 };
 
-type SquadOrder = "engage" | "regroup" | "holdFire";
-
-function buildRun(id: ScenarioId, squadOrder: { at: number; order: SquadOrder } | null): Run {
+function buildRun(id: ScenarioId): Run {
   const kind = SCENARIOS[id].kind;
   if (kind === "blocks") return { kind: "blocks", data: runBlocks() };
-  if (kind === "squad") return { kind: "squad", data: runSquad(id as SquadScenarioId, id === "companion" && squadOrder ? { allyCommand: { ...squadOrder, unit: "B1" } } : {}) };
+  if (kind === "squad") return { kind: "squad", data: runSquad(id as SquadScenarioId) };
   return { kind: "grid", data: runScenario(id as GridId) };
+}
+
+interface SquadView {
+  frame: SquadFrame;
+  trace: { unit: string; e: TraceEvent }[];
+  units: string[];
+  instance: SquadInstance;
 }
 
 export default function Page() {
@@ -59,15 +64,20 @@ export default function Page() {
   const [step, setStep] = useState(0);
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(450);
+  const [liveStepMs, setLiveStepMs] = useState(90);
   const [selected, setSelected] = useState<string | null>(null);
-  const [squadOrder, setSquadOrder] = useState<{ at: number; order: SquadOrder } | null>(null);
 
+  const isLive = scenario === "companion";
+  const live = useLiveSquad(isLive ? "companion" : null, liveStepMs);
+
+  // build the deterministic replay for everything EXCEPT the live companion battle
   useEffect(() => {
+    if (isLive) { setRun(null); setComputing(false); return; }
     setComputing(true);
     setRun(null);
     setStep(0);
     const id = setTimeout(() => {
-      const r = buildRun(scenario, squadOrder);
+      const r = buildRun(scenario);
       setRun(r);
       setComputing(false);
       setPlaying(true);
@@ -75,28 +85,38 @@ export default function Page() {
     }, 30);
     return () => clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario, squadOrder]);
+  }, [scenario]);
 
   const frameCount = run ? run.data.frames.length : 0;
   const lastStep = Math.max(frameCount - 1, 0);
 
   useEffect(() => {
-    if (!playing || !run) return;
+    if (isLive || !playing || !run) return;
     if (step >= lastStep) { setPlaying(false); return; }
     const id = setTimeout(() => setStep((s) => s + 1), speed);
     return () => clearTimeout(id);
-  }, [playing, step, run, speed, lastStep]);
+  }, [playing, step, run, speed, lastStep, isLive]);
 
-  const trace = run ? (run.kind === "squad" ? run.data.trace.map((t) => t.e) : run.data.trace) : [];
-  const summary = useMemo(() => (run?.kind === "squad" ? squadTraceSummary(run.data.trace) : traceSummary(trace)), [run, trace]);
+  useEffect(() => {
+    if (isLive && live.units.length && !selected) setSelected(live.units[0]);
+  }, [isLive, live.units, selected]);
+
+  // unified squad view (live OR replay)
+  const squad: SquadView | null = isLive
+    ? live.frame && live.instance
+      ? { frame: live.frame, trace: live.trace, units: live.units, instance: live.instance }
+      : null
+    : run?.kind === "squad"
+      ? { frame: run.data.frames[Math.min(step, lastStep)], trace: run.data.trace, units: run.data.units, instance: run.data.instance }
+      : null;
+
+  const trace = squad ? squad.trace.map((t) => t.e) : run && run.kind !== "squad" ? run.data.trace : [];
+  const summary = useMemo(() => (squad ? squadTraceSummary(squad.trace) : traceSummary(trace)), [squad, trace]);
   const interesting = useMemo(() => summary.filter((s) => /repair|replan|fail|scope|drift/.test(s.label)), [summary]);
 
-  const squadFrame = run?.kind === "squad" ? run.data.frames[Math.min(step, lastStep)] : null;
-  const narration = squadFrame ? squadNarration(squadFrame) : "";
-  const watch = run?.kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
-  const status = run?.kind === "grid" ? run.data.status : run?.kind === "squad" ? squadOutcome(run.data, step) : "—";
-
-  const issueOrder = (order: SquadOrder) => setSquadOrder({ at: Math.max(1, step), order });
+  const narration = squad ? squadNarration(squad.frame) : "";
+  const watch = SCENARIOS[scenario].kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
+  const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : "—";
 
   return (
     <div className="app">
@@ -108,11 +128,11 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {run?.kind === "squad" && <SquadScene key="squad" frame={run.data.frames[Math.min(step, lastStep)]} instance={run.data.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
-        {squadFrame && (
+        {squad && (
           <div className="hud-top">
-            {squadFrame.teams.map((t) => (
+            {squad.frame.teams.map((t) => (
               <span key={t.side} className="team-chip">
                 <i className="dot" style={{ background: teamColor(t.side) }} />
                 <b style={{ color: teamColor(t.side) }}>{teamName(t.side)}</b>
@@ -122,7 +142,7 @@ export default function Page() {
             ))}
           </div>
         )}
-        {run?.kind === "squad" && (
+        {squad && (
           <div className="hud-legend mono">
             <span><i className="dot" style={{ background: "#ef4444" }} />Red team</span>
             <span><i className="dot" style={{ background: "#3b82f6" }} />Blue team</span>
@@ -131,6 +151,7 @@ export default function Page() {
           </div>
         )}
         {narration && <div className="hud-narration">{narration}</div>}
+        {isLive && live.lastOrder && <div className="hud-order">order → {live.lastOrder.unit}: <b>{live.lastOrder.order}</b> @ {live.lastOrder.at}s</div>}
 
         {computing && (
           <div className="overlay">
@@ -144,7 +165,7 @@ export default function Page() {
         <div className="card">
           <h2>Scenario</h2>
           <div className="row spread">
-            <select value={scenario} onChange={(e) => { setScenario(e.target.value as ScenarioId); setSquadOrder(null); setSelected(null); }}>
+            <select value={scenario} onChange={(e) => { setScenario(e.target.value as ScenarioId); setSelected(null); }}>
               <optgroup label="Squad combat (game AI)">
                 {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind === "squad").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
               </optgroup>
@@ -156,47 +177,60 @@ export default function Page() {
           </div>
         </div>
 
-        {watch.length > 0 && (
-          <div className="card watch">
-            <h2>What to watch for</h2>
-            <ol>
-              {watch.map((w, i) => <li key={i}>{w}</li>)}
-            </ol>
+        {isLive && (
+          <div className="card">
+            <h2>Order a unit — live</h2>
+            <div className="mono" style={{ color: "var(--muted)", marginBottom: 8 }}>
+              hits the <span style={{ color: "var(--accent-2)" }}>running</span> planner via <span style={{ color: "var(--accent-2)" }}>setGoals</span> — watch the selected unit replan.
+            </div>
+            <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+              {live.units.filter((u) => u.startsWith("B")).map((u) => (
+                <span key={u} className="row" style={{ gap: 4 }}>
+                  <span className="mono" style={{ color: "#3b82f6", fontWeight: 700 }}>{u}</span>
+                  <button onClick={() => { setSelected(u); live.command(u, "engage" as Order); }}>⚔</button>
+                  <button onClick={() => { setSelected(u); live.command(u, "regroup" as Order); }}>⮌</button>
+                  <button onClick={() => { setSelected(u); live.command(u, "holdFire" as Order); }}>✋</button>
+                </span>
+              ))}
+            </div>
+            <div className="mono" style={{ color: "var(--muted)", marginTop: 6, fontSize: 11 }}>⚔ engage · ⮌ regroup · ✋ hold fire</div>
           </div>
         )}
 
         <div className="card">
-          <h2>Playback {run?.kind === "squad" ? "· deterministic replay" : ""}</h2>
+          <h2>{isLive ? "Live battle" : "Playback · deterministic replay"}</h2>
           <div className="row">
-            <button className="primary" onClick={() => setPlaying((p) => !p)} disabled={!run}>{playing ? "⏸ Pause" : "▶ Play"}</button>
-            <button onClick={() => setStep((s) => Math.min(s + 1, lastStep))} disabled={!run || step >= lastStep}>Step ⟩</button>
-            <button onClick={() => { setStep(0); setPlaying(true); }} disabled={!run}>⟲ Reset</button>
+            <button className="primary" onClick={() => (isLive ? live.setPlaying(!live.playing) : setPlaying((p) => !p))} disabled={!isLive && !run}>
+              {(isLive ? live.playing : playing) ? "⏸ Pause" : "▶ Play"}
+            </button>
+            <button onClick={() => (isLive ? live.stepOnce() : setStep((s) => Math.min(s + 1, lastStep)))} disabled={isLive ? false : !run || step >= lastStep}>Step ⟩</button>
+            <button onClick={() => (isLive ? live.reset() : (setStep(0), setPlaying(true)))} disabled={!isLive && !run}>⟲ {isLive ? "Restart" : "Reset"}</button>
           </div>
-          <div className="row" style={{ marginTop: 10 }}>
-            <span className="mono" style={{ color: "var(--muted)" }}>t</span>
-            <input type="range" min={0} max={lastStep} step={1} value={Math.min(step, lastStep)} onChange={(e) => { setPlaying(false); setStep(Number(e.target.value)); }} style={{ flex: 1 }} />
-            <span className="mono">{step}/{lastStep}</span>
-          </div>
+          {!isLive && (
+            <div className="row" style={{ marginTop: 10 }}>
+              <span className="mono" style={{ color: "var(--muted)" }}>t</span>
+              <input type="range" min={0} max={lastStep} step={1} value={Math.min(step, lastStep)} onChange={(e) => { setPlaying(false); setStep(Number(e.target.value)); }} style={{ flex: 1 }} />
+              <span className="mono">{step}/{lastStep}</span>
+            </div>
+          )}
           <div className="row" style={{ marginTop: 8 }}>
             <span className="mono" style={{ color: "var(--muted)" }}>speed</span>
-            <input type="range" min={120} max={1400} step={20} value={1520 - speed} onChange={(e) => setSpeed(1520 - Number(e.target.value))} style={{ flex: 1 }} />
+            {isLive ? (
+              <input type="range" min={40} max={260} step={10} value={300 - liveStepMs} onChange={(e) => setLiveStepMs(300 - Number(e.target.value))} style={{ flex: 1 }} />
+            ) : (
+              <input type="range" min={120} max={1400} step={20} value={1520 - speed} onChange={(e) => setSpeed(1520 - Number(e.target.value))} style={{ flex: 1 }} />
+            )}
           </div>
         </div>
 
-        {scenario === "companion" && (
-          <div className="card">
-            <h2>Orders → B1 (Blue squad)</h2>
-            <div className="mono" style={{ color: "var(--muted)", marginBottom: 8 }}>routed through <span style={{ color: "var(--accent-2)" }}>Planner.setGoals</span> — the LLM seam. Issued at the scrubbed moment, then replayed.</div>
-            <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-              <button onClick={() => issueOrder("engage")} className={squadOrder?.order === "engage" ? "primary" : ""}>⚔ Engage</button>
-              <button onClick={() => issueOrder("regroup")} className={squadOrder?.order === "regroup" ? "primary" : ""}>⮌ Regroup</button>
-              <button onClick={() => issueOrder("holdFire")} className={squadOrder?.order === "holdFire" ? "primary" : ""}>✋ Hold fire</button>
-              {squadOrder && <button onClick={() => setSquadOrder(null)}>clear</button>}
-            </div>
+        {watch.length > 0 && (
+          <div className="card watch">
+            <h2>What to watch for</h2>
+            <ol>{watch.map((w, i) => <li key={i}>{w}</li>)}</ol>
           </div>
         )}
 
-        {run?.kind === "squad" && <SquadDirector frame={run.data.frames[Math.min(step, lastStep)]} units={run.data.units} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadDirector frame={squad.frame} units={squad.units} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {run?.kind === "grid" && (
           <div className="card">
@@ -206,7 +240,7 @@ export default function Page() {
         )}
 
         <div className="card">
-          <h2>Trace events {run?.kind === "squad" ? "· glass-box" : ""}</h2>
+          <h2>Trace events {squad ? "· glass-box" : ""}</h2>
           <div className="legend" style={{ marginBottom: 8 }}>{summary.map((s) => <span key={s.label} className="mono">{s.label}:{s.count}</span>)}</div>
           {interesting.length > 0 ? (
             <div className="mono" style={{ color: "var(--accent-2)" }}>reactive: {interesting.map((s) => `${s.label}×${s.count}`).join(", ")}</div>
@@ -219,9 +253,7 @@ export default function Page() {
   );
 }
 
-function squadOutcome(run: SquadRun, step: number): string {
-  const f = run.frames[Math.min(step, run.frames.length - 1)];
-  if (!f) return "—";
+function outcome(f: SquadFrame): string {
   const dead = f.teams.filter((t) => t.alive === 0);
   if (dead.length) return `${teamName(dead[0].side)} eliminated`;
   return "engaging";
