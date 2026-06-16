@@ -62,18 +62,20 @@ The 10-second deadline is enforced **inside the search**: walking (15s, cheap) i
 
 ## Game AI: squad combat (F.E.A.R.-style)
 
-[`scenarios/squad-combat.ts`](./scenarios/squad-combat.ts) is a vertical slice that drives this engine as **game AI** — the use case [F.E.A.R.](https://en.wikipedia.org/wiki/F.E.A.R._(video_game)) made famous, where the *illusion of intelligence* came not from a fancy per-agent planner but from **squad coordination** layered over modest GOAP. The headline scenarios pit **two autonomous squads (Red vs Blue)** against each other: every unit runs the real reactive `Planner` (one `Model` + `ExecState` each — the ExecState *is* that unit's private belief/working memory) and plans from **what it alone has perceived** — there is no shared memory across teams. A per-unit perception step (line-of-sight + hearing + memory decay) produces the dirty writes that drive fluent-precise reactive replanning, so as each side discovers the other's moves it **invalidates and readjusts** its plan in real time. Each team coordinates its own squad through a private blackboard. No core changes — it's all built from the existing extension points.
+[`scenarios/squad-combat.ts`](./scenarios/squad-combat.ts) is a vertical slice that drives this engine as **game AI** — the use case [F.E.A.R.](https://en.wikipedia.org/wiki/F.E.A.R._(video_game)) made famous. The headline scenarios pit **two autonomous squads (Red vs Blue)** against each other: every unit runs the real reactive `Planner` (one `Model` + `ExecState` each — the ExecState *is* that unit's private belief/working memory) and plans from **what it alone has perceived** — no shared memory across teams. A per-unit perception step (line-of-sight + hearing + last-known memory) produces the dirty writes that drive fluent-precise reactive replanning, so as each side discovers the other's moves it **invalidates and re-routes** in real time. No core changes — it's all built from the existing extension points.
+
+The signature idea: there are **no scripted waypoints**. The play area is a **fluid grid of cells**, and a `step(from,to)` operator moves between adjacent cells at a cost of `1 + EXPOSURE_W·exposure(to) + RANGE_W·range(to)`. Engagement is the GOAP goal `achieve(canSee)` — so each unit **searches a multi-step route to a firing line**, trading exposure against closing the distance. It will take the long way around a blocker, or a so-so cell that opens onto a dominant angle, that a greedy "walk toward the enemy" would never find — the library's "discover the staircase" emergence, turned on combat positioning.
 
 It matches F.E.A.R., then exceeds it:
 
-- **Coordinated suppress-and-flank** — a coordinator promotes two NPCs in contact to a flank tactic; the suppressor lays covering fire inside `scoped({ maintain: !flankerReady })` while the flanker swings wide. Reaching position reactively releases the suppressor to push.
-- **Emergent spatial tactics ★** — with the direct lane blocked, the flank is **not scripted**: method selection (`coverSeesThreat`) *derives* that the unit must reposition to a cover that geometrically sees the target — the library's "discover the staircase" emergence, turned on combat.
-- **Cover reservation** — a `coverTaken` belief plus a `verify` on the move operators means a unit whose slot is stolen mid-move aborts and repairs to a free one; no two NPCs ever share cover.
+- **Emergent spatial tactics ★** — flanks, covered approaches and break-contact all *emerge* from the exposure-weighted route search over the grid (`adj` is a `static` fluent, so the compiler prunes every non-adjacent `step` grounding — the grid stays cheap to search). Nothing is scripted.
+- **Position is a real, mechanical edge** — a probabilistic hit model (closer = deadlier via range, a target in **directional half-cover** is ×0.3 to hit) means the cell the search chose actually changes the odds — cover you path *around*, not onto, and only against the shooters it sits between you and.
+- **Single-occupancy cells** — a `cellTaken` belief on the `step` precondition means a claimed cell dirties its rivals, who reactively re-route; two units never converge on one spot.
 - **Timed synchronized breach** — a fire-team stacks and breaches inside one `scoped({ deadline })` window; the projected-clock deadline prunes anyone who can't make it *in search* — temporal coordination F.E.A.R. lacked.
 - **Collaborative companion + player orders** — an allied companion auto-assists (and never targets a friendly), taking orders routed through `Planner.setGoals` — the seam an LLM later drives.
-- **Glass-box & deterministic** — structured `TraceEvent`s + `explainFailure` expose each NPC's plan and *why a branch was rejected*; a seeded, fixed-timestep rollout makes the whole engagement a deterministic replay.
+- **Glass-box & deterministic** — structured `TraceEvent`s + `explainFailure` expose each NPC's plan + route and *why a branch was rejected*; a seeded, fixed-timestep rollout makes the whole engagement a deterministic replay.
 
-Run it: the browser demo in [`examples/web`](./examples/web) renders four squad scenarios in 3D with a live glass-box AI-director panel (per-NPC plan, live step, "why not X", reservations); [`tests/squad.ts`](./tests/squad.ts) pins every behaviour above as a ground-truth assertion.
+Run it: the browser demo in [`examples/web`](./examples/web) renders four squad scenarios in 3D — the fluid grid, each unit's **searched route**, sight lines, and a live glass-box AI-director panel (per-NPC plan, live step, "why not X"); [`tests/squad.ts`](./tests/squad.ts) pins every behaviour above as a ground-truth assertion.
 
 ## Install & develop
 
@@ -86,7 +88,7 @@ npm test                  # uvu test suite (core, HTN semantics, ground-truth
 npm run typecheck && npm run lint && npm run build
 ```
 
-The test suite doubles as documentation: `tests/puzzles.ts` (water jug / blocks world / river crossing / sokoban solved *by search* against known optima), `tests/temporal.ts` (deadlines, time windows, maintain-for-15s, escort), `tests/htn.ts` (FluidHTN-lineage semantics), `tests/exec.ts` (repair, reactivity, budgets, determinism, scheduler), `tests/squad.ts` (F.E.A.R.-style squad combat: emergent flanking, suppress-while-flank, cover reservation, timed breach, companion orders).
+The test suite doubles as documentation: `tests/puzzles.ts` (water jug / blocks world / river crossing / sokoban solved *by search* against known optima), `tests/temporal.ts` (deadlines, time windows, maintain-for-15s, escort), `tests/htn.ts` (FluidHTN-lineage semantics), `tests/exec.ts` (repair, reactivity, budgets, determinism, scheduler), `tests/squad.ts` (F.E.A.R.-style squad combat: emergent searched-route flanking, single-occupancy cells, reactive replanning, timed breach, companion orders).
 
 ## License
 

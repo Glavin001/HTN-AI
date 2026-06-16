@@ -10,24 +10,27 @@ Scenes selectable from the scenario dropdown, each driving the **real reactive
 
 ### ★ Squad combat (F.E.A.R.-style game AI)
 
-Four scenarios where coordinated NPCs run one reactive `Planner` each over a
-shared world + blackboard (see [`../../scenarios/squad-combat.ts`](../../scenarios/squad-combat.ts)).
-Select an NPC (click it, or use the **glass-box AI-director** panel) to watch its
-live plan, the executing step, recent trace events, and **why a branch was
-rejected**. The playback slider is a deterministic **replay** of the engagement.
+Four scenarios where autonomous NPCs run one reactive `Planner` each over a
+fluid grid of positions (see [`../../scenarios/squad-combat.ts`](../../scenarios/squad-combat.ts)).
+There are **no scripted waypoints**: each unit *searches* a covered, multi-step
+route to a firing line (`achieve(canSee)` over a `step` operator whose cost trades
+exposure against closing the distance). Select an NPC (click it, or use the
+**glass-box AI-director** panel) to watch its live plan + **route** (the bright
+dashed path), the sight line (green = a shot, red = blocked), and **why a branch
+was rejected**. The faint dots are the grid the planner searches over.
 
-- **Skirmish** — two NPCs flush a target with coordinated **suppress-and-flank**:
-  one pins inside a `scoped({ maintain: !flankerReady })` block while the other
-  swings to a flank cover; reaching position releases the suppressor to push.
-- **Emergent flank** — a barricade blocks the direct line of fire. The flank is
-  **not scripted**: method selection *derives* that the unit must reposition to a
-  cover that geometrically sees the target (the staircase emergence, on combat).
+- **Skirmish** — two squads fight over open-ish ground with a central building.
+  No flank is scripted — each unit's route search finds the covered way around to
+  an angle, and cover reservation splits the squad-mates into a pincer.
+- **Emergent flank** — a central barricade blocks every direct shot. The detour
+  the search *derives* (the long way around the ends) is one a greedy push toward
+  the enemy would never find — the staircase emergence, on combat positioning.
 - **Timed breach** — a fire-team **stacks and breaches in sync** inside a
   `scoped({ deadline })` window; the projected-clock deadline prunes anyone who
   can't make it *in search*.
-- **Companion + orders** — an allied companion auto-assists, and takes orders
-  (**Engage / Regroup / Hold fire**) routed through `Planner.setGoals` — the LLM
-  seam. Issue an order at any scrubbed moment and watch the plan change on replay.
+- **Companion + orders (LIVE)** — your Blue squad fights autonomously in real
+  time; issue an order (**Engage / Regroup / Hold fire**) routed through
+  `Planner.setGoals` — the LLM seam — and watch the unit re-route on the next tick.
 
 ### Staircase World (spatial GOAP)
 
