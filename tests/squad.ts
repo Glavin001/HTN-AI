@@ -1,7 +1,7 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
-import { type TraceEvent } from "../src/index";
-import { type SquadInstance, SquadSim, squadModel } from "../scenarios/index";
+import { type TraceEvent, F, N, explainFailure, goal, planOnce } from "../src/index";
+import { type SquadInstance, SquadSim, breachInstance, squadModel } from "../scenarios/index";
 
 /**
  * Squad Combat — ground-truth assertions for the F.E.A.R.-style tactical
@@ -261,6 +261,57 @@ test("squad: a player 'regroup' order swaps the ally's goal and it obeys (setGoa
     sim.trace.slice(before).some((t) => t.unit === "ally" && (t.e.t === "plan.new" || t.e.t === "step.start")),
     "the order triggered a fresh plan",
   );
+});
+
+// ---------------------------------------------------------------- E4: timed synchronized breach
+
+test("squad: a fire-team breaches in sync inside a deadline window (temporal-lite)", () => {
+  const sim = new SquadSim(breachInstance(), { seed: 8 });
+  sim.run(500);
+
+  for (const u of ["E1", "E2"]) {
+    const scopes = sim.trace.filter((t) => t.unit === u && t.e.t === "scope.enter");
+    assert.ok(
+      scopes.some((t) => (t.e as { label: string }).label.includes("breach-window")),
+      `${u} entered the timed breach window`,
+    );
+    assert.ok(stepStarts(sim, u).some((l) => l.startsWith("moveToBreach")), `${u} stacked on the door`);
+    assert.ok(stepStarts(sim, u).some((l) => l.startsWith("breach")), `${u} breached`);
+  }
+  // nobody blew the deadline — the window was met
+  const blown = sim.trace.filter((t) => t.e.t === "scope.violated" && (t.e as { reason: string }).reason === "deadline");
+  assert.equal(blown.length, 0, "the breach completed within the window (no deadline violation)");
+  assert.equal(sim.world.actors.get("player")!.alive, false, "the room was cleared");
+});
+
+// ---------------------------------------------------------------- E3: glass-box — explain why a branch was rejected
+
+test("squad: the planner can explain why an impossible engagement fails (glass-box)", () => {
+  // a unit boxed in with no line of fire and nowhere with one ⇒ neutralize is
+  // unreachable; explainFailure surfaces readable rejection reasons.
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+      { name: "player", side: "player", x: 0, z: 6 },
+    ],
+    covers: [{ name: "c", x: 0, z: 1 }], // also boxed in
+    // fully enclose the target so no cover anywhere has a line of fire
+    walls: [{ x: -3, z: 3, w: 6, d: 1 }],
+  };
+  const model = squadModel(inst, "E");
+  const state = model.createExecState();
+  // seed a believed threat the unit cannot see (boxed behind the wall)
+  state.set(model.slotOf("hasThreat"), 1);
+  state.buffer[model.slotOf("threatPos")] = 0;
+  state.buffer[model.slotOf("threatPos") + 1] = 6;
+  const result = planOnce(model, state, {
+    goals: [goal(F.lte(N.fl("threatHp"), N.c(0)))],
+    collectRejections: true,
+    maxNodes: 4000,
+  });
+  assert.equal(result.status, "failure", "no line of fire exists ⇒ planning fails");
+  const reasons = explainFailure(result);
+  assert.ok(reasons.length > 0, "explainFailure produced human-readable rejection reasons");
 });
 
 // ---------------------------------------------------------------- exports sanity

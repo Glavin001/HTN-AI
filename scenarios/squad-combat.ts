@@ -107,6 +107,8 @@ export interface SquadInstance {
   playerPath?: Vec2[];
   /** seconds the player dwells at each waypoint */
   playerDwell?: number;
+  /** open with a synchronized breach-and-clear (E4) instead of a standing fight */
+  breach?: boolean;
 }
 
 // ---------------------------------------------------------------- ground-truth world
@@ -189,8 +191,8 @@ export class SquadWorld {
   public flankerReady = false;
   /** number of breachers stacked at the door (E4) */
   public stacked = 0;
-  /** absolute clock the synchronized breach must complete by (E4) */
-  public breachDeadline = Infinity;
+  /** the door has been breached — the coordinator switches off the breach tactic */
+  public breached = false;
   /** most recent bark per unit, for the view */
   public readonly barks = new Map<string, { text: string; at: number }>();
 
@@ -287,7 +289,6 @@ export const squadDomain: DomainDoc = {
     { name: "hasThreat", kind: "boolean", initial: false }, // have a position fix at all (sight OR hearing)
     // --- squad blackboard (belief; written by the coordinator) ---
     { name: "flankerReady", kind: "boolean", initial: false },
-    { name: "stackedReady", kind: "boolean", initial: false },
     // --- cover descriptors (static, set at init) ---
     { name: "coverPos", params: [{ name: "c", type: "cover" }], kind: "vec2" },
     { name: "coverFlank", params: [{ name: "c", type: "cover" }], kind: "boolean", initial: false },
@@ -396,8 +397,10 @@ export const squadDomain: DomainDoc = {
       executor: "suppress",
     },
     {
+      // breach the door (only as part of a breach assault — not a shoot-through-walls
+      // shortcut; a standing fight must still earn a line of sight by flanking)
       name: "breach",
-      pre: F.lit("stackedReady"),
+      pre: F.and(F.lit("tactic", [], "breach"), F.lit("hasThreat"), F.gt(N.fl("threatHp"), N.c(0))),
       eff: [E.dec("threatHp", [], N.c(SHOT_DAMAGE), "planOnly")],
       cost: 1,
       duration: 0.4,
@@ -421,15 +424,19 @@ export const squadDomain: DomainDoc = {
       pre: F.and(F.lt(N.fl("myHp"), N.c(LOW_HP)), F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
       subtasks: [{ do: "retreatTo", args: ["?r"] }],
     },
-    // 2. synchronized breach (E4) — stack up then breach within the deadline window
+    // 2. synchronized breach (E4) — stack up AND breach inside one deadline window.
+    // The scoped deadline prunes any unit that can't reach the door in time *during
+    // search* (projected clock), so only those who can make the window commit.
     {
       name: "breachAssault",
       task: "Fight",
       params: [{ name: "bp", type: "cover" }],
       pre: F.and(F.lit("tactic", [], "breach"), F.lit("coverBreach", ["?bp"])),
       subtasks: [
-        { scope: { deadline: BREACH_WINDOW, label: "breach-window" }, subtasks: [{ do: "moveToBreach", args: ["?bp"] }] },
-        { do: "breach" },
+        {
+          scope: { deadline: BREACH_WINDOW, label: "breach-window" },
+          subtasks: [{ do: "moveToBreach", args: ["?bp"] }, { do: "breach" }],
+        },
         { achieve: F.lte(N.fl("threatHp"), N.c(0)) },
       ],
     },
@@ -606,6 +613,7 @@ function breachExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => 
       target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
       if (target.hp <= 0) target.alive = false;
     }
+    world.breached = true;
     return "success";
   };
 }
@@ -702,6 +710,7 @@ export class SquadSim {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
     this.world = new SquadWorld(inst);
+    if (inst.breach) this.world.squadTactic = "breach";
     let seedBump = 0;
     for (const u of inst.units) {
       if (u.side === "player") continue;
@@ -752,11 +761,6 @@ export class SquadSim {
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
     }
     setBelief(p, "flankerReady", [], this.world.flankerReady);
-    setBelief(p, "stackedReady", [], this.world.stacked >= this.countBreachers());
-  }
-
-  private countBreachers(): number {
-    return Math.max(1, this.units.filter((u) => u.side === "enemy").length);
   }
 
   /** a fallen unit releases its cover reservation (so the slot frees up). */
@@ -788,6 +792,8 @@ export class SquadSim {
   // ---- the squad coordinator: assigns roles/tactic into each unit's belief ----
   private coordinate(): void {
     const enemies = this.units.filter((u) => u.side === "enemy" && (this.world.actors.get(u.name)?.alive ?? false));
+    // a breach opening ends once the door is cleared, then it's a standing fight
+    if (this.world.squadTactic === "breach" && this.world.breached) this.world.squadTactic = "hold";
     const seeing = enemies.filter((u) => this.world.nearestHostile(u.name, true));
     // two-or-more in contact → coordinated flank: one suppresses while one flanks
     if (this.world.squadTactic !== "breach" && seeing.length >= 2) {
@@ -952,6 +958,28 @@ export function skirmishInstance(): SquadInstance {
       { x: 2, z: 0 },
     ],
     playerDwell: 1,
+  };
+}
+
+/** Breach-and-clear: a fire-team stacks on a door and breaches in sync (E4). */
+export function breachInstance(): SquadInstance {
+  return {
+    breach: true,
+    units: [
+      { name: "E1", side: "enemy", x: -4, z: 0, role: "assault" },
+      { name: "E2", side: "enemy", x: 4, z: 0, role: "assault" },
+      { name: "player", side: "player", x: 0, z: 8 }, // holed up in the room
+    ],
+    covers: [
+      { name: "door", x: 0, z: 4, breach: true }, // the stack-up / breach point
+      { name: "cW", x: -5, z: 3 },
+      { name: "cE", x: 5, z: 3 },
+    ],
+    // a wall with a doorway: blocks the line of fire so the room must be breached
+    walls: [
+      { x: -6, z: 5, w: 5, d: 1 },
+      { x: 1, z: 5, w: 5, d: 1 },
+    ],
   };
 }
 
