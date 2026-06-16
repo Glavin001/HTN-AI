@@ -37,6 +37,14 @@ export interface FluentDecl {
   entityType?: TypeName;
   /** default initial value (boolean=false, numbers=0, enum=values[0], entity=null) */
   initial?: number | boolean | string | [number, number] | [number, number, number];
+  /**
+   * Declares this fluent IMMUTABLE after the initial state — never changed by any
+   * operator *or the host*. Lets the compiler treat precondition lits over it as
+   * compile-time constants and prune ground operators whose static precondition
+   * can never hold (adjacency, maps, alignment, type tables). Unsound to set on a
+   * fluent that actually changes; validated against operator effects.
+   */
+  static?: boolean;
 }
 
 // ---------------------------------------------------------------- terms
@@ -118,8 +126,12 @@ export type Formula =
   | { f: "not"; part: Formula }
   | { f: "lit"; fluent: string; args: Term[]; value?: Term } // boolean fluents: omitted value = true
   | { f: "cmp"; op: CmpOp; a: NumExpr; b: NumExpr }
-  | { f: "external"; name: string; args: Term[]; reads: string[] }
-  | { f: "opaque"; name: string };
+  // `relax`: an optional T1 over-approximation — a formula the predicate's truth
+  // *implies* (a sound necessary condition). The relaxation heuristic folds its
+  // conjunctive lits in as extra preconditions, so the black box stops being
+  // invisible to h (and stays admissible iff the implication genuinely holds).
+  | { f: "external"; name: string; args: Term[]; reads: string[]; relax?: Formula }
+  | { f: "opaque"; name: string; relax?: Formula };
 
 /** Formula helpers. */
 export const F = {
@@ -139,8 +151,8 @@ export const F = {
   gte: (a: NumLike, b: NumLike): Formula => F.cmp(">=", a, b),
   gt: (a: NumLike, b: NumLike): Formula => F.cmp(">", a, b),
   eq: (a: NumLike, b: NumLike): Formula => F.cmp("==", a, b),
-  ext: (name: string, args: TermLike[], reads: string[]): Formula => ({ f: "external", name, args: terms(args), reads }),
-  opaque: (name: string): Formula => ({ f: "opaque", name }),
+  ext: (name: string, args: TermLike[], reads: string[], relax?: Formula): Formula => ({ f: "external", name, args: terms(args), reads, ...(relax ? { relax } : {}) }),
+  opaque: (name: string, relax?: Formula): Formula => ({ f: "opaque", name, ...(relax ? { relax } : {}) }),
   true: (): Formula => ({ f: "and", parts: [] }),
 };
 
@@ -408,6 +420,8 @@ function checkFormula(
       return;
     case "external":
     case "opaque":
+      // validate the optional relaxation over-approximation (a real T1 formula)
+      if (formula.relax) checkFormula(formula.relax, vars, idx, `${path}/relax`, out, axiomStack);
       return;
   }
 }

@@ -90,6 +90,13 @@ export interface CompiledFormula {
   readsClock: boolean;
   /** positive conjunctive lit atoms (for h_add); skipped parts make h more optimistic */
   atoms: (b: Bindings) => Atom[];
+  /** like `atoms`, but also folds in external/opaque `relax` over-approximations —
+   *  used only by the relaxation heuristic, never for search applicability */
+  relaxAtoms: (b: Bindings) => Atom[];
+  /** true when `atoms` fully captures the formula (a conjunction of encodable,
+   *  non-axiom positive lits) — so an atom-level check is the whole precondition
+   *  and the compiled closure can be skipped once the atoms hold */
+  atomsComplete: boolean;
   ir: Formula;
 }
 
@@ -129,6 +136,9 @@ export interface CompiledOperator {
   cost: CompiledNum;
   duration: CompiledNum;
   executor: string | undefined;
+  /** precondition checks over arg-only externals (declared empty read set ⇒
+   *  constant per ground binding); evaluated once at grounding to prune ops */
+  argOnlyChecks: ((b: Bindings) => boolean)[];
 }
 
 export interface GroundOp {
@@ -137,6 +147,10 @@ export interface GroundOp {
   b: Bindings;
   preAtoms: Atom[];
   addAtoms: Atom[];
+  /** compile-time interned relaxation-atom ids (parallel to pre/addAtoms); drive
+   *  the allocation-free h_add/h_max core. Filled by Model.buildRelaxTables(). */
+  preIds?: Int32Array;
+  addIds?: Int32Array;
 }
 
 export interface CompiledScopeTmpl {
@@ -168,6 +182,8 @@ export interface CompiledMethod {
   pre: CompiledFormula | null;
   utility: CompiledNum | null;
   subtasks: CompiledSubtask[];
+  /** memoized free-parameter binding enumeration (types are fixed at compile time) */
+  freeBindingsCache?: Bindings[];
 }
 
 interface CompiledFluent {
@@ -227,10 +243,40 @@ export class Model {
   public groundOps: GroundOp[] = [];
   /** fluents any operator writes non-atomically — relaxation treats them as optimistically settable */
   public readonly relaxFuzzyWrites = new Set<number>();
+  /** fluents no operator effect writes — their precondition lits are compile-time constants */
+  public readonly staticFluents = new Set<number>();
+
+  // ---- relaxation heuristic tables: distinct (slot,value) atoms interned to
+  //      dense ids at compile time so h_add/h_max runs over typed arrays with no
+  //      per-atom string keys or maps on the hot path (see search.ts/relaxCore).
+  /** number of distinct atoms appearing in any ground op's pre/add sets */
+  public relaxAtomCount = 0;
+  public relaxAtomSlot: Int32Array = new Int32Array(0);
+  public relaxAtomValue: Float64Array = new Float64Array(0);
+  public relaxAtomFuzzy: Uint8Array = new Uint8Array(0);
+  private readonly relaxAtomIndex = new Map<string, number>();
+
+  // ---- successor generator: index each ground op by its most-selective
+  //      precondition atom so search considers only plausibly-applicable ops
+  //      (selector holds) instead of scanning all ground operators per node.
+  /** ops with no positive-lit precondition — always candidates */
+  public succAlwaysOps: GroundOp[] = [];
+  /** distinct selector slots; succSelTables[k] maps required value → gid-sorted ops */
+  public succSelSlots: Int32Array = new Int32Array(0);
+  public succSelTables: Map<number, GroundOp[]>[] = [];
+  /** true when candidates can come from >1 bucket and must be re-sorted into gid order */
+  public succNeedsSort = false;
 
   public slotCount = 1; // slot 0 = clock
   public slotOwner!: Int32Array;
   public baseState!: Float64Array;
+
+  // reusable ExtQuery/ExtWriter so external/opaque predicate & numeric
+  // evaluation allocates nothing per call (was: a fresh 5-closure object each time)
+  private extState: Snap = undefined as unknown as Snap;
+  private extTarget: WritableState = undefined as unknown as WritableState;
+  private reuseQ: ExtQuery | null = null;
+  private reuseW: ExtWriter | null = null;
 
   constructor(doc: DomainDoc, setup: WorldSetup = {}, registry: Registry = {}) {
     const errors = validateDomain(doc).filter((d) => d.severity === "error");
@@ -416,10 +462,26 @@ export class Model {
     const sources = this.resolveArgSources(args, vars, context);
     if (sources.every((s) => "c" in s)) {
       const slot = this.slotOf(name, ...sources.map((s) => (s as { c: number }).c));
-      return () => slot;
+      return () => slot; // fully ground ⇒ constant slot, resolved once
     }
-    const getArgs = this.argFn(sources);
-    return (b: Bindings) => this.slotOf(name, ...getArgs(b));
+    // variable args: precompute the fluent layout + per-param index maps so the
+    // hot closure does no name lookup, no per-type map lookup, and no array
+    // allocation (the previous `slotOf(name, ...getArgs(b))` allocated two).
+    const cf = this.fluent(name);
+    const np = cf.paramTypes.length;
+    const idxMaps = cf.paramTypes.map((t) => this.indexInType.get(t) as Map<number, number>);
+    const strides = cf.strides;
+    const base = cf.base;
+    const width = cf.width;
+    return (b: Bindings) => {
+      let idx = 0;
+      for (let i = 0; i < np; i++) {
+        const src = sources[i];
+        const gid = "c" in src ? (src as { c: number }).c : b[(src as { v: number }).v];
+        idx += (idxMaps[i].get(gid) as number) * strides[i];
+      }
+      return base + idx * width;
+    };
   }
 
   private extQuery(s: Snap, args: Bindings): ExtQuery {
@@ -448,6 +510,64 @@ export class Model {
         target.set(slot, this.encodeValue(fluent, value));
       },
     };
+  }
+
+  /** Slot for a dynamic (user-supplied) fluent ref, without the spread/rest +
+   *  `.map()` allocations of `slotOf` — for the reusable ExtQuery hot path. */
+  private slotOfArgs(name: string, a: (number | string)[]): number {
+    const cf = this.fluent(name);
+    let idx = 0;
+    for (let i = 0; i < cf.paramTypes.length; i++) {
+      const raw = a[i];
+      const gid = typeof raw === "string" ? this.entityId(raw) : raw;
+      const within = this.indexInType.get(cf.paramTypes[i])?.get(gid);
+      if (within === undefined) {
+        throw new Error(`Entity '${this.entityName(gid)}' is not of type '${cf.paramTypes[i]}' (fluent '${name}')`);
+      }
+      idx += within * cf.strides[i];
+    }
+    return cf.base + idx * cf.width;
+  }
+
+  /** Reusable ExtQuery bound to mutable model state (no per-call allocation).
+   *  External/opaque evaluation is a synchronous leaf call, so one shared,
+   *  re-pointed instance is safe. */
+  private queryFor(s: Snap, args: Bindings): ExtQuery {
+    this.extState = s;
+    let q = this.reuseQ;
+    if (q === null) {
+      q = this.reuseQ = {
+        args,
+        get: (fluent, ...a) => this.extState.get(this.slotOfArgs(fluent, a)),
+        vec: (fluent, ...a) => {
+          const cf = this.fluent(fluent);
+          const slot = this.slotOfArgs(fluent, a);
+          const out: number[] = [];
+          for (let i = 0; i < cf.width; i++) out.push(this.extState.get(slot + i));
+          return out;
+        },
+        clock: () => this.extState.get(CLOCK_SLOT),
+        gid: (name) => this.entityId(name),
+        name: (gid) => this.entityName(gid),
+      };
+    }
+    q.args = args;
+    return q;
+  }
+
+  /** Reusable ExtWriter (reads see the target being written). */
+  private writerFor(target: WritableState, args: Bindings): ExtWriter {
+    const q = this.queryFor(target, args); // sets extState = target ⇒ reads see writes
+    this.extTarget = target;
+    let w = this.reuseW;
+    if (w === null) {
+      w = this.reuseW = {
+        ...q,
+        set: (fluent, a, value) => this.extTarget.set(this.slotOfArgs(fluent, a), this.encodeValue(fluent, value)),
+      };
+    }
+    w.args = args;
+    return w;
   }
 
   // ---------------- numeric expression compilation
@@ -508,7 +628,7 @@ export class Model {
         if (!fn) throw new Error(`Unregistered external numeric '${expr.name}' in ${context}`);
         for (const r of expr.reads) reads.add(this.fluent(r).id);
         const getArgs = this.argFn(this.resolveArgSources(expr.args, vars, context));
-        return (s, b) => fn(this.extQuery(s, getArgs(b)));
+        return (s, b) => fn(this.queryFor(s, getArgs(b)));
       }
     }
     throw new Error(`Unreachable numeric expression in ${context}`);
@@ -520,14 +640,32 @@ export class Model {
     const reads = new Set<number>();
     const readsClock = { v: false };
     const fn = this.buildFormula(formula, vars, context, reads, readsClock);
-    const atomFns = this.collectAtomFns(formula, vars, context);
+    const atomFns = this.collectAtomFns(formula, vars, context, false);
+    const relaxAtomFns = this.collectAtomFns(formula, vars, context, true);
     return {
       fn,
       reads,
       readsClock: readsClock.v,
       atoms: (b: Bindings) => atomFns.map((f) => f(b)),
+      relaxAtoms: (b: Bindings) => relaxAtomFns.map((f) => f(b)),
+      atomsComplete: this.formulaAtomsComplete(formula, vars, context),
       ir: formula,
     };
+  }
+
+  /** Does `atoms()` fully capture this formula? True iff it's a conjunction of
+   *  encodable, non-axiom positive lits (no not/or/cmp/external/opaque/axiom). */
+  private formulaAtomsComplete(f: Formula, vars: Map<string, number>, context: string): boolean {
+    if (f.f === "and") return f.parts.every((p) => this.formulaAtomsComplete(p, vars, context));
+    if (f.f !== "lit" || this.axioms.has(f.fluent)) return false;
+    const cf = this.fluentByName.get(f.fluent);
+    if (!cf) return false;
+    try {
+      this.encodeLitValue(cf, f.value, vars, context); // must be representable as an atom
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   private buildFormula(
@@ -594,12 +732,12 @@ export class Model {
         if (!fn) throw new Error(`Unregistered external predicate '${formula.name}' in ${context}`);
         for (const r of formula.reads) reads.add(this.fluent(r).id);
         const getArgs = this.argFn(this.resolveArgSources(formula.args, vars, context));
-        return (s, b) => fn(this.extQuery(s, getArgs(b)));
+        return (s, b) => fn(this.queryFor(s, getArgs(b)));
       }
       case "opaque": {
         const fn = this.registry.predicates[formula.name];
         if (!fn) throw new Error(`Unregistered opaque predicate '${formula.name}' in ${context}`);
-        return (s, b) => fn(this.extQuery(s, b));
+        return (s, b) => fn(this.queryFor(s, b));
       }
     }
     throw new Error(`Unreachable formula in ${context}`);
@@ -634,12 +772,17 @@ export class Model {
     }
   }
 
-  /** positive conjunctive lits → atom extractors (for heuristics); other parts skipped (optimistic) */
-  private collectAtomFns(formula: Formula, vars: Map<string, number>, context: string): ((b: Bindings) => Atom)[] {
+  /** positive conjunctive lits → atom extractors (for heuristics); other parts skipped (optimistic).
+   *  With includeHints, descends into external/opaque `relax` over-approximations. */
+  private collectAtomFns(formula: Formula, vars: Map<string, number>, context: string, includeHints: boolean): ((b: Bindings) => Atom)[] {
     const out: ((b: Bindings) => Atom)[] = [];
     const walk = (f: Formula): void => {
       if (f.f === "and") {
         f.parts.forEach(walk);
+        return;
+      }
+      if (includeHints && (f.f === "external" || f.f === "opaque")) {
+        if (f.relax) walk(f.relax); // fold the sound necessary condition into h
         return;
       }
       if (f.f !== "lit") return;
@@ -685,7 +828,7 @@ export class Model {
         }
         appliers.push((target, b, mask) => {
           if ((mask & timingBit) === 0) return;
-          fn(this.extWriter(target, b));
+          fn(this.writerFor(target, b));
         });
         continue;
       }
@@ -793,6 +936,8 @@ export class Model {
       const params = decl.params ?? [];
       const vars = new Map(params.map((p, i) => [varKey(p.name), i]));
       const ctxName = `operators/${decl.name}`;
+      const argOnlyChecks: ((b: Bindings) => boolean)[] = [];
+      if (decl.pre) this.collectArgOnlyChecks(decl.pre, vars, `${ctxName}/pre`, argOnlyChecks);
       const op: CompiledOperator = {
         id: this.operators.length,
         name: decl.name,
@@ -807,10 +952,38 @@ export class Model {
             ? this.compileNum(num(decl.duration), vars, `${ctxName}/duration`)
             : { fn: () => 0, reads: new Set() },
         executor: decl.executor,
+        argOnlyChecks,
       };
       this.operators.push(op);
       this.operatorByName.set(decl.name, op);
       for (const f of op.effects.fuzzyWrites) this.relaxFuzzyWrites.add(f);
+    }
+  }
+
+  /** Snap over the (post-init) base world, for evaluating arg-only externals. */
+  private baseSnap(): Snap {
+    if (!this._baseSnap) this._baseSnap = { get: (slot: number) => this.baseState[slot] };
+    return this._baseSnap;
+  }
+  private _baseSnap: Snap | null = null;
+
+  /**
+   * Collect prunable precondition checks: an external predicate with a declared
+   * **empty read set** is a pure function of its arguments, so it is constant per
+   * ground binding and can be evaluated once at grounding. Only sound in
+   * conjunctive position (top-level `and` / bare external) — never under
+   * `not`/`or`, and never for opaque predicates (which declare nothing).
+   */
+  private collectArgOnlyChecks(f: Formula, vars: Map<string, number>, ctx: string, out: ((b: Bindings) => boolean)[]): void {
+    if (f.f === "and") {
+      for (const p of f.parts) this.collectArgOnlyChecks(p, vars, ctx, out);
+      return;
+    }
+    if (f.f === "external" && f.reads.length === 0) {
+      const fn = this.registry.predicates[f.name] as ExternalPredicate | undefined;
+      if (!fn) return;
+      const argFn = this.argFn(this.resolveArgSources(f.args, vars, ctx));
+      out.push((b) => fn(this.queryFor(this.baseSnap(), argFn(b))));
     }
   }
 
@@ -946,22 +1119,156 @@ export class Model {
 
   private groundOperators(): void {
     this.groundOps = [];
+    // fluents the author DECLARED static are immutable after init, so any
+    // precondition lit over them is a compile-time constant. (We cannot infer
+    // this from "no operator writes it" — the host can mutate world fluents
+    // between plans, e.g. has_vehicle; it must be a promise, validated here.)
+    const written = new Set<number>();
+    for (const op of this.operators) for (const w of op.effects.writes) written.add(w);
+    for (const f of this.fluents) {
+      if (!f.decl.static) continue;
+      if (written.has(f.id)) {
+        throw new Error(`Fluent '${f.decl.name}' is declared static but an operator effect writes it`);
+      }
+      this.staticFluents.add(f.id);
+    }
+    const base = this.baseState;
+    const owner = this.slotOwner;
+    const staticAtomFails = (a: Atom): boolean => {
+      const o = owner[a.slot];
+      return o >= 0 && this.staticFluents.has(o) && base[a.slot] !== a.value;
+    };
+
     for (const op of this.operators) {
+      const checks = op.argOnlyChecks;
       for (const b of this.enumerateBindings(op.paramTypes)) {
+        // metadata-driven prune: skip bindings an arg-only external rejects (e.g.
+        // neq(x,x)) — they can never apply, so they enter neither search nor the
+        // relaxation. The relaxation already treats externals optimistically, so
+        // dropping these invalid groundings leaves the heuristic unchanged.
+        let ok = true;
+        for (let i = 0; i < checks.length; i++) {
+          if (!checks[i](b)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+        const preAtoms = op.pre ? op.pre.atoms(b) : [];
+        // static-fluent prune (relevance analysis): a precondition over a static
+        // fluent (adjacency, maps, alignment, …) that is false in the initial
+        // state can NEVER hold, so this grounding is dead — drop it. Sound for the
+        // heuristic too: such an atom is unreachable in the relaxation (static ⇒
+        // never added, current value = base value), so the op never fires there.
+        let dead = false;
+        for (let i = 0; i < preAtoms.length; i++) {
+          if (staticAtomFails(preAtoms[i])) {
+            dead = true;
+            break;
+          }
+        }
+        if (dead) continue;
         this.groundOps.push({
           gid: this.groundOps.length,
           op,
           b,
-          preAtoms: op.pre ? op.pre.atoms(b) : [],
+          preAtoms,
           addAtoms: op.effects.addAtoms(b),
         });
       }
     }
+    this.buildRelaxTables();
+    this.buildSuccessorIndex();
   }
 
-  /** Enumerate bindings for a method's free parameters. */
+  /** Index ground ops by their most-selective precondition atom. Positive-lit
+   *  preconditions are necessary conditions, so an op whose selector atom does
+   *  not hold is inapplicable — letting search skip it without an evaluation. */
+  private buildSuccessorIndex(): void {
+    // distinct required values per slot ≈ selectivity (positional fluents
+    // partition finely; booleans shared by every binding do not)
+    const valuesBySlot = new Map<number, Set<number>>();
+    for (const g of this.groundOps) {
+      for (const a of g.preAtoms) {
+        let s = valuesBySlot.get(a.slot);
+        if (!s) valuesBySlot.set(a.slot, (s = new Set()));
+        s.add(a.value);
+      }
+    }
+    const selectivity = (slot: number): number => valuesBySlot.get(slot)?.size ?? 0;
+
+    this.succAlwaysOps = [];
+    const tables = new Map<number, Map<number, GroundOp[]>>();
+    for (const g of this.groundOps) {
+      if (g.preAtoms.length === 0) {
+        this.succAlwaysOps.push(g); // no indexable precondition — always consider
+        continue;
+      }
+      let sel = g.preAtoms[0];
+      for (let i = 1; i < g.preAtoms.length; i++) {
+        if (selectivity(g.preAtoms[i].slot) > selectivity(sel.slot)) sel = g.preAtoms[i];
+      }
+      let table = tables.get(sel.slot);
+      if (!table) tables.set(sel.slot, (table = new Map()));
+      let list = table.get(sel.value);
+      if (!list) table.set(sel.value, (list = []));
+      list.push(g); // groundOps iterated in gid order ⇒ each bucket stays gid-sorted
+    }
+    this.succSelSlots = Int32Array.from(tables.keys());
+    this.succSelTables = Array.from(this.succSelSlots, (s) => tables.get(s) as Map<number, GroundOp[]>);
+    // a single bucket is already gid-sorted; only multiple contributing sources
+    // (≥2 selector slots, or always-ops mixed with a selector) can interleave
+    this.succNeedsSort = !(this.succAlwaysOps.length === 0 && this.succSelSlots.length <= 1);
+  }
+
+  /** Intern every distinct (slot,value) atom over the ground operators and emit
+   *  the typed-array tables + per-op id arrays the relaxation heuristic runs on. */
+  private buildRelaxTables(): void {
+    const slots: number[] = [];
+    const values: number[] = [];
+    const index = this.relaxAtomIndex;
+    const intern = (a: Atom): number => {
+      const key = `${a.slot}:${a.value}`;
+      let id = index.get(key);
+      if (id === undefined) {
+        id = slots.length;
+        index.set(key, id);
+        slots.push(a.slot);
+        values.push(a.value);
+      }
+      return id;
+    };
+    for (const g of this.groundOps) {
+      // the relaxation sees real precondition lits *plus* any `relax`
+      // over-approximation atoms (preAtoms — used for search — stay real-only)
+      const relaxPre = g.op.pre ? g.op.pre.relaxAtoms(g.b) : [];
+      g.preIds = Int32Array.from(relaxPre, intern);
+      g.addIds = Int32Array.from(g.addAtoms, intern);
+    }
+    this.relaxAtomCount = slots.length;
+    this.relaxAtomSlot = Int32Array.from(slots);
+    this.relaxAtomValue = Float64Array.from(values);
+    this.relaxAtomFuzzy = new Uint8Array(this.relaxAtomCount);
+    for (let id = 0; id < this.relaxAtomCount; id++) {
+      const owner = this.slotOwner[slots[id]];
+      this.relaxAtomFuzzy[id] = owner >= 0 && this.relaxFuzzyWrites.has(owner) ? 1 : 0;
+    }
+  }
+
+  /** interned relaxation-atom id for (slot,value), or -1 if no ground op references it */
+  relaxAtomId(slot: number, value: number): number {
+    const id = this.relaxAtomIndex.get(`${slot}:${value}`);
+    return id === undefined ? -1 : id;
+  }
+
+  /** Enumerate bindings for a method's free parameters (memoized — fixed types). */
   freeBindings(method: CompiledMethod): Bindings[] {
-    return this.enumerateBindings(method.freeParams.map((p) => p.type));
+    let cache = method.freeBindingsCache;
+    if (cache === undefined) {
+      cache = this.enumerateBindings(method.freeParams.map((p) => p.type));
+      method.freeBindingsCache = cache;
+    }
+    return cache;
   }
 
   // ---------------- introspection helpers

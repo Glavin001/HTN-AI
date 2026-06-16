@@ -231,9 +231,29 @@ fluents: [
   { name: "pos", params: [{ name: "a", type: "agent" }], kind: "vec2" },
 
   // a relation: a 2-arg boolean table (graph edges, adjacency, …)
-  { name: "road", params: [{ name: "a", type: "node" }, { name: "b", type: "node" }], kind: "boolean" },
+  // `static: true` ⇒ immutable after init (see below) — a big planning speedup
+  { name: "road", params: [{ name: "a", type: "node" }, { name: "b", type: "node" }], kind: "boolean", static: true },
 ]
 ```
+
+### Static fluents (immutable relations) — declare them, it's a major speedup
+
+Maps, adjacency, alignment, type tables, recipe tables — relations that are set
+once at init and never change — should be declared `static: true`. The compiler
+then treats precondition lits over them as **compile-time constants** and **drops
+every ground operator whose static precondition can never hold** (e.g. `move(a,b)`
+where `road(a,b)` is false), so they never enter search *or* the heuristic. On a
+grid this turns the operator set from O(cells²) into O(edges):
+
+```ts
+{ name: "adj", params: [{ name: "a", type: "cell" }, { name: "b", type: "cell" }], kind: "boolean", static: true }
+//   nav 10×10: 10 000 ground move ops → 360;  Scavenger HUGE: 6.1 s → 0.08 s
+```
+
+It is a **promise**: a `static` fluent must never be written — not by an operator
+(validated: declaring it and writing it is a compile error) *and not by the host*
+at runtime (e.g. don't `state.set` it between plans). Use it only for genuinely
+fixed structure; leave host-controlled inputs (like `has_vehicle`) non-static.
 
 ### The seven kinds and how they encode
 
@@ -1263,9 +1283,33 @@ use it only for prototyping or for genuinely state-independent checks.
 F.opaque("preflightOk")   // predicate registered under `predicates.preflightOk`
 ```
 
+### Relaxation hints (`relax`) — let a black box guide the heuristic
+
+Externals and opaque predicates are invisible to the delete-relaxation heuristic
+(treated optimistically as always-satisfiable), so `h` can't account for whatever
+they gate — search degrades toward brute force on the paths they sit on. Attach a
+**sound over-approximation**: a T1 formula the predicate's truth *implies* (a
+necessary condition). The relaxation folds its conjunctive lits in as extra
+preconditions, so `h` becomes informative again — often by orders of magnitude.
+
+```ts
+// "you can only `finish(x)` once x is prepared" — invisible while opaque…
+F.opaque("ready", F.lit("prepared", ["?x"]))            // …now h knows it
+F.ext("canMoveTo", ["?d","?to"], ["peg","size"], F.lit("clear", ["?to"]))
+```
+
+It only feeds the heuristic — the real applicability check still runs unchanged,
+so a hint can never make search *incorrect*. It must be a genuine necessary
+condition (predicate ⟹ hint): if it is, the heuristic stays admissible (`hmax`
+remains optimal); if you over-claim, you only risk suboptimal/greedier search,
+exactly like an over-tight declared read set. Only the conjunctive lits of the
+hint are used (an `or`/`cmp` part is skipped, staying optimistic). In one
+opaque-gated benchmark this cut expansions 14376 → 23 at K=6.
+
 **Rule of thumb:** stay in T1 whenever you can (best heuristics, exact replan
 triggers, fully serializable). Reach for T2 when you need real computation but can
-still declare its fluent footprint. Reserve T3 for throwaway checks.
+still declare its fluent footprint. Reserve T3 for throwaway checks — and add a
+`relax` hint whenever a T2/T3 predicate gates a planning-relevant choice.
 
 ---
 
