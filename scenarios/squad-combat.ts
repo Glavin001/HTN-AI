@@ -92,8 +92,8 @@ export const W_EXPOSE = 5.0; // cost per enemy with a clear shot on you (the dan
 export const W_PATH_EXPOSE = 0.8; // cost for crossing exposed ground to reach a spot
 export const W_RANGE = 0.12; // mild pull toward comfortable firing range (don't let it dominate cover)
 export const IDEAL_RANGE = 12; // closer than this you fight well; far costs a little accuracy
-export const SPOT_GRID = 4.2; // spacing of the auto-generated walkable grid
-export const MAX_SPOTS = 22; // cap on tactical points exposed to the planner (branching)
+export const SPOT_GRID = 3.2; // spacing of the auto-generated walkable grid
+export const MAX_SPOTS = 48; // cap on tactical points exposed to the planner (branching)
 
 /** Fluents the move-cost externals read — listed so a foe moving (perception) dirties
  *  the cost and the unit re-decides each beat. */
@@ -278,6 +278,14 @@ export function generateTacticalSpots(inst: SquadInstance): CoverSpec[] {
     for (const [sx, sz] of offs) {
       const x = cx + sx * (o.w / 2 + EDGE);
       const z = cz + sz * (o.d / 2 + EDGE);
+      if (!insideWall(x, z)) pts.push({ x, z });
+    }
+    // a wider standoff ring — diagonal firing angles a step back from the crate, so a
+    // unit can pick an OBLIQUE line on the enemy (more interesting perspectives than
+    // just hugging the box edge)
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]] as [number, number][]) {
+      const x = cx + sx * (o.w / 2 + EDGE * 2.6);
+      const z = cz + sz * (o.d / 2 + EDGE * 2.6);
       if (!insideWall(x, z)) pts.push({ x, z });
     }
   }
@@ -939,6 +947,24 @@ function believedFoes(q: ExtQuery, foes: string[]): { x: number; z: number }[] {
 function spotHasLos(world: SquadWorld, x: number, z: number, t: number[]): boolean {
   if (x === t[0] && z === t[1]) return false;
   return world.losClear(x, z, t[0], t[1]) && dist2(x, z, t[0], t[1]) <= SIGHT_RANGE;
+}
+
+/** The risk/reward of standing at (sx,sz) to fight `threat`, with `foes` able to shoot
+ *  you — the SAME cost the planner's spot search optimises, exposed so the view can
+ *  paint the potential field. `cost` is the whole-engagement cost (shots-to-kill ×
+ *  per-shot exposure); `firing` is false when the spot has no line of fire (cost ∞). */
+export interface SpotEval {
+  firing: boolean;
+  exposure: number;
+  cost: number;
+}
+export function evaluateSpot(world: SquadWorld, sx: number, sz: number, threat: { x: number; z: number }, foes: { x: number; z: number }[], caution = 1): SpotEval {
+  const exposure = world.exposureAt(sx, sz, foes);
+  if (!spotHasLos(world, sx, sz, [threat.x, threat.z])) return { firing: false, exposure, cost: Infinity };
+  let hit = rangeFalloff(dist2(sx, sz, threat.x, threat.z));
+  if (world.inCoverVs(threat.x, threat.z, sx, sz)) hit *= COVER_HIT_MULT;
+  const shots = Math.max(1, Math.ceil(100 / (SHOT_DAMAGE * Math.max(0.12, hit))));
+  return { firing: true, exposure, cost: shots * (1 + caution * W_EXPOSE * exposure) };
 }
 
 /**

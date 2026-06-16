@@ -3,7 +3,7 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, Grid, Html, Line, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
-import type { SquadFrame, SquadInstance, UnitFrame } from "@scenarios/squad-combat";
+import { SquadWorld, evaluateSpot, type SquadFrame, type SquadInstance, type UnitFrame, type SpotEval } from "@scenarios/squad-combat";
 
 const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
 const COVER_COLOR = { free: "#4b463d", flank: "#b45309", high: "#6d28d9", breach: "#7c2d12", rally: "#15803d" };
@@ -34,18 +34,54 @@ interface SceneProps {
   onSelect: (name: string) => void;
 }
 
-/** The candidate positions the spot search considers, drawn as faint floor markers so
- *  you can see the discrete option space. The one the SELECTED unit is currently moving
- *  to (parsed from its plan step) lights up — that's the choice the search just made. */
-function TacticalSpots({ spots, chosen }: { spots: { name: string; x: number; z: number }[]; chosen: string | null }) {
+/** green (good / cheap & safe) → red (bad / exposed) for a normalized cost t∈[0,1]. */
+function heatColor(t: number): string {
+  return new THREE.Color().setHSL((1 - t) * 0.33, 0.85, 0.5).getStyle();
+}
+
+interface Heat {
+  evals: Map<string, SpotEval>;
+  lo: number;
+  hi: number;
+}
+
+/** The candidate positions the spot search considers, drawn as floor markers. When a
+ *  unit is selected they become a POTENTIAL FIELD: each dot is tinted by that unit's
+ *  risk/reward at that spot (green = cheap, safe firing position → red = exposed),
+ *  grey = no line of fire. The dot the unit is moving to lights up cyan — the choice
+ *  the search just made. The field shifts live as enemies move. */
+function TacticalSpots({ spots, chosen, heat }: { spots: { name: string; x: number; z: number }[]; chosen: string | null; heat: Heat | null }) {
   return (
     <group>
       {spots.map((s) => {
-        const isChosen = s.name === chosen;
+        if (s.name === chosen) {
+          return (
+            <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.02, s.z]}>
+              <circleGeometry args={[0.34, 24]} />
+              <meshBasicMaterial color="#38bdf8" transparent opacity={0.9} side={THREE.DoubleSide} />
+            </mesh>
+          );
+        }
+        let color = "#3b4763";
+        let opacity = 0.26;
+        let r = 0.12;
+        const e = heat?.evals.get(s.name);
+        if (e) {
+          if (!e.firing) {
+            color = "#2b3447";
+            opacity = 0.2;
+            r = 0.11;
+          } else {
+            const t = heat && heat.hi > heat.lo ? (e.cost - heat.lo) / (heat.hi - heat.lo) : 0;
+            color = heatColor(t);
+            opacity = 0.82;
+            r = 0.22;
+          }
+        }
         return (
           <mesh key={s.name} rotation={[-Math.PI / 2, 0, 0]} position={[s.x, 0.015, s.z]}>
-            <circleGeometry args={[isChosen ? 0.34 : 0.12, isChosen ? 24 : 10]} />
-            <meshBasicMaterial color={isChosen ? "#38bdf8" : "#3b4763"} transparent opacity={isChosen ? 0.85 : 0.28} side={THREE.DoubleSide} />
+            <circleGeometry args={[r, 12]} />
+            <meshBasicMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} />
           </mesh>
         );
       })}
@@ -250,6 +286,28 @@ function Scene({ frame, instance, spots = [], selected, onSelect }: SceneProps) 
     return best;
   }, [sel, frame]);
 
+  // geometry-only world (walls + crates) for scoring spots from the view — pure LOS /
+  // cover / exposure math, rebuilt only when the map changes.
+  const world = useMemo(() => new SquadWorld(instance), [instance]);
+
+  // the potential field FOR THE SELECTED UNIT: score every candidate spot by its
+  // risk/reward against the enemies' CURRENT positions this frame (so it shifts as
+  // they move). Drives the heatmap tint.
+  const heat = useMemo<Heat | null>(() => {
+    if (!sel || !sel.alive || !selTarget || spots.length === 0) return null;
+    const foes = frame.units.filter((u) => u.alive && (HOSTILE[sel.side] ?? []).includes(u.side)).map((u) => ({ x: u.x, z: u.z }));
+    const threat = { x: selTarget.x, z: selTarget.z };
+    const evals = new Map<string, SpotEval>();
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const s of spots) {
+      const e = evaluateSpot(world, s.x, s.z, threat, foes);
+      evals.set(s.name, e);
+      if (e.firing) { lo = Math.min(lo, e.cost); hi = Math.max(hi, e.cost); }
+    }
+    return { evals, lo, hi };
+  }, [sel, selTarget, spots, frame, world]);
+
   // the spot the selected unit is currently moving to — parsed from its plan step
   // (e.g. "moveFree(spot12)" / "moveToSpot(crNW)"). This is the search's live choice.
   const chosenSpot = useMemo(() => {
@@ -283,7 +341,7 @@ function Scene({ frame, instance, spots = [], selected, onSelect }: SceneProps) 
       ))}
 
       {/* the discrete candidate positions the planner scores each beat */}
-      <TacticalSpots spots={spots} chosen={chosenSpot} />
+      <TacticalSpots spots={spots} chosen={chosenSpot} heat={heat} />
 
       {/* the move the SELECTED unit's search just committed to (unit → chosen spot) */}
       {sel && sel.alive && chosenPos && (
