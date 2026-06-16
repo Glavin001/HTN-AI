@@ -619,6 +619,54 @@ test("squad: the spot-graph route composes a multi-hop path around a barricade t
   assert.equal(sim.world.actors.get("P")!.alive, false, "and reached a firing angle to neutralize the target");
 });
 
+// --------------------------------------------------- F: known limitation — no survival modelling
+
+test("squad: planning does NOT model own survival — units die mid-reposition crossing fire", () => {
+  // Characterizes a real gap (not a feature): NO operator projects myHp loss, so the
+  // crossing of an exposed lane is only a soft COST (pathExposure, scaled by caution),
+  // never a survival constraint. A unit therefore commits to a reposition toward a
+  // better angle even when the enemy's fire kills it before it arrives — it cannot
+  // reason "I'll be dead before I complete this move." We assert the observable symptom:
+  // across seeds, some units die WHILE executing a move step (not while firing).
+  const inst: SquadInstance = {
+    units: [
+      { name: "R1", side: "enemy", x: -10, z: -1, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -10, z: 2, role: "flanker" },
+      { name: "B1", side: "ally", x: 10, z: 1, role: "suppressor" },
+      { name: "B2", side: "ally", x: 10, z: -2, role: "flanker" },
+    ],
+    covers: [
+      { name: "cW", x: -5, z: 0 }, { name: "cE", x: 5, z: 0 },
+      { name: "crNW", x: -3.5, z: -7 }, { name: "crNE", x: 3.5, z: -7 },
+      { name: "crSW", x: -3.5, z: 7 }, { name: "crSE", x: 3.5, z: 7 },
+      { name: "fNW", x: -3, z: -9.5, flank: true }, { name: "fSW", x: -3, z: 9.5, flank: true },
+      { name: "fNE", x: 3, z: -9.5, flank: true }, { name: "fSE", x: 3, z: 9.5, flank: true },
+    ],
+    walls: [{ x: -2, z: -5, w: 4, d: 10 }], // central barricade forces exposed flanks
+  };
+  const isMove = (s: string) => /^(moveFree|moveToSpot|flankTo|advanceTo|retreatTo)/.test(s);
+  let total = 0;
+  let moveDeaths = 0;
+  for (const seed of [1, 2, 3, 4, 5, 6]) {
+    const sim = new SquadSim(inst, { seed, positioning: "goap" });
+    const lastStep = new Map<string, string>();
+    const alive = new Map<string, boolean>();
+    for (const u of sim.snapshot().units) alive.set(u.name, true);
+    for (let i = 0; i < 600 && !sim.engagementOver(); i++) {
+      for (const u of sim.step().units) {
+        if (alive.get(u.name) && !u.alive) {
+          total++;
+          if (isMove(lastStep.get(u.name) ?? "")) moveDeaths++;
+          alive.set(u.name, false);
+        }
+        if (u.alive && u.step && u.step !== "—") lastStep.set(u.name, u.step);
+      }
+    }
+  }
+  assert.ok(total > 0, "the engagements produced casualties");
+  assert.ok(moveDeaths >= 1, `at least one unit died while repositioning across fire (saw ${moveDeaths}/${total}) — confirms plans don't weigh lethal crossing as survival`);
+});
+
 // ---------------------------------------------------------------- F: caution (outgunned ⇒ value safety)
 
 test("squad: an outgunned unit becomes more cautious than one fighting even odds", () => {
