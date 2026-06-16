@@ -44,24 +44,37 @@ function blockedFlankInstance(): SquadInstance {
   };
 }
 
-/** Your Blue squad (autonomous) vs a Red squad — you command one Blue unit. */
+/** Your Blue squad (autonomous) vs a Red squad — you command a Blue unit. A
+ *  building + scattered crates give real cover; the Blue rally cluster (safe right
+ *  side) means "regroup" gathers the squad instead of running it into the open. */
 function companionInstance(): SquadInstance {
   return {
     units: [
-      { name: "B1", side: "ally", x: 8, z: -1, role: "suppressor" },
-      { name: "B2", side: "ally", x: 8, z: 2, role: "flanker" },
-      { name: "R1", side: "enemy", x: -9, z: -1, role: "suppressor" },
-      { name: "R2", side: "enemy", x: -9, z: 2, role: "flanker" },
+      // your Blue squad outnumbers Red 3:2, so an order is a tactical choice, not
+      // an instant loss — pull one back and the other two can still hold
+      { name: "B1", side: "ally", x: 10, z: -2, role: "suppressor" },
+      { name: "B2", side: "ally", x: 10, z: 2, role: "flanker" },
+      { name: "B3", side: "ally", x: 12, z: 0, role: "assault" },
+      { name: "R1", side: "enemy", x: -10, z: -1, role: "suppressor" },
+      { name: "R2", side: "enemy", x: -10, z: 2, role: "flanker" },
     ],
     covers: [
-      { name: "cW", x: -3, z: 0 },
-      { name: "cE", x: 3, z: 0 },
-      { name: "fNW", x: -2, z: -7, flank: true },
-      { name: "fSW", x: -2, z: 7, flank: true },
-      { name: "fNE", x: 2, z: -7, flank: true },
-      { name: "fSE", x: 2, z: 7, flank: true },
-      { name: "bRally", x: 11, z: 0, rally: true },
-      { name: "rRally", x: -11, z: 0, rally: true },
+      { name: "cNW", x: -5, z: -5 },
+      { name: "cSW", x: -5, z: 5 },
+      { name: "cNE", x: 5, z: -5 },
+      { name: "cSE", x: 5, z: 5 },
+      { name: "fN", x: 0, z: -9, flank: true },
+      { name: "fS", x: 0, z: 9, flank: true },
+      // Blue's defensive rally line on its own (right) side — close enough to keep
+      // a line of fire, so a regrouped unit gathers AND fights instead of dying
+      { name: "bRallyA", x: 7, z: -5, rally: true },
+      { name: "bRallyB", x: 7, z: 5, rally: true },
+      { name: "rRally", x: -7, z: 0, rally: true },
+    ],
+    walls: [
+      { x: -3.5, z: -2.5, w: 7, d: 5 }, // central building
+      { x: 6, z: -7, w: 2, d: 2 }, // scattered crates
+      { x: -8, z: 5, w: 2, d: 2 },
     ],
   };
 }

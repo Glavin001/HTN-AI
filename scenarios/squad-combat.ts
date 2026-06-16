@@ -613,7 +613,9 @@ export const squadDomain: DomainDoc = {
       params: [{ name: "r", type: "cover" }],
       pre: F.and(F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
       utility: N.sub(N.c(0), N.dist("myPos", [], "coverPos", ["?r"])), // nearest rally
-      subtasks: [{ do: "retreatTo", args: ["?r"] }],
+      // fall back to the rally, THEN hold and fight from there (defensive) rather
+      // than sitting passively and getting overrun
+      subtasks: [{ do: "retreatTo", args: ["?r"] }, { do: "Fight" }],
     },
   ],
 };
@@ -807,7 +809,12 @@ export interface UnitPlanner {
   trace: TraceEvent[];
   /** most recent "why a branch was rejected" reasons (glass-box director, E3) */
   why: string[];
+  /** the unit's current goal, in plain words + how the library expresses it */
+  goalText: string;
+  goalExpr: string;
 }
+
+const DEFAULT_GOAL = { text: "Win the firefight — neutralize the enemy squad", expr: 'task("Fight")' };
 
 // ---------------------------------------------------------------- the sim
 
@@ -834,6 +841,11 @@ export interface UnitFrame {
   sees: string | null;
   tactic: string;
   status: string;
+  /** the unit's current goal in plain words + the library form (glass-box director) */
+  goalText: string;
+  goalExpr: string;
+  /** the plan was just invalidated and is being recomputed */
+  replanning: boolean;
   /** the unit's current plan, as readable step labels (glass-box director) */
   plan: string[];
   /** recent trace event kinds (glass-box director) */
@@ -909,6 +921,8 @@ export class SquadSim {
         lastSeen: -Infinity,
         trace,
         why: [],
+        goalText: DEFAULT_GOAL.text,
+        goalExpr: DEFAULT_GOAL.expr,
       };
       entry.planner = new Planner(model, {
         goals: [{ kind: "task", name: "Fight" }],
@@ -976,10 +990,16 @@ export class SquadSim {
     if (!p) return;
     if (order === "regroup") {
       p.planner.setGoals([{ kind: "task", name: "Regroup" }]);
+      p.goalText = "Regroup — fall back to the nearest rally";
+      p.goalExpr = 'task("Regroup")';
     } else if (order === "holdFire") {
       p.planner.setGoals([]); // stand down
+      p.goalText = "Hold fire — stand down";
+      p.goalExpr = "goals: [] (idle)";
     } else {
       p.planner.setGoals([{ kind: "task", name: "Fight" }]);
+      p.goalText = DEFAULT_GOAL.text;
+      p.goalExpr = DEFAULT_GOAL.expr;
     }
   }
 
@@ -1119,6 +1139,9 @@ export class SquadSim {
           sees,
           tactic: up ? this.world.team(a.side).tactic : "—",
           status,
+          goalText: up ? up.goalText : "—",
+          goalExpr: up ? up.goalExpr : "",
+          replanning: up ? up.trace.slice(-3).some((e) => e.t === "replan.dirty" || e.t === "repair.attempt") || status === "planning" : false,
           plan: up && plan ? planSummary(up.model, plan) : [],
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
           why: up ? up.why : [],
