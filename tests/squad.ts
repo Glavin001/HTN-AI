@@ -1,7 +1,16 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
 import { type TraceEvent, F, N, explainFailure, goal, planOnce } from "../src/index";
-import { type SquadInstance, SquadSim, breachInstance, squadModel } from "../scenarios/index";
+import {
+  COVER_HIT_MULT,
+  type SquadInstance,
+  SquadSim,
+  SquadWorld,
+  breachInstance,
+  coverFootprint,
+  isSoftCover,
+  squadModel,
+} from "../scenarios/index";
 
 /**
  * Squad Combat — ground-truth assertions for the F.E.A.R.-style tactical
@@ -319,6 +328,125 @@ test("squad: the planner can explain why an impossible engagement fails (glass-b
   assert.equal(result.status, "failure", "no line of fire exists ⇒ planning fails");
   const reasons = explainFailure(result);
   assert.ok(reasons.length > 0, "explainFailure produced human-readable rejection reasons");
+});
+
+// ---------------------------------------------------------------- F: tactical model — directional cover
+
+test("squad: a crate gives cover against a shooter behind it, but not one on your own side (directional)", () => {
+  // a plain crate at the origin; foe to the NORTH. Standing just SOUTH of the crate
+  // puts it on the incoming line → in cover. A foe to the SOUTH (your side) is not blocked.
+  const inst: SquadInstance = {
+    units: [{ name: "E", side: "enemy", x: 0, z: -1.4 }],
+    covers: [{ name: "crate", x: 0, z: 0 }],
+  };
+  const world = new SquadWorld(inst);
+  assert.ok(isSoftCover(inst.covers[0]), "a plain crate is soft cover");
+  assert.equal(world.softCovers.length, 1, "the crate produced a soft-cover footprint");
+  assert.ok(world.inCoverVs(0, -1.4, 0, 6), "the crate shields against a shooter to the north");
+  assert.not.ok(world.inCoverVs(0, -1.4, 0, -6), "it does NOT shield against a shooter on your own side");
+  // step to the OTHER side of the crate and the cover flips to the other shooter
+  assert.ok(world.inCoverVs(0, 1.4, 0, -6), "moving around the crate shields the opposite angle");
+});
+
+test("squad: maneuver anchors (flank/rally) are open ground, not crates", () => {
+  const inst: SquadInstance = {
+    units: [{ name: "E", side: "enemy", x: 0, z: 0 }],
+    covers: [
+      { name: "f", x: 5, z: 5, flank: true },
+      { name: "r", x: -5, z: 0, rally: true },
+      { name: "crate", x: 0, z: 3 },
+    ],
+  };
+  const world = new SquadWorld(inst);
+  assert.equal(world.softCovers.length, 1, "only the plain crate is soft cover — flank/rally are open");
+  assert.ok(coverFootprint(inst.covers[2]).w > 0, "a footprint has a real extent");
+});
+
+test("squad: hit chance falls with range and is cut by the target's cover", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0 },
+      { name: "P", side: "player", x: 0, z: 4 },
+    ],
+    covers: [{ name: "crate", x: 0, z: 0 }],
+  };
+  const world = new SquadWorld(inst);
+  const shooter = world.actors.get("E")!;
+  const near = world.actors.get("P")!;
+  const close = world.hitChance(shooter, near);
+  near.z = 18; // farther away
+  const far = world.hitChance(shooter, near);
+  assert.ok(close > far, "closing the distance improves accuracy");
+  // now the target is in cover relative to the shooter
+  near.x = 0;
+  near.z = 6;
+  const open = world.hitChance(shooter, near); // shooter at crate, no cover for target here
+  const coveredWorld = new SquadWorld({
+    units: [
+      { name: "E", side: "enemy", x: 0, z: -6 },
+      { name: "P", side: "player", x: 0, z: 1.4 }, // hugging the crate, crate between it and E
+    ],
+    covers: [{ name: "crate", x: 0, z: 0 }],
+  });
+  const covered = coveredWorld.hitChance(coveredWorld.actors.get("E")!, coveredWorld.actors.get("P")!);
+  assert.ok(covered < open * COVER_HIT_MULT * 2, "a target in cover is much harder to hit");
+});
+
+test("squad: exposure counts the foes with a clear line of fire, cover and walls reduce it", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0 },
+      { name: "P1", side: "player", x: -6, z: 0 },
+      { name: "P2", side: "player", x: 6, z: 0 },
+    ],
+    covers: [{ name: "crate", x: 0, z: 0 }],
+  };
+  const world = new SquadWorld(inst);
+  const foes = [{ x: -6, z: 0 }, { x: 6, z: 0 }];
+  // standing in the open between them → exposed to both
+  assert.equal(world.exposureAt(0, -4, foes), 2, "open ground is exposed to both foes");
+  // hug the crate so it blocks the foe to the north... both foes are to the sides here,
+  // so place foes north/south to exercise cover directionality
+  const ns = [{ x: 0, z: -10 }, { x: 0, z: 10 }];
+  assert.equal(world.coverCountAt(0, 1.4, ns), 1, "the crate covers exactly one of the two opposed foes");
+  assert.equal(world.exposureAt(0, 1.4, ns), 1, "so exposure drops to the single uncovered foe");
+});
+
+// ---------------------------------------------------------------- F: multi-enemy belief
+
+test("squad: perception tracks each known hostile individually (multi-enemy belief)", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+      { name: "P1", side: "player", x: 4, z: 0 },
+      { name: "P2", side: "player", x: -4, z: 2 },
+    ],
+    covers: [{ name: "c", x: 0, z: 0 }],
+  };
+  const sim = new SquadSim(inst, { seed: 1 });
+  sim.step();
+  const e = sim.units.find((u) => u.name === "E")!;
+  const snap = e.planner.state;
+  assert.ok(e.foes.includes("P1") && e.foes.includes("P2"), "both players are tracked as foes");
+  assert.equal(e.model.read(snap, "foeSeen", "P1"), true, "P1 is currently seen");
+  assert.equal(e.model.read(snap, "foeSeen", "P2"), true, "P2 is currently seen");
+  const p1 = e.model.read(snap, "foePos", "P1");
+  assert.ok(p1 !== null, "P1's believed position was written into belief");
+});
+
+test("squad: a hostile hidden behind a wall is not 'seen' (belief is line-of-sight gated)", () => {
+  const inst: SquadInstance = {
+    units: [
+      { name: "E", side: "enemy", x: 0, z: 0, role: "assault" },
+      { name: "P", side: "player", x: 0, z: 10 },
+    ],
+    covers: [{ name: "c", x: 0, z: 0 }],
+    walls: [{ x: -3, z: 4, w: 6, d: 1 }], // blocks the line E↔P
+  };
+  const sim = new SquadSim(inst, { seed: 1 });
+  sim.step();
+  const e = sim.units.find((u) => u.name === "E")!;
+  assert.equal(e.model.read(e.planner.state, "foeSeen", "P"), false, "the hidden player is not seen");
 });
 
 // ---------------------------------------------------------------- exports sanity

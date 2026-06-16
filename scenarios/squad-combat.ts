@@ -60,6 +60,23 @@ export const LOW_HP = 48; // pull back to cover once this hurt (react to taking 
 export const SIGHT_RANGE = 22;
 export const BREACH_WINDOW = 6; // seconds the synchronized breach must complete within
 
+// ---- tactical positioning model (cover is directional + dynamic; range matters) ----
+// A "soft cover" crate is a half-height structure you stand BESIDE: it doesn't block
+// shooting line-of-sight (you peek/shoot over it) or movement, but if its footprint
+// sits between you and a shooter, that shooter's hit chance on you is cut. Which
+// enemies it shields you from depends on which side of the crate you stand — so the
+// same spot's value changes as enemies move or a new one appears on your flank.
+export const COVER_HALF_W = 0.6; // soft-cover footprint half-width (≈ drawn crate)
+export const COVER_HALF_D = 0.4; // soft-cover footprint half-depth
+export const COVER_REACH = 1.8; // how close you must hug a crate for it to shield you
+export const COVER_HIT_MULT = 0.28; // incoming hit chance is scaled by this when in cover
+export const BASE_ACCURACY = 0.96; // point-blank hit chance (open, no cover)
+export const ACC_MIN = 0.42; // hit chance at the edge of sight range (open)
+export const PEEK_PENALTY = 0.82; // your OWN outgoing accuracy when you shoot from cover
+// expected damage the planner reasons with when it sees a believed target (it plans
+// over the *average* shot; execution rolls the seeded RNG around it)
+export const EXPECTED_HIT = 0.78;
+
 // ---------------------------------------------------------------- instance shapes
 
 export type Side = "enemy" | "ally" | "player";
@@ -198,6 +215,31 @@ function boxCorners(w: WallSpec, pad: number): Vec2[] {
   ];
 }
 
+/** A cover crate is "soft cover" — a half-height thing you fight from beside —
+ *  unless it's a maneuver anchor (flank / high / breach / rally), which are open
+ *  waypoints, not crates. Only soft cover blocks incoming fire directionally. */
+export function isSoftCover(c: CoverSpec): boolean {
+  return !c.flank && !c.high && !c.breach && !c.rally;
+}
+
+/** The axis-aligned footprint of a soft-cover crate (used for directional cover). */
+export function coverFootprint(c: CoverSpec): WallSpec {
+  return { x: c.x - COVER_HALF_W, z: c.z - COVER_HALF_D, w: 2 * COVER_HALF_W, d: 2 * COVER_HALF_D };
+}
+
+/** Distance from a point to an axis-aligned box (0 if inside). */
+function distToBox(px: number, pz: number, b: WallSpec): number {
+  const dx = Math.max(b.x - px, 0, px - (b.x + b.w));
+  const dz = Math.max(b.z - pz, 0, pz - (b.z + b.d));
+  return Math.hypot(dx, dz);
+}
+
+/** Hit-chance falloff with range: full at point-blank, ACC_MIN at sight range. */
+function rangeFalloff(d: number): number {
+  const t = Math.min(1, Math.max(0, d / SIGHT_RANGE));
+  return BASE_ACCURACY + (ACC_MIN - BASE_ACCURACY) * t;
+}
+
 /** Position reached by walking `dist` along a polyline; `done` once past the end. */
 function walkPolyline(path: Vec2[], dist: number): { x: number; z: number; done: boolean } {
   let rem = dist;
@@ -224,6 +266,8 @@ export class SquadWorld {
   public readonly covers: CoverSpec[];
   public readonly coverByName = new Map<string, CoverSpec>();
   public readonly walls: WallSpec[];
+  /** half-height crate footprints — block incoming fire directionally, not LOS/movement */
+  public readonly softCovers: WallSpec[];
 
   // ---- blackboard — PER TEAM (each side coordinates its own squad; the two teams
   //      share no memory, only physical cover reservations) ----
@@ -249,6 +293,7 @@ export class SquadWorld {
   constructor(inst: SquadInstance) {
     this.covers = inst.covers;
     this.walls = inst.walls ?? [];
+    this.softCovers = inst.covers.filter(isSoftCover).map(coverFootprint);
     for (const c of inst.covers) {
       this.coverByName.set(c.name, c);
       this.coverOwner.set(c.name, null);
@@ -280,6 +325,62 @@ export class SquadWorld {
   losClear(ax: number, az: number, bx: number, bz: number): boolean {
     for (const w of this.activeWalls()) if (segHitsBox(ax, az, bx, bz, w)) return false;
     return true;
+  }
+
+  /** Is a unit AT (px,pz) in soft cover against a shooter at (ex,ez)? True when a
+   *  crate it is hugging sits on the line between them — directional + dynamic, so
+   *  it lapses the instant the shooter rounds the crate (or a new one flanks). */
+  inCoverVs(px: number, pz: number, ex: number, ez: number): boolean {
+    for (const c of this.softCovers) {
+      if (distToBox(px, pz, c) > COVER_REACH) continue; // must be hugging THIS crate
+      if (segHitsBox(px, pz, ex, ez, c)) return true; // crate blocks the incoming line
+    }
+    return false;
+  }
+
+  /** Every living actor hostile to `side` (ground truth — used for tuning/tests). */
+  hostilesOf(side: Side): Actor[] {
+    return [...this.actors.values()].filter((a) => a.alive && HOSTILE[side].includes(a.side));
+  }
+
+  /** The names of every actor hostile to `self` (static — the set of possible foes,
+   *  alive or not). Each becomes a `foe` entity so belief can track it individually. */
+  foeNamesFor(self: string): string[] {
+    const me = this.actors.get(self);
+    if (!me) return [];
+    return [...this.actors.values()].filter((a) => HOSTILE[me.side].includes(a.side)).map((a) => a.name);
+  }
+
+  /** Probability a shot from `shooter` lands on `target`, given range + the target's
+   *  cover relative to the shooter (and a small peek penalty if the shooter itself is
+   *  hugging cover). Deterministic inputs → the executor rolls a seeded RNG against it. */
+  hitChance(shooter: Actor, target: Actor): number {
+    const d = dist2(shooter.x, shooter.z, target.x, target.z);
+    let p = rangeFalloff(d);
+    if (this.inCoverVs(target.x, target.z, shooter.x, shooter.z)) p *= COVER_HIT_MULT;
+    // shooting from behind your own crate trims your accuracy a touch (you're peeking)
+    if (this.softCovers.some((c) => distToBox(shooter.x, shooter.z, c) <= COVER_REACH && segHitsBox(shooter.x, shooter.z, target.x, target.z, c))) p *= PEEK_PENALTY;
+    return Math.min(1, Math.max(0.02, p));
+  }
+
+  /** How many of `foes` currently have a clear line of fire on (px,pz) AND no soft
+   *  cover denies them — i.e. how exposed this spot is. Pass believed foe positions. */
+  exposureAt(px: number, pz: number, foes: { x: number; z: number }[]): number {
+    let n = 0;
+    for (const f of foes) {
+      if (dist2(px, pz, f.x, f.z) > SIGHT_RANGE) continue;
+      if (!this.losClear(px, pz, f.x, f.z)) continue; // a wall already shields you here
+      if (this.inCoverVs(px, pz, f.x, f.z)) continue; // a crate denies this shooter
+      n++;
+    }
+    return n;
+  }
+
+  /** How many of `foes` this spot has soft cover against (the spot's defensive value). */
+  coverCountAt(px: number, pz: number, foes: { x: number; z: number }[]): number {
+    let n = 0;
+    for (const f of foes) if (dist2(px, pz, f.x, f.z) <= SIGHT_RANGE && this.inCoverVs(px, pz, f.x, f.z)) n++;
+    return n;
   }
 
   /** Shortest walkable path from (ax,az) to (bx,bz) around obstacles (visibility
@@ -363,7 +464,7 @@ export class SquadWorld {
  */
 export const squadDomain: DomainDoc = {
   name: "squad-combat",
-  types: [{ name: "cover" }],
+  types: [{ name: "cover" }, { name: "foe" }],
   fluents: [
     // --- self (belief; perception mirrors truth, ungated) ---
     { name: "myPos", kind: "vec2" },
@@ -377,6 +478,13 @@ export const squadDomain: DomainDoc = {
     { name: "threatHp", kind: "float", initial: 100 },
     { name: "threatSeen", kind: "boolean", initial: false }, // have a current line of sight
     { name: "hasThreat", kind: "boolean", initial: false }, // have a position fix at all (sight OR hearing)
+    // --- known hostiles (belief; one set of slots per foe, gated like the threat).
+    //     This is what makes EXPOSURE real: a spot's danger = how many of THESE have a
+    //     line of fire on it. A foe you haven't seen yet isn't dodged — so when one
+    //     appears on your flank, your cover lapses and you reactively reposition. ---
+    { name: "foePos", params: [{ name: "f", type: "foe" }], kind: "vec2" },
+    { name: "foeAlive", params: [{ name: "f", type: "foe" }], kind: "boolean", initial: false },
+    { name: "foeSeen", params: [{ name: "f", type: "foe" }], kind: "boolean", initial: false },
     // --- squad blackboard (belief; written by the coordinator) ---
     { name: "flankerReady", kind: "boolean", initial: false },
     // --- cover descriptors (static, set at init) ---
@@ -625,6 +733,8 @@ export const squadDomain: DomainDoc = {
 function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): Model {
   const entities: Record<string, string> = {};
   for (const c of inst.covers) entities[c.name] = "cover";
+  const foes = world.foeNamesFor(self);
+  for (const f of foes) entities[f] = "foe";
   return createModel(
     squadDomain,
     {
@@ -797,6 +907,13 @@ function setBeliefVec(p: UnitPlanner, fluent: string, x: number, z: number): voi
   p.planner.state.set(slot + 1, z);
 }
 
+function setBeliefVecArgs(p: UnitPlanner, fluent: string, args: (string | number)[], x: number, z: number): void {
+  const gids = args.map((a) => (typeof a === "string" ? p.model.entityId(a) : a));
+  const slot = p.model.slotOf(fluent, ...gids);
+  p.planner.state.set(slot, x);
+  p.planner.state.set(slot + 1, z);
+}
+
 // ---------------------------------------------------------------- unit planner wrapper
 
 export interface UnitPlanner {
@@ -806,6 +923,10 @@ export interface UnitPlanner {
   model: Model;
   planner: PlannerT;
   lastSeen: number;
+  /** the static set of this unit's possible foes (hostile actor names) */
+  foes: string[];
+  /** per-foe clock of the last time this unit had a clear line of sight to it */
+  foeLastSeen: Map<string, number>;
   trace: TraceEvent[];
   /** most recent "why a branch was rejected" reasons (glass-box director, E3) */
   why: string[];
@@ -919,6 +1040,8 @@ export class SquadSim {
         model,
         planner: undefined as unknown as PlannerT,
         lastSeen: -Infinity,
+        foes: this.world.foeNamesFor(u.name),
+        foeLastSeen: new Map(),
         trace,
         why: [],
         goalText: DEFAULT_GOAL.text,
@@ -963,6 +1086,24 @@ export class SquadSim {
       setBelief(p, "threatHp", [], heard.hp);
     }
     setBelief(p, "hasThreat", [], !!heard);
+    // per-foe belief: track every known hostile individually (drives exposure/cover).
+    // LOS now → write truth; recently lost → keep last fix but mark unseen; long lost
+    // → drop it (you stop dodging someone you've lost track of).
+    for (const fname of p.foes) {
+      const fa = this.world.actors.get(fname);
+      if (!fa) continue;
+      const los = fa.alive && dist2(a.x, a.z, fa.x, fa.z) <= SIGHT_RANGE && this.world.losClear(a.x, a.z, fa.x, fa.z);
+      if (los) {
+        p.foeLastSeen.set(fname, this.world.clock);
+        setBeliefVecArgs(p, "foePos", [fname], fa.x, fa.z);
+        setBelief(p, "foeAlive", [fname], fa.alive);
+        setBelief(p, "foeSeen", [fname], true);
+      } else {
+        setBelief(p, "foeSeen", [fname], false);
+        const lost = this.world.clock - (p.foeLastSeen.get(fname) ?? -Infinity);
+        if (!fa.alive || lost > MEMORY_SECONDS) setBelief(p, "foeAlive", [fname], false);
+      }
+    }
     setBelief(p, "myCover", [], a.cover ?? false); // reconcile claimed cover (for the regroup goal)
     for (const c of this.world.covers) {
       const owner = this.world.coverOwner.get(c.name) ?? null;
