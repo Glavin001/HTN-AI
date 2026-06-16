@@ -15,21 +15,24 @@ import {
   type SquadScenarioId,
 } from "../lib/runSquad";
 import { useLiveSquad, type Order } from "../lib/useLiveSquad";
+import { useLiveDive } from "../lib/useLiveDive";
 import type { SquadFrame, SquadInstance } from "@scenarios/squad-combat";
 import type { TraceEvent } from "htn-ai";
 
 const StaircaseScene = dynamic(() => import("../components/StaircaseScene"), { ssr: false });
 const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: false });
 const SquadScene = dynamic(() => import("../components/SquadScene"), { ssr: false });
+const DiveScene = dynamic(() => import("../components/DiveScene"), { ssr: false });
 import SquadDirector from "../components/SquadDirector";
 
 type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
-type ScenarioId = GridId | "blocks" | SquadScenarioId;
-type Kind = "grid" | "blocks" | "squad";
+type ScenarioId = GridId | "blocks" | SquadScenarioId | "dive";
+type Kind = "grid" | "blocks" | "squad" | "dive";
 
 type Run = { kind: "grid"; data: RunResult } | { kind: "blocks"; data: BlocksRun } | { kind: "squad"; data: SquadRun };
 
 const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }> = {
+  dive: { name: "★ Deathmatch arena (LIVE)", kind: "dive", blurb: "A LIVE 4-bot free-for-all à la the 'Dive' shooter — but every bot is an htn-ai planner. Each arbitrates attack / get-health / get-weapon / explore from its own belief, hunts your last-seen position, picks weapons by range and respawns. Take over a bot (WASD + Space/click to fire) and fight them yourself." },
   skirmish: { name: "★ Skirmish: Red vs Blue", kind: "squad", blurb: "Two AI squads fight autonomously. Each unit plans from its OWN belief (no shared memory across teams) and reactively readjusts as it discovers the other's moves." },
   blockedFlank: { name: "★ Emergent flank: Red vs Blue", kind: "squad", blurb: "A barricade blocks every direct shot. No flank is scripted — each squad DISCOVERS it must reach a cover that can see the enemy, and they contest the same flanks." },
   breach: { name: "★ Timed breach: Red vs Blue", kind: "squad", blurb: "A Red fire-team breaches a door a Blue team holds — stacking and breaching in sync inside a deadline window enforced inside the planner's search." },
@@ -70,11 +73,13 @@ export default function Page() {
   const [heatMode, setHeatMode] = useState<"belief" | "truth">("belief");
 
   const isLive = scenario === "companion";
+  const isDive = scenario === "dive";
   const live = useLiveSquad(isLive ? "companion" : null, liveStepMs);
+  const dive = useLiveDive(isDive, liveStepMs);
 
-  // build the deterministic replay for everything EXCEPT the live companion battle
+  // build the deterministic replay for everything EXCEPT the live battles (dive + companion)
   useEffect(() => {
-    if (isLive) { setRun(null); setComputing(false); return; }
+    if (isLive || isDive) { setRun(null); setComputing(false); return; }
     setComputing(true);
     setRun(null);
     setStep(0);
@@ -118,7 +123,19 @@ export default function Page() {
 
   const narration = squad ? squadNarration(squad.frame) : "";
   const watch = SCENARIOS[scenario].kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
-  const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : "—";
+  const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : isDive && dive.frame ? diveStatus(dive.frame) : "—";
+
+  // a unified "live" controller so the playback card drives the squad OR dive sim
+  const liveCtl = isDive
+    ? { playing: dive.playing, setPlaying: dive.setPlaying, stepOnce: dive.stepOnce, reset: dive.reset }
+    : isLive
+      ? { playing: live.playing, setPlaying: live.setPlaying, stepOnce: live.stepOnce, reset: live.reset }
+      : null;
+
+  // default the inspector to the first combatant in the live deathmatch
+  useEffect(() => {
+    if (isDive && dive.frame && !selected) setSelected(dive.frame.bots[0]?.name ?? null);
+  }, [isDive, dive.frame, selected]);
 
   return (
     <div className="app">
@@ -131,6 +148,32 @@ export default function Page() {
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
         {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} spots={squad.spots} heatMode={heatMode} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {isDive && dive.frame && (
+          <DiveScene
+            key="dive"
+            frame={dive.frame}
+            halfWidth={dive.frame.halfWidth}
+            halfDepth={dive.frame.halfDepth}
+            selected={selected}
+            onSelect={(n) => setSelected(n || null)}
+            humanName={dive.humanName}
+            onInput={dive.setInput}
+          />
+        )}
+        {isDive && dive.frame && (
+          <div className="hud-top">
+            {dive.frame.scoreboard.map((s) => (
+              <span key={s.name} className="team-chip">
+                <i className="dot" style={{ background: s.color }} />
+                <b style={{ color: s.color }}>{s.name}</b>
+                <span className="mono">{s.frags} frags · {s.deaths} deaths{dive.humanName === s.name ? " · YOU" : ""}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        {isDive && dive.humanName && (
+          <div className="hud-narration">You are <b>{dive.humanName}</b> — WASD / arrows to move · Space or click to fire</div>
+        )}
 
         {squad && (
           <div className="hud-top">
@@ -183,11 +226,11 @@ export default function Page() {
           <h2>Scenario</h2>
           <div className="row spread">
             <select value={scenario} onChange={(e) => { setScenario(e.target.value as ScenarioId); setSelected(null); }}>
-              <optgroup label="Squad combat (game AI)">
-                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind === "squad").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
+              <optgroup label="Game AI">
+                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind === "squad" || SCENARIOS[id].kind === "dive").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
               </optgroup>
               <optgroup label="Spatial planning">
-                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind !== "squad").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
+                {(Object.keys(SCENARIOS) as ScenarioId[]).filter((id) => SCENARIOS[id].kind !== "squad" && SCENARIOS[id].kind !== "dive").map((id) => <option key={id} value={id}>{SCENARIOS[id].name}</option>)}
               </optgroup>
             </select>
             <span className={`pill ${/eliminated|succeeded/.test(status) ? "good" : status === "failed" ? "bad" : "busy"}`}>{status}</span>
@@ -214,16 +257,54 @@ export default function Page() {
           </div>
         )}
 
-        <div className="card">
-          <h2>{isLive ? "Live battle" : "Playback · deterministic replay"}</h2>
-          <div className="row">
-            <button className="primary" onClick={() => (isLive ? live.setPlaying(!live.playing) : setPlaying((p) => !p))} disabled={!isLive && !run}>
-              {(isLive ? live.playing : playing) ? "⏸ Pause" : "▶ Play"}
-            </button>
-            <button onClick={() => (isLive ? live.stepOnce() : setStep((s) => Math.min(s + 1, lastStep)))} disabled={isLive ? false : !run || step >= lastStep}>Step ⟩</button>
-            <button onClick={() => (isLive ? live.reset() : (setStep(0), setPlaying(true)))} disabled={!isLive && !run}>⟲ {isLive ? "Restart" : "Reset"}</button>
+        {isDive && dive.frame && (
+          <div className="card">
+            <h2>Take control — live</h2>
+            <div className="mono" style={{ color: "var(--muted)", marginBottom: 8 }}>
+              swap a bot between the <span style={{ color: "var(--accent-2)" }}>htn-ai planner</span> and <span style={{ color: "var(--accent-2)" }}>you</span> on the running sim — no reset. WASD/arrows move · Space/click fires.
+            </div>
+            <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+              {dive.frame.bots.map((b) => (
+                <button
+                  key={b.name}
+                  onClick={() => { setSelected(b.name); dive.takeOver(dive.humanName === b.name ? null : b.name); }}
+                  style={{ border: "1px solid " + (dive.humanName === b.name ? "#fde047" : "#2a3650"), color: dive.humanName === b.name ? "#fde047" : b.color, fontWeight: 700 }}
+                >
+                  {dive.humanName === b.name ? `🎮 ${b.name} (release)` : `take ${b.name}`}
+                </button>
+              ))}
+            </div>
           </div>
-          {!isLive && (
+        )}
+
+        {isDive && dive.frame && selected && (() => {
+          const b = dive.frame.bots.find((x) => x.name === selected);
+          if (!b) return null;
+          return (
+            <div className="card">
+              <h2>Bot · <span style={{ color: b.color }}>{b.name}</span> {b.control === "human" ? "(you)" : "· glass-box"}</h2>
+              <div className="mono" style={{ color: "var(--muted)" }}>{b.goalText}</div>
+              <div className="mono" style={{ marginTop: 4 }}>action: <span style={{ color: "var(--accent-2)" }}>{b.action}</span> · {b.hp} hp · {b.weapon}{b.ammo >= 0 ? ` (${b.ammo})` : ""}</div>
+              {b.control === "ai" && b.plan.length > 0 && (
+                <div className="mono" style={{ marginTop: 6, color: "var(--muted)" }}>plan: {b.plan.join(" → ")}</div>
+              )}
+              {b.control === "ai" && (
+                <div className="legend" style={{ marginTop: 6 }}>{b.events.map((e, i) => <span key={i} className="mono">{e}</span>)}</div>
+              )}
+            </div>
+          );
+        })()}
+
+        <div className="card">
+          <h2>{liveCtl ? "Live battle" : "Playback · deterministic replay"}</h2>
+          <div className="row">
+            <button className="primary" onClick={() => (liveCtl ? liveCtl.setPlaying(!liveCtl.playing) : setPlaying((p) => !p))} disabled={!liveCtl && !run}>
+              {(liveCtl ? liveCtl.playing : playing) ? "⏸ Pause" : "▶ Play"}
+            </button>
+            <button onClick={() => (liveCtl ? liveCtl.stepOnce() : setStep((s) => Math.min(s + 1, lastStep)))} disabled={liveCtl ? false : !run || step >= lastStep}>Step ⟩</button>
+            <button onClick={() => (liveCtl ? liveCtl.reset() : (setStep(0), setPlaying(true)))} disabled={!liveCtl && !run}>⟲ {liveCtl ? "Restart" : "Reset"}</button>
+          </div>
+          {!liveCtl && (
             <div className="row" style={{ marginTop: 10 }}>
               <span className="mono" style={{ color: "var(--muted)" }}>t</span>
               <input type="range" min={0} max={lastStep} step={1} value={Math.min(step, lastStep)} onChange={(e) => { setPlaying(false); setStep(Number(e.target.value)); }} style={{ flex: 1 }} />
@@ -232,7 +313,7 @@ export default function Page() {
           )}
           <div className="row" style={{ marginTop: 8 }}>
             <span className="mono" style={{ color: "var(--muted)" }}>speed</span>
-            {isLive ? (
+            {liveCtl ? (
               <input type="range" min={40} max={260} step={10} value={300 - liveStepMs} onChange={(e) => setLiveStepMs(300 - Number(e.target.value))} style={{ flex: 1 }} />
             ) : (
               <input type="range" min={120} max={1400} step={20} value={1520 - speed} onChange={(e) => setSpeed(1520 - Number(e.target.value))} style={{ flex: 1 }} />
@@ -274,4 +355,9 @@ function outcome(f: SquadFrame): string {
   const dead = f.teams.filter((t) => t.alive === 0);
   if (dead.length) return `${teamName(dead[0].side)} eliminated`;
   return "engaging";
+}
+
+function diveStatus(f: import("@scenarios/dive").DiveFrame): string {
+  const leader = f.scoreboard[0];
+  return leader && leader.frags > 0 ? `${leader.name} leads ${leader.frags}` : "deathmatch";
 }

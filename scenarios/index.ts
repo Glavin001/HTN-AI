@@ -6,3 +6,5 @@
 export * from "./blocks";
 export * from "./staircase";
 export * from "./squad-combat";
+// `dive` is imported via its subpath (../scenarios/dive) to avoid barrel name
+// collisions with squad-combat's shared constants (MOVE_SPEED, SIGHT_RANGE, …).

@@ -8,6 +8,20 @@ app that **visualizes the `htn-ai` planner running in the browser**.
 Scenes selectable from the scenario dropdown, each driving the **real reactive
 `Planner`** in the browser (the app never re-implements planning).
 
+### ★ Deathmatch arena (LIVE — "Dive"-style shooter)
+
+A live 4-bot free-for-all modelled on Mugen87's [Dive](https://github.com/Mugen87/dive)
+demo (originally built on the Yuka game-AI library), here driven entirely by
+`htn-ai` (see [`../../scenarios/dive.ts`](../../scenarios/dive.ts)). Every bot runs
+one reactive `Planner`: its root `Compete` task **arbitrates attack / get-health /
+get-weapon / explore** by method *utility* (Dive's `GoalEvaluator` desirabilities),
+the `Attack` decomposition **engages from sight or hunts the last-seen position**
+(Dive's `CompositeGoal`s), and executors bridge to a continuous world that resolves
+steering, pickups, weapon selection by range, hits, deaths and **respawns**. Click a
+bot for its glass-box plan/step/trace — or **take control** of any slot mid-match
+(WASD/arrows to move, Space/click to fire) and fight the planners yourself; the swap
+hits the running sim with no reset. Rendered with simple primitive shapes.
+
 ### ★ Squad combat (F.E.A.R.-style game AI)
 
 Four scenarios where coordinated NPCs run one reactive `Planner` each over a
