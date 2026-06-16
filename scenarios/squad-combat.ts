@@ -56,7 +56,7 @@ export const SHOT_TIME = 0.32; // seconds to take a shot
 export const RELOAD_TIME = 1.6;
 export const SUPPRESS_MAX = 5; // a suppressor sustains fire up to this long (or until the flanker is set)
 export const MEMORY_SECONDS = 4; // how long a lost target is remembered before "search"
-export const LOW_HP = 34; // retreat threshold
+export const LOW_HP = 48; // pull back to cover once this hurt (react to taking fire)
 export const SIGHT_RANGE = 22;
 export const BREACH_WINDOW = 6; // seconds the synchronized breach must complete within
 
@@ -396,8 +396,9 @@ export const squadDomain: DomainDoc = {
       name: "advanceTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.not(F.lit("coverTaken", ["?c"])),
-      // abort the instant a rival claims this slot mid-move → repair to a free one
-      verify: F.not(F.lit("coverTaken", ["?c"])),
+      // abort the move the instant the slot is taken OR a line of fire opens up —
+      // don't blindly run across open ground when you suddenly have a shot
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.not(F.ext("canSee", [], ["myPos", "threatPos"]))),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -411,6 +412,8 @@ export const squadDomain: DomainDoc = {
       name: "flankTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.and(F.lit("coverFlank", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
+      // a flank is a deliberate maneuver to break symmetry — commit to it (only
+      // bail if the slot is taken; being hurt is handled by the retreat method)
       verify: F.not(F.lit("coverTaken", ["?c"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
@@ -425,7 +428,7 @@ export const squadDomain: DomainDoc = {
       name: "climbTo",
       params: [{ name: "c", type: "cover" }],
       pre: F.and(F.lit("coverHigh", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
-      verify: F.not(F.lit("coverTaken", ["?c"])),
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.not(F.ext("canSee", [], ["myPos", "threatPos"]))),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
@@ -508,12 +511,13 @@ export const squadDomain: DomainDoc = {
     },
   ],
   methods: [
-    // 1. hurt → fall back to a rally point
+    // 1. hurt → fall back to the NEAREST rally point (utility prefers closest)
     {
       name: "retreat",
       task: "Fight",
       params: [{ name: "r", type: "cover" }],
       pre: F.and(F.lt(N.fl("myHp"), N.c(LOW_HP)), F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
+      utility: N.sub(N.c(0), N.dist("myPos", [], "coverPos", ["?r"])),
       subtasks: [{ do: "retreatTo", args: ["?r"] }],
     },
     // 2. synchronized breach (E4) — stack up AND breach inside one deadline window.
@@ -561,7 +565,19 @@ export const squadDomain: DomainDoc = {
     {
       name: "assault",
       task: "Fight",
+      // while a breach is on, units commit to the breach (breachAssault) rather than
+      // wandering toward a room cover they can't reach through the closed door
+      pre: F.not(F.lit("tactic", [], "breach")),
       subtasks: [{ do: "Neutralize" }],
+    },
+    // 7. there's a threat but no firing solution right now (e.g. a defender behind
+    // a closed door) → hold ready in short beats rather than fail; a changed world
+    // (door breached, enemy steps into view) reactively wakes it.
+    {
+      name: "holdReady",
+      task: "Fight",
+      pre: F.lit("hasThreat"),
+      subtasks: [{ hold: 0.4 }],
     },
     // --- Neutralize: reload if dry, fire if there's a line of sight, else
     // reposition to a cover that geometrically has one (the flank EMERGES from
@@ -596,6 +612,7 @@ export const squadDomain: DomainDoc = {
       task: "Regroup",
       params: [{ name: "r", type: "cover" }],
       pre: F.and(F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
+      utility: N.sub(N.c(0), N.dist("myPos", [], "coverPos", ["?r"])), // nearest rally
       subtasks: [{ do: "retreatTo", args: ["?r"] }],
     },
   ],
@@ -687,7 +704,7 @@ function moveExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => Ta
     if (at.done) {
       a.x = cover.x;
       a.z = cover.z;
-      if (cover.flank) world.team(a.side).flankerReady = true;
+      if (cover.flank) world.team(a.side).flankerReady = true; // flanker reached position
       return "success";
     }
     return "continue";
@@ -731,9 +748,19 @@ function suppressExecutor(self: string, world: SquadWorld): (api: ExecutorApi) =
 }
 
 function breachExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => TaskStatus {
-  return (_api) => {
+  return (api) => {
     const a = world.actors.get(self);
     if (!a || !a.alive) return "failure";
+    // emergent synchronization: the first unit to reach the door HOLDS (weapon
+    // ready) until the whole fire-team has stacked, so they breach + flow in
+    // together rather than one going alone under fire. A short cap means a lone
+    // survivor still breaches.
+    const team = [...world.actors.values()].filter((x) => x.alive && x.side === a.side);
+    const atDoor = (x: Actor) => {
+      const c = x.cover ? world.coverByName.get(x.cover) : undefined;
+      return !!(c && c.breach && dist2(x.x, x.z, c.x, c.z) < 0.9);
+    };
+    if (!world.doorBroken && !team.every(atDoor) && api.elapsedInStep() < 2.5) return "continue";
     world.doorBroken = true; // the door is down — sight + movement open into the room
     const target = world.nearestHostile(self, false);
     if (target) {
@@ -966,13 +993,23 @@ export class SquadSim {
       // a breach opening ends once the door is cleared, then it's a standing fight
       if (tb.tactic === "breach" && tb.breached) tb.tactic = "hold";
       const inContact = members.filter((u) => this.world.nearestHostile(u.name, true));
-      // two-or-more in contact → coordinated flank: one suppresses while one flanks
-      if (tb.tactic !== "breach" && inContact.length >= 2) {
-        tb.tactic = "flank";
-        members.forEach((u, i) => {
-          u.role = i === 0 ? "suppressor" : i === 1 ? "flanker" : "assault";
-        });
+      if (tb.tactic !== "breach") {
+        if (inContact.length >= 2) {
+          // two-or-more in contact → coordinated flank: one suppresses, one flanks
+          tb.tactic = "flank";
+          members.forEach((u, i) => {
+            u.role = i === 0 ? "suppressor" : i === 1 ? "flanker" : "assault";
+          });
+        } else {
+          // not enough to coordinate (e.g. a lone survivor) → drop the roles and
+          // just assault decisively, rather than keep chasing a flank
+          if (tb.tactic === "flank") tb.tactic = "hold";
+          for (const u of members) u.role = "assault";
+        }
       }
+      // flankerReady is set by the flanker reaching its flank cover; clear it when
+      // the team isn't flanking so a stale flag doesn't linger
+      if (tb.tactic !== "flank") tb.flankerReady = false;
       for (const u of members) {
         setBelief(u, "role", [], u.role);
         setBelief(u, "tactic", [], tb.tactic === "breach" ? "breach" : tb.tactic === "flank" ? "flank" : "hold");
@@ -1012,11 +1049,13 @@ export class SquadSim {
     // decay suppression
     for (const a of this.world.actors.values()) a.suppressedFor = Math.max(0, a.suppressedFor - this.dt);
     this.movePlayer();
-    for (const p of this.units) this.perceive(p);
     this.coordinate();
-    // drive each planner (deterministic node budget; round-robin)
+    // perceive + plan each unit in turn — perceiving right before the tick means a
+    // later unit sees an earlier one's just-made cover claim, so there's no
+    // reservation race (clean stacking at the door, clean cover splits)
     for (const p of this.units) {
       if (!(this.world.actors.get(p.name)?.alive ?? false)) continue;
+      this.perceive(p);
       p.planner.tick({ nodes: this.nodes });
     }
     this.reapDead();
