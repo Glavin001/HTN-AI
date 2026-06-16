@@ -37,6 +37,9 @@ import {
   createModel,
   createRng,
   exchangeCost,
+  goal,
+  planOnce,
+  planSummary,
   scoreOption,
 } from "../src/index";
 import { type Box, type Foe, type Vec2, COVER_TOP, dist2, findPath, generateTacticalSpots, inCoverVs, losClear, walkPolyline } from "./lib/geometry";
@@ -227,9 +230,18 @@ export class SoloWorld {
     return Math.min(1, Math.max(0.02, p));
   }
 
+  /** Destroy a crate. If it is soft cover, also block the generated firing spots it was
+   *  shielding (those hugging it) — a unit moving to one finds its precondition
+   *  invalidated (coverBlocked) and reroutes; the spots stop being safe candidates. */
   destroyCover(name: string): void {
     const c = this.coverByName.get(name);
-    if (c) c.blocked = true;
+    if (!c) return;
+    c.blocked = true;
+    if (isSoftCover(c)) {
+      for (const s of this.covers) {
+        if (s.spot && !s.blocked && dist2(s.x, s.z, c.x, c.z) <= COVER_REACH + 0.6) s.blocked = true;
+      }
+    }
   }
 
   destroyWall(pred: (w: WallSpec) => boolean): void {
@@ -792,9 +804,16 @@ export interface SoloSimOptions {
   debug?: boolean;
   /** the NPC's goal: default the Fight task; pass a GOAP goal for lookahead tests */
   goals?: GoalSpec[];
-  /** bake a mid-run disruption: at sim time `t`, destroy `cover` (or the cover the NPC
-   *  is currently moving to) so a deterministic replay shows the reactive replan (S2) */
-  disruptAt?: { t: number; cover?: string };
+  /** bake a mid-run disruption that destroys `cover` (or the crate the NPC is fighting
+   *  from) so a deterministic replay shows the reactive replan (S2). Trigger by sim time
+   *  `t`, or `whenCovered` to fire the first beat the NPC is firing from cover (robust
+   *  across seeds — guarantees a clean in-cover → exposed transition). */
+  disruptAt?: { t?: number; whenCovered?: boolean; cover?: string };
+  /** scale the ACTUAL incoming damage dealt to the NPC (default 1). This affects only
+   *  survivability of the replay — NOT the planner's cost model (which always reasons
+   *  with full INCOMING_DAMAGE) — so a demo can be watchable while the cover-seeking
+   *  decisions are unchanged. */
+  threatDamageScale?: number;
 }
 
 export interface SoloFrame {
@@ -820,6 +839,9 @@ export interface SoloFrame {
     bark: string;
   };
   threats: { name: string; x: number; z: number; hp: number; alive: boolean; firing: boolean }[];
+  /** live state of the NAMED covers (not generated spots) — `destroyed` reflects a
+   *  mid-run disruption, so the view hides the crate AND the heatmap stops shielding it. */
+  covers: { name: string; x: number; z: number; soft: boolean; high: boolean; destroyed: boolean }[];
 }
 
 export type PerceptionEvent = { t: number; kind: "saw" | "lost" | "search" | "heard"; detail?: string };
@@ -854,14 +876,16 @@ export class SoloSim {
   /** world stochastics (threat fire) — independent of the planner's RNG so the two
    *  streams can't correlate (which would skew hit rolls). */
   private readonly simRng: Rng;
-  private readonly disruptAt?: { t: number; cover?: string };
+  private readonly disruptAt?: { t?: number; whenCovered?: boolean; cover?: string };
   private disrupted = false;
+  private readonly threatDamageScale: number;
 
   constructor(inst: SoloInstance, opts: SoloSimOptions = {}) {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
     this.instance = inst;
     this.disruptAt = opts.disruptAt;
+    this.threatDamageScale = opts.threatDamageScale ?? 1;
     const augmented: SoloInstance = { ...inst, covers: [...inst.covers, ...tacticalSpots(inst)] };
     this.world = new SoloWorld(augmented);
     this.self = inst.units.find((u) => u.side === "npc")!.name;
@@ -985,7 +1009,7 @@ export class SoloSim {
       this.nextThreatShot.set(t.name, this.world.clock + SHOT_TIME);
       this.firedThisTick.add(t.name);
       if (this.simRng.next() < this.world.hitChance(t, npc)) {
-        npc.hp = Math.max(0, npc.hp - INCOMING_DAMAGE);
+        npc.hp = Math.max(0, npc.hp - INCOMING_DAMAGE * this.threatDamageScale);
         if (npc.hp <= 0) npc.alive = false;
       }
     }
@@ -997,9 +1021,22 @@ export class SoloSim {
 
   step(): SoloFrame {
     this.world.clock += this.dt;
-    // baked disruption: destroy the relied-on cover mid-execution (S2)
-    if (this.disruptAt && !this.disrupted && this.world.clock >= this.disruptAt.t) {
-      const target = this.disruptAt.cover ?? /moveToSpot\(([^)]+)\)/.exec(this.snapshot().npc.step)?.[1] ?? this.world.actors.get(this.self)?.cover ?? undefined;
+    // baked disruption (S2): destroy the CRATE the NPC is fighting from — the visible
+    // one nearest it — mid-execution. Removing the crate strips its cover (the field
+    // rebuilds, exposure jumps) and dirties `coverBlocked` (→ reactive replan), so the
+    // NPC breaks for the other crate. The destroyed crate is reported in the frame so
+    // the view hides it and the heatmap stops shielding behind it.
+    const npcNow = this.world.actors.get(this.self);
+    const coveredFiring = !!npcNow && npcNow.alive && this.ctx.field.exposureAt(npcNow.x, npcNow.z, npcNow.elev) === 0 && /^engageFrom/.test(this.snapshot().npc.step);
+    const disruptDue = this.disruptAt && !this.disrupted && (this.disruptAt.whenCovered ? coveredFiring : this.disruptAt.t !== undefined && this.world.clock >= this.disruptAt.t);
+    if (disruptDue) {
+      const npc = this.world.actors.get(this.self);
+      let target = this.disruptAt!.cover;
+      if (!target && npc) {
+        target = this.world.covers
+          .filter((c) => isSoftCover(c) && !c.blocked)
+          .sort((a, b) => dist2(npc.x, npc.z, a.x, a.z) - dist2(npc.x, npc.z, b.x, b.z))[0]?.name;
+      }
       if (target) this.world.destroyCover(target);
       this.disrupted = true;
     }
@@ -1078,6 +1115,7 @@ export class SoloSim {
         bark: this.world.barks.get(a.name) ?? "",
       },
       threats: this.world.enemiesOf("npc").map((t) => ({ name: t.name, x: round(t.x), z: round(t.z), hp: round(t.hp), alive: t.alive, firing: this.firedThisTick.has(t.name) })),
+      covers: this.instance.covers.map((c) => ({ name: c.name, x: c.x, z: c.z, soft: isSoftCover(c), high: !!c.high, destroyed: !!this.world.coverByName.get(c.name)?.blocked })),
     };
   }
 
@@ -1179,6 +1217,51 @@ export function soloField(inst: SoloInstance, threats: { x: number; z: number; e
   const softCovers: Box[] = inst.covers.filter((c) => isSoftCover(c) && !c.blocked).map(coverFootprint);
   const snap: ThreatSnapshot[] = threats.map((t) => ({ pos: { x: t.x, z: t.z }, elev: t.elev ?? 0, alive: true }));
   return buildField(snap, walls, softCovers, FIELD_CFG);
+}
+
+/**
+ * The danger field for a specific FRAME — uses the frame's LIVE covers (so a destroyed
+ * crate stops shielding) + live threats. This is what the web heatmap samples, so the
+ * overlay stays correct through a disruption. Walls are static, taken from the instance.
+ */
+export function soloFieldFromFrame(frame: SoloFrame, walls: WallSpec[] = []): SpatialField {
+  const wallBoxes: Box[] = walls.map((w) => ({ x: w.x, z: w.z, w: w.w, d: w.d, height: w.height }));
+  const softCovers: Box[] = frame.covers
+    .filter((c) => c.soft && !c.destroyed)
+    .map((c) => ({ x: c.x - COVER_HALF_W, z: c.z - COVER_HALF_D, w: 2 * COVER_HALF_W, d: 2 * COVER_HALF_D, height: COVER_TOP }));
+  const snap: ThreatSnapshot[] = frame.threats.filter((t) => t.alive).map((t) => ({ pos: { x: t.x, z: t.z }, elev: 0, alive: true }));
+  return buildField(snap, wallBoxes, softCovers, FIELD_CFG);
+}
+
+/**
+ * The S4 contrast, computed once for the view: what a MYOPIC greedy does (shoot from
+ * where it stands) vs what the lookahead planner does (relocate to cover then fire),
+ * with each option's whole-engagement expected-HP cost so the saving is explicit.
+ */
+export function lookaheadComparison(inst: SoloInstance, profile: Personality = AGGRESSIVE): {
+  greedy: { label: string; cost: number };
+  planner: { steps: string[]; cost: number };
+} {
+  const { model, world } = soloModel(inst, "npc", profile);
+  const st = model.createExecState();
+  const t = world.enemiesOf("npc")[0];
+  const npc = world.actors.get("npc")!;
+  st.set(model.slotOf("hasThreat"), 1);
+  st.set(model.slotOf("threatSeen"), world.losClear(npc.x, npc.z, t.x, t.z) ? 1 : 0);
+  st.buffer[model.slotOf("threatPos")] = t.x;
+  st.buffer[model.slotOf("threatPos") + 1] = t.z;
+  st.set(model.slotOf("threatHp"), 100);
+  st.set(model.slotOf("foeAlive", model.entityId(t.name)), 1);
+  st.buffer[model.slotOf("foePos", model.entityId(t.name))] = t.x;
+  st.buffer[model.slotOf("foePos", model.entityId(t.name)) + 1] = t.z;
+  st.buffer[model.slotOf("myPos")] = npc.x;
+  st.buffer[model.slotOf("myPos") + 1] = npc.z;
+  const res = planOnce(model, st, { goals: [goal(neutralizeGoal())], weight: 1, heuristic: "hmax", maxNodes: 80000 });
+  const greedy = greedyChoice(world, "npc", profile.riskAversion);
+  return {
+    greedy,
+    planner: { steps: res.plan ? planSummary(model, res.plan) : [], cost: res.plan?.cost ?? Infinity },
+  };
 }
 
 /** Run a solo scenario to a terminal state and return a deterministic replay bundle. */
@@ -1319,18 +1402,38 @@ export function steppingStoneArena(): SoloInstance {
   };
 }
 
-/** Disruption arena (S2): the NPC commits to a covered firing spot, then it is
- *  destroyed mid-execution; an alternate must be found without freezing. */
+/** Disruption arena (S2): two crates between the NPC and the threat. The NPC takes
+ *  cover beside one; mid-fight that crate is destroyed (disruptAt) — the NPC must break
+ *  for the other crate without freezing. */
 export function disruptionArena(): SoloInstance {
   return {
     units: [
-      { name: "npc", side: "npc", x: 0, z: -10 },
+      { name: "npc", side: "npc", x: 0, z: -7 },
+      { name: "t", side: "threat", x: 0, z: 12 },
+    ],
+    // the NPC takes cover beside a crate and fights; mid-fight that crate is destroyed
+    // (disruptAt), so its cover vanishes (the heatmap behind it flips green→red and the
+    // NPC's exposure jumps) and it reactively replans rather than freezing.
+    covers: [
+      { name: "leftCrate", x: -3, z: 0 },
+      { name: "rightCrate", x: 3, z: 0 },
+    ],
+  };
+}
+
+/**
+ * Personality arena (S6): a moderate threat with cover off to the side, tuned to sit on
+ * the open-vs-cover boundary so the SAME library produces visibly different behavior
+ * from data alone — an AGGRESSIVE profile trades fire from the open, a DEFENSIVE one
+ * relocates to the crate. (Verified divergent in tests; the web exposes a live toggle.)
+ */
+export function personalityArena(): SoloInstance {
+  return {
+    units: [
+      { name: "npc", side: "npc", x: 0, z: 0 },
       { name: "t", side: "threat", x: 0, z: 10 },
     ],
-    covers: [
-      { name: "primary", x: -3, z: -2 },
-      { name: "alt", x: 3, z: -2 },
-    ],
+    covers: [{ name: "crate", x: 4, z: -3 }],
   };
 }
 

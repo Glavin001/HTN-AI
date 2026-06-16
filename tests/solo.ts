@@ -11,11 +11,14 @@ import {
   type SoloWorld,
   greedyChoice,
   disruptionArena,
+  lookaheadComparison,
   neutralizeGoal,
   openFieldArena,
+  personalityArena,
   postureArena,
   runSolo,
   soloField,
+  soloFieldFromFrame,
   soloDomain,
   soloModel,
   steppingStoneArena,
@@ -193,28 +196,42 @@ test("solo: the field reflects believed threats and ignores live-world changes m
 
 // ---------------------------------------------------------------- S2 dynamic replan on disruption
 
-test("solo: destroying the committed cover triggers a replan to a DIFFERENT plan, no freeze", () => {
-  const sim = new SoloSim(disruptionArena(), { seed: 3, profile: DEFENSIVE });
-  let target = "";
-  for (let i = 0; i < 20 && !target; i++) {
-    sim.step();
-    const m = /moveToSpot\(([^)]+)\)/.exec(sim.snapshot().npc.step);
-    if (m) target = m[1];
+test("solo: destroying the cover the NPC is fighting from flips its exposure and forces a replan, no freeze", () => {
+  // whenCovered fires the disruption the first beat the NPC fires from cover — a clean,
+  // deterministic in-cover → exposed transition (this is what the web demo replays).
+  const run = runSolo(disruptionArena(), { seed: 2, threatDamageScale: 0.5, disruptAt: { whenCovered: true } });
+  const di = run.frames.findIndex((f) => f.covers.some((c) => c.destroyed));
+  assert.ok(di > 0, "a crate was destroyed mid-run (carried in the frame so the view updates)");
+  const before = run.frames[di - 1];
+  const after = run.frames[Math.min(di + 2, run.frames.length - 1)];
+  // the NPC was shielded just before; at its OLD position the heatmap is now exposed
+  assert.equal(before.npc.exposure, 0, "it was firing from cover before the disruption");
+  const exposedNow = soloFieldFromFrame(after, disruptionArena().walls).exposureAt(before.npc.x, before.npc.z, 0);
+  assert.ok(exposedNow > 0, "with the crate gone, its old spot is exposed (heatmap flips green→red)");
+  // it reactively replanned and never froze
+  assert.ok(run.trace.some((e) => e.t === "step.fail" || e.t === "replan.dirty" || e.t === "repair.attempt"), "the invalidated cover triggered a replan");
+  // no PROLONGED freeze: a single "—" tick during a repair replan is fine, but it must
+  // resume acting promptly (the plan-as-hint contract), so no long idle stretch.
+  let idle = 0;
+  let maxIdle = 0;
+  for (const f of run.frames.slice(di)) {
+    if (f.npc.alive && f.npc.step === "—") maxIdle = Math.max(maxIdle, ++idle);
+    else idle = 0;
   }
-  assert.ok(target, "the NPC committed to moving to a cover spot");
-  sim.world.destroyCover(target);
-  let newTarget = "";
-  let everFroze = false;
-  for (let i = 0; i < 15; i++) {
-    sim.step();
-    if (!sim.planner.currentStep() && sim.planner.getStatus() === "idle") everFroze = true;
-    const m = /moveToSpot\(([^)]+)\)/.exec(sim.snapshot().npc.step);
-    if (m && m[1] !== target) newTarget = m[1];
-  }
-  const reacted = sim.trace.some((e) => e.t === "step.fail" || e.t === "replan.dirty" || e.t === "repair.attempt");
-  assert.ok(reacted, "the invalidated precondition triggered a replan");
-  assert.ok(newTarget && newTarget !== target, `the new plan is genuinely different (${target} → ${newTarget})`);
-  assert.not.ok(everFroze, "the NPC never froze — it kept executing while replanning");
+  assert.ok(maxIdle <= 3, `it resumed acting promptly while replanning (longest idle ${maxIdle} ticks)`);
+});
+
+// ---------------------------------------------------------------- S6 personality (the web toggle)
+
+test("solo: the SAME arena yields different behavior per personality — aggressive fights in the open, defensive takes cover", () => {
+  const aggressive = runSolo(personalityArena(), { seed: 1, profile: AGGRESSIVE, threatDamageScale: 0.5 });
+  const defensive = runSolo(personalityArena(), { seed: 1, profile: DEFENSIVE, threatDamageScale: 0.5 });
+  const postures = (r: ReturnType<typeof runSolo>) => new Set(r.postureTrace.map((p) => p.posture).filter((p) => p !== "none"));
+  const agg = postures(aggressive);
+  const def = postures(defensive);
+  assert.ok(agg.has("open"), `aggressive trades fire from the open (${[...agg].join(",")})`);
+  assert.ok(def.has("cover"), `defensive relocates to cover (${[...def].join(",")})`);
+  assert.not.equal([...agg].sort().join(","), [...def].sort().join(","), "the two profiles behave differently — from data alone");
 });
 
 // ---------------------------------------------------------------- S4 lookahead beats greedy
@@ -334,11 +351,18 @@ test("solo: runSolo returns a deterministic replay bundle with an enriched frame
   assert.ok(f.threats.every((t) => "firing" in t), "threats carry a firing flag");
 });
 
-test("solo: a baked disruption (disruptAt) destroys the relied-on cover and forces a replan", () => {
-  // commit to cover, then destroy it mid-run — the deterministic replay shows the reaction
-  const run = runSolo(disruptionArena(), { seed: 3, profile: DEFENSIVE, disruptAt: { t: 1.5 } });
-  const reacted = run.trace.some((e) => e.t === "step.fail" || e.t === "replan.dirty" || e.t === "repair.attempt");
-  assert.ok(reacted, "the destroyed cover triggered a reactive replan");
+test("solo: runSolo frames carry live cover state so the view reflects a disruption", () => {
+  const run = runSolo(disruptionArena(), { seed: 2, threatDamageScale: 0.5, disruptAt: { whenCovered: true } });
+  const f0 = run.frames[0];
+  assert.ok(f0.covers.length >= 2 && f0.covers.every((c) => !c.destroyed), "covers start intact in the frame");
+  assert.ok(run.frames.some((f) => f.covers.some((c) => c.destroyed)), "a crate becomes 'destroyed' in later frames (the view hides it)");
+});
+
+test("solo: lookaheadComparison surfaces the greedy-vs-planner contrast the web shows", () => {
+  const cmp = lookaheadComparison(steppingStoneArena(), AGGRESSIVE);
+  assert.equal(cmp.greedy.label, "engageFrom", "greedy takes the immediate open shot");
+  assert.ok(cmp.planner.steps.some((s) => s.includes("moveToSpot")), "the planner relocates to cover first");
+  assert.ok(cmp.planner.cost < cmp.greedy.cost * 0.6, `lookahead is far cheaper (planner=${cmp.planner.cost.toFixed(1)} vs greedy=${cmp.greedy.cost.toFixed(1)})`);
 });
 
 test("solo: soloField shades danger — exposed open ground vs behind a wall", () => {

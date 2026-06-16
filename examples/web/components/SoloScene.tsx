@@ -3,7 +3,7 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, Grid, Html, Line, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
-import { type SoloFrame, type SoloInstance, soloField } from "@scenarios/solo-combat";
+import { type SoloFrame, type SoloInstance, soloFieldFromFrame } from "@scenarios/solo-combat";
 
 const NPC_COLOR = "#3b82f6";
 const THREAT_COLOR = "#ef4444";
@@ -64,11 +64,18 @@ function Actor({ x, z, elev, hp, alive, color, label, sub }: { x: number; z: num
         <capsuleGeometry args={[0.32, 0.5, 6, 14]} />
         <meshStandardMaterial color={alive ? color : "#3a3f4b"} emissive={alive ? color : "#000"} emissiveIntensity={0.3} roughness={0.5} transparent opacity={alive ? 1 : 0.3} />
       </mesh>
+      {/* HP bar — a thin centered bar above the capsule (green→red as it drops) */}
       {alive && (
-        <mesh position={[-(1 - hpFrac) * 0.4, 1.0, 0]} scale={[Math.max(0.001, hpFrac), 1, 1]}>
-          <boxGeometry args={[0.8, 0.1, 0.05]} />
-          <meshBasicMaterial color={hpFrac > 0.5 ? "#22c55e" : hpFrac > 0.25 ? "#f59e0b" : "#ef4444"} />
-        </mesh>
+        <group position={[0, 1.05, 0]}>
+          <mesh>
+            <boxGeometry args={[0.84, 0.12, 0.04]} />
+            <meshBasicMaterial color="#0b0e14" />
+          </mesh>
+          <mesh position={[-(1 - hpFrac) * 0.4, 0, 0.01]} scale={[Math.max(0.001, hpFrac), 1, 1]}>
+            <boxGeometry args={[0.8, 0.08, 0.04]} />
+            <meshBasicMaterial color={hpFrac > 0.5 ? "#22c55e" : hpFrac > 0.25 ? "#f59e0b" : "#ef4444"} />
+          </mesh>
+        </group>
       )}
       <Html position={[0, 1.5, 0]} center distanceFactor={13} style={{ pointerEvents: "none", userSelect: "none" }}>
         <div style={{ textAlign: "center", fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap" }}>
@@ -80,11 +87,21 @@ function Actor({ x, z, elev, hp, alive, color, label, sub }: { x: number; z: num
   );
 }
 
-function Cover({ x, z }: { x: number; z: number }) {
+/** A soft-cover crate. Intact crates are solid; a destroyed one is low rubble. */
+function Cover({ x, z, destroyed, high }: { x: number; z: number; destroyed: boolean; high: boolean }) {
+  if (destroyed) {
+    return (
+      <mesh position={[x, 0.06, z]} receiveShadow>
+        <boxGeometry args={[1.0, 0.12, 0.6]} />
+        <meshStandardMaterial color="#241712" roughness={1} />
+      </mesh>
+    );
+  }
+  const h = high ? 0.9 : 0.26;
   return (
-    <mesh position={[x, 0.13, z]} castShadow receiveShadow>
-      <boxGeometry args={[0.95, 0.26, 0.5]} />
-      <meshStandardMaterial color="#4b463d" roughness={0.98} metalness={0.02} />
+    <mesh position={[x, h / 2, z]} castShadow receiveShadow>
+      <boxGeometry args={[1.2, h, 0.8]} />
+      <meshStandardMaterial color={high ? "#6d28d9" : "#6b6253"} roughness={0.95} metalness={0.02} />
     </mesh>
   );
 }
@@ -98,32 +115,37 @@ function Wall({ x, z, w, d }: { x: number; z: number; w: number; d: number }) {
   );
 }
 
-/** A translucent floor heatmap: red where a threat has a clear shot, green where shielded. */
+/**
+ * A translucent floor heatmap of THREAT EXPOSURE: red where a threat has a clear shot,
+ * green where shielded (behind a wall or hugging a crate). Built from the FRAME's live
+ * covers + threats (soloFieldFromFrame), so destroying a crate updates the overlay. The
+ * sampling grid is aligned to integer world cells so tiles line up with the geometry.
+ */
 function ExposureHeatmap({ frame, instance }: SceneProps) {
   const tiles = useMemo(() => {
-    const threats = frame.threats.filter((t) => t.alive).map((t) => ({ x: t.x, z: t.z, elev: 0 }));
-    if (threats.length === 0) return [];
-    const field = soloField(instance, threats);
+    if (frame.threats.every((t) => !t.alive)) return [];
+    const field = soloFieldFromFrame(frame, instance.walls);
     const xs = [...instance.units.map((u) => u.x), ...instance.covers.map((c) => c.x)];
     const zs = [...instance.units.map((u) => u.z), ...instance.covers.map((c) => c.z)];
     const pad = 4;
-    const minX = Math.min(...xs) - pad, maxX = Math.max(...xs) + pad;
-    const minZ = Math.min(...zs) - pad, maxZ = Math.max(...zs) + pad;
-    const step = 1.2;
+    const lo = (a: number[]) => Math.floor(Math.min(...a) - pad);
+    const hi = (a: number[]) => Math.ceil(Math.max(...a) + pad);
+    const minX = lo(xs), maxX = hi(xs), minZ = lo(zs), maxZ = hi(zs);
     const out: { x: number; z: number; exp: number }[] = [];
-    for (let x = minX; x <= maxX; x += step) for (let z = minZ; z <= maxZ; z += step) out.push({ x, z, exp: field.exposureAt(x, z, 0) });
-    return out.slice(0, 900); // bound the tile count
+    for (let x = minX; x <= maxX; x += 1) for (let z = minZ; z <= maxZ; z += 1) out.push({ x, z, exp: field.exposureAt(x, z, 0) });
+    return out.slice(0, 1100);
   }, [frame, instance]);
   const max = Math.max(1, ...tiles.map((t) => t.exp));
   return (
     <group>
       {tiles.map((t, i) => {
         const f = t.exp / max;
-        const color = t.exp === 0 ? "#1b3a2a" : new THREE.Color(0.2 + 0.8 * f, 0.5 - 0.4 * f, 0.15).getStyle();
+        const safe = t.exp === 0;
+        const danger = new THREE.Color(0.85, 0.25 - 0.2 * f, 0.2).getStyle();
         return (
-          <mesh key={i} rotation={[-Math.PI / 2, 0, 0]} position={[t.x, 0.015, t.z]}>
-            <planeGeometry args={[1.1, 1.1]} />
-            <meshBasicMaterial color={color} transparent opacity={t.exp === 0 ? 0.12 : 0.18 + 0.18 * f} />
+          <mesh key={i} rotation={[-Math.PI / 2, 0, 0]} position={[t.x, 0.02, t.z]}>
+            <planeGeometry args={[0.92, 0.92]} />
+            <meshBasicMaterial color={safe ? "#14532d" : danger} transparent opacity={safe ? 0.22 : 0.12 + 0.28 * f} />
           </mesh>
         );
       })}
@@ -154,7 +176,7 @@ function Scene({ frame, instance }: SceneProps) {
       <ExposureHeatmap frame={frame} instance={instance} />
 
       {(instance.walls ?? []).map((w, i) => <Wall key={i} {...w} />)}
-      {instance.covers.map((c) => <Cover key={c.name} x={c.x} z={c.z} />)}
+      {frame.covers.map((c) => <Cover key={c.name} x={c.x} z={c.z} destroyed={c.destroyed} high={c.high} />)}
 
       {/* NPC fire beam → its target; threats firing → the NPC */}
       {npc.alive && firingTarget && <FireBeam from={npcPos} to={new THREE.Vector3(firingTarget.x, 0.45, firingTarget.z)} color={NPC_COLOR} />}

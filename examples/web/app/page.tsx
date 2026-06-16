@@ -20,6 +20,8 @@ import {
   type ProfileId,
   type SoloScenarioId,
   runSoloScenario,
+  soloComparison,
+  soloHasPersonalityToggle,
   soloNarration,
   soloScenarioBlurb,
   soloScenarioName,
@@ -73,7 +75,7 @@ interface SquadView {
 }
 
 export default function Page() {
-  const [scenario, setScenario] = useState<ScenarioId>("posture");
+  const [scenario, setScenario] = useState<ScenarioId>("personality");
   const [run, setRun] = useState<Run | null>(null);
   const [computing, setComputing] = useState(true);
   const [step, setStep] = useState(0);
@@ -134,6 +136,7 @@ export default function Page() {
 
   const soloFrame = run?.kind === "solo" ? run.data.frames[Math.min(step, lastStep)] : null;
   const narration = squad ? squadNarration(squad.frame) : soloFrame ? soloNarration(soloFrame) : "";
+  const comparison = useMemo(() => (isSolo ? soloComparison(scenario as SoloScenarioId, profile) : null), [isSolo, scenario, profile]);
   const watch = isSolo ? soloWhatToWatch(scenario as SoloScenarioId) : SCENARIOS[scenario].kind === "squad" ? whatToWatch(scenario as SquadScenarioId) : [];
   const status = run?.kind === "grid" ? run.data.status : squad ? outcome(squad.frame) : soloFrame ? soloOutcome(soloFrame) : "—";
 
@@ -218,8 +221,10 @@ export default function Page() {
         {isSolo && soloFrame && (
           <div className="card">
             <h2>Single-agent NPC · glass-box</h2>
-            <div className="row" style={{ marginBottom: 8, gap: 6 }}>
-              <span className="mono" style={{ color: "var(--muted)" }}>personality</span>
+            <div className="row" style={{ marginBottom: 8, gap: 6, alignItems: "center" }}>
+              <span className="mono" style={{ color: soloHasPersonalityToggle(scenario as SoloScenarioId) ? "var(--accent-2)" : "var(--muted)" }}>
+                personality{soloHasPersonalityToggle(scenario as SoloScenarioId) ? " ← toggle me" : ""}
+              </span>
               {(["aggressive", "defensive"] as ProfileId[]).map((p) => (
                 <button key={p} className={profile === p ? "primary" : ""} onClick={() => setProfile(p)}>{p}</button>
               ))}
@@ -230,6 +235,14 @@ export default function Page() {
               <div>HP: {soloFrame.npc.hp} · ammo: {soloFrame.npc.ammo}</div>
               <div style={{ color: "var(--muted)" }}>data-only: same domain + library, only the profile differs</div>
             </div>
+            {comparison && (
+              <div className="mono" style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--border)", lineHeight: 1.7 }}>
+                <div style={{ color: "var(--muted)", marginBottom: 2 }}>greedy vs lookahead (expected-HP cost):</div>
+                <div>🔴 greedy: <b>{comparison.greedy.label}</b> from the open — cost <b style={{ color: "#ef4444" }}>{comparison.greedy.cost.toFixed(1)}</b></div>
+                <div>🟢 lookahead: <b>{comparison.planner.steps.join(" → ") || "—"}</b> — cost <b style={{ color: "#22c55e" }}>{comparison.planner.cost.toFixed(1)}</b></div>
+                <div style={{ color: "var(--muted)" }}>the planner relocates to cover: {(100 - (100 * comparison.planner.cost) / Math.max(comparison.greedy.cost, 1e-6)).toFixed(0)}% cheaper over the fight</div>
+              </div>
+            )}
           </div>
         )}
 
