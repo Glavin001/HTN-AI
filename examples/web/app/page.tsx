@@ -47,7 +47,7 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerBig: { name: "Scavenger XL", kind: "grid", blurb: "A bigger 4×3 grid, a height-3 goal, seven scattered blocks. The planner harvests a pillar and stacks a 3-level structure." },
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
-  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — it's a SHAPE made of blocks: a ring that encloses a courtyard. There's no bespoke 'build wall' task: the agent composes two generic, reusable HTN methods — FetchBlock and PlaceBlockAt(cell) — once per slot. A different structure is just a different list of PlaceBlockAt targets. Blocks are only grabbed from the scattered pile, so a laid block is never cannibalised." },
+  wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — it's a SHAPE made of blocks: an octagonal ring, two courses tall, enclosing a courtyard. No bespoke 'build wall' task exists: the agent composes two generic, reusable HTN methods — PlaceBlockAt(cell) → FetchBlock — once per slot. A flat 12-slot goal would blow up one search, so the planner runs in goal-agenda mode and serialises it: lay one slot, commit, plan the next. Blocks come only from the scattered pile, so a laid block is never cannibalised — which is what makes serialising sound." },
 };
 
 function buildRun(id: ScenarioId): Run {
@@ -136,7 +136,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {run?.kind === "wall" && <WallScene key="wall" frame={run.data.frames[step]} cells={run.data.cells} targets={run.data.targets} sources={run.data.sources} core={run.data.core} reached={step === lastStep && status === "succeeded"} />}
+        {run?.kind === "wall" && <WallScene key="wall" frame={run.data.frames[step]} cells={run.data.cells} targets={run.data.targets} sources={run.data.sources} core={run.data.core} wantHeight={run.data.wantHeight} reached={step === lastStep && status === "succeeded"} />}
         {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {squad && (
@@ -248,23 +248,52 @@ export default function Page() {
           </div>
         )}
 
-        {run?.kind === "wall" && (
-          <div className="card">
-            <h2>Goal · a structure, not a position</h2>
-            <div className="mono">{run.data.goalText}</div>
-            <div className="mono" style={{ color: "var(--muted)", marginTop: 6, fontSize: 11 }}>
-              composed from reusable methods: <span style={{ color: "var(--accent-2)" }}>PlaceBlockAt(c)</span> × {run.data.targets.length} → <span style={{ color: "var(--accent-2)" }}>FetchBlock</span> → grab/place
-            </div>
-            <div className="row" style={{ marginTop: 8, gap: 8 }}>
-              <span className="mono" style={{ color: "var(--muted)" }}>wall laid</span>
-              <input type="range" min={0} max={run.data.targets.length} step={1} value={run.data.frames[Math.min(step, lastStep)]?.placed ?? 0} readOnly style={{ flex: 1, accentColor: "#34d399" }} />
-              <span className="mono" style={{ color: "#34d399" }}>{run.data.frames[Math.min(step, lastStep)]?.placed ?? 0}/{run.data.targets.length}</span>
-            </div>
-            <div className="mono" style={{ color: "var(--muted)", marginTop: 6, fontSize: 11 }}>
-              ◻ amber wireframe = goal slot &nbsp;·&nbsp; ▮ green = block laid &nbsp;·&nbsp; ◆ courtyard core
-            </div>
-          </div>
-        )}
+        {run?.kind === "wall" && (() => {
+          const f = run.data.frames[Math.min(step, lastStep)];
+          const want = run.data.wantHeight;
+          const totalBlocks = run.data.targets.length * want;
+          const blocksLaid = run.data.targets.reduce((n, c) => n + Math.min(f?.heights[c] ?? 0, want), 0);
+          const activeSlot = Math.min((f?.placed ?? 0) + 1, run.data.targets.length);
+          const phase = wallPhase(f?.action ?? "start", f?.holding ?? false);
+          return (
+            <>
+              <div className="card watch">
+                <h2>Goal · a structure, not a position</h2>
+                <div className="mono">{run.data.goalText}</div>
+                <ol style={{ marginTop: 8 }}>
+                  <li><b style={{ color: "#fbbf24" }}>amber wireframe</b> = a goal slot, {want} blocks tall, still to build</li>
+                  <li><b style={{ color: "#34d399" }}>green blocks</b> = wall laid · <b style={{ color: "#f59e0b" }}>orange</b> = scattered pile · <b style={{ color: "#a78bfa" }}>◆</b> = courtyard core</li>
+                </ol>
+                <div className="row" style={{ marginTop: 8, gap: 8 }}>
+                  <span className="mono" style={{ color: "var(--muted)", minWidth: 70 }}>blocks laid</span>
+                  <input type="range" min={0} max={totalBlocks} step={1} value={blocksLaid} readOnly style={{ flex: 1, accentColor: "#34d399" }} />
+                  <span className="mono" style={{ color: "#34d399" }}>{blocksLaid}/{totalBlocks}</span>
+                </div>
+                <div className="row" style={{ marginTop: 6, gap: 8 }}>
+                  <span className="mono" style={{ color: "var(--muted)", minWidth: 70 }}>slots done</span>
+                  <input type="range" min={0} max={run.data.targets.length} step={1} value={f?.placed ?? 0} readOnly style={{ flex: 1, accentColor: "#34d399" }} />
+                  <span className="mono" style={{ color: "#34d399" }}>{f?.placed ?? 0}/{run.data.targets.length}</span>
+                </div>
+              </div>
+
+              <div className="card">
+                <h2>How the planner solves it</h2>
+                <div className="mono" style={{ fontSize: 11, lineHeight: 1.7 }}>
+                  <div>goal = <span style={{ color: "var(--accent-2)" }}>PlaceBlockAt(cell)</span> × {run.data.targets.length} &nbsp;<span style={{ color: "var(--muted)" }}>// a composition, not a bespoke task</span></div>
+                  <div style={{ paddingLeft: 14 }}>└─ <span style={{ color: "var(--accent-2)" }}>FetchBlock</span> → <span style={{ color: "var(--accent)" }}>grab</span> (from pile) → <span style={{ color: "var(--accent)" }}>place</span></div>
+                </div>
+                <div className="mono" style={{ color: "var(--muted)", marginTop: 8, fontSize: 11 }}>
+                  <b style={{ color: "var(--accent-2)" }}>goalAgenda</b>: the 12 sub-goals are serialised — lay one slot, commit, plan the next. A flat conjunction would blow up; this stays linear.
+                </div>
+                <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 8, background: "rgba(56,189,248,0.08)", border: "1px solid rgba(56,189,248,0.18)" }}>
+                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>now · laying slot {activeSlot}/{run.data.targets.length}</div>
+                  <div className="mono" style={{ marginTop: 2 }}><span style={{ color: phase.color }}>{phase.icon} {phase.text}</span></div>
+                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{f?.action ?? "start"}</div>
+                </div>
+              </div>
+            </>
+          );
+        })()}
 
         <div className="card">
           <h2>Trace events {squad ? "· glass-box" : ""}</h2>
@@ -284,4 +313,13 @@ function outcome(f: SquadFrame): string {
   const dead = f.teams.filter((t) => t.alive === 0);
   if (dead.length) return `${teamName(dead[0].side)} eliminated`;
   return "engaging";
+}
+
+/** Map a raw wall action label to a human phase for the "now" readout. */
+function wallPhase(action: string, holding: boolean): { icon: string; text: string; color: string } {
+  if (action.startsWith("grab")) return { icon: "✋", text: "picking up a block from the pile", color: "#f59e0b" };
+  if (action.startsWith("place")) return { icon: "▮", text: "laying a block on the wall", color: "#34d399" };
+  if (action.startsWith("goto")) return holding ? { icon: "→", text: "carrying a block to the wall", color: "#38bdf8" } : { icon: "→", text: "walking to a block", color: "#38bdf8" };
+  if (action === "start") return { icon: "•", text: "planning the first placement", color: "var(--muted)" };
+  return { icon: "✓", text: "wall complete", color: "#34d399" };
 }

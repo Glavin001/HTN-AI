@@ -67,22 +67,35 @@ Each scene below drives the same reactive `Planner`:
   the classic Sussman anomaly: `C on A`, `A`/`B` on the table, goal `A-on-B-on-C`.
   The naive order deadlocks, so the planner interleaves subgoals.
 - **Build a wall (structure goal)** ([`../../scenarios/wall.ts`](../../scenarios/wall.ts)) —
-  the goal is **not a position to stand at** but a **shape made of blocks**: a ring
-  of cells that must each hold a block, enclosing a central courtyard. Blocks start
-  **scattered** around the yard. Laying all eight slots in one flat GOAP search
-  blows up combinatorially (symmetric block↔slot assignments × free movement), so
-  instead of a bespoke "build wall" task the domain ships two **composable, reusable
-  HTN methods**: `FetchBlock` (be holding a block) and `PlaceBlockAt(cell)` (fetch
-  one, deliver it — composes `FetchBlock`). A *structure* is then just a
-  **composition** of them — a list of `PlaceBlockAt(c)` goals, one per cell of the
-  shape — so a wall, a tower, an L, or a line all reuse the exact same methods; only
-  the cell list (pure data) changes. Two domain rules keep the composition robust
-  without any shape-aware coordination: `grab` may only take from a **`source`**
-  cell (the scatter pile), so a laid block is never cannibalised and each placement
-  is independent/order-free; and the same one-level climb + `height(stand) ≥
-  height(at)` spatial gating as Scavenger World. The yard ends tidy (eight blocks,
-  eight slots). See [`../../tests/wall.ts`](../../tests/wall.ts), which also builds a
-  *different* structure from the same two methods.
+  the goal is **not a position to stand at** but a **shape made of blocks**: an
+  octagonal ring (a 5×5 perimeter minus its corners — 12 cells), built **two courses
+  tall**, enclosing a central courtyard, on a 9×9 yard. Blocks start **scattered**
+  just outside the ring. This is the demo's *scale* lesson, and it has two parts:
+
+  - **Composable methods, not a macro.** There's no bespoke "build wall" task — that
+    wouldn't match a different shape. The domain ships two small, reusable HTN
+    building blocks: `FetchBlock` (be holding a block) and `PlaceBlockAt(cell)`
+    (raise a cell to its target height, composing `FetchBlock`). A *structure* is
+    just a **composition** of them — a list of `PlaceBlockAt(c)` goals, one per cell
+    — so a wall, a tower, an L, or a line all reuse the same methods; only the cell
+    list (data) changes. `tests/wall.ts` builds a free-standing 2-tall tower from the
+    same methods to prove it.
+  - **Goal-agenda serialization.** Laying an N-cell wall is a conjunction of N
+    near-identical, serializable sub-goals; one search over that conjunction blows up
+    combinatorially (every ordering and block↔slot assignment is a distinct state).
+    The standard symbolic-planning fix is to **serialize**: solve one sub-goal,
+    commit, plan the next from the reached state. The reactive `Planner`'s new
+    **`goalAgenda: true`** option does exactly this, turning one exponential search
+    into N small ones — cost grows *linearly* in cells, so a 9×9 / 24-block wall
+    plans in well under a second.
+
+  Two domain rules make serialization **sound** (sub-goals never clobber each other):
+  `grab` may only take from a **`source`** cell (the scatter pile), so a laid block
+  is never cannibalised; and `place` reaches **one level up**
+  (`height(stand) ≥ height(at) − 1`, mirroring `grab`), so a 2-course wall is laid
+  from the ground without ever climbing the half-built wall — each cell independent.
+  The yard ends tidy (24 blocks, 24 slots; courtyard left clear). See
+  [`../../tests/wall.ts`](../../tests/wall.ts).
 
 The right-hand panel shows the live world state, the **plan the search
 discovered**, and the planner's **`TraceEvent` stream** (so repair/replan show up
@@ -120,7 +133,7 @@ library repo).
 | World-state panel | `model.read(state, fluent, …)` over typed fluents |
 | Trace events panel | the `trace:` `TraceEvent` stream (`plan.*`, `step.*`, `repair.*`, …) |
 | Goal = a 3D coordinate | a position-only goal (`agentAt ∧ agentY`), not a prescriptive structure |
-| Goal = a block structure (wall) | a composition of reusable HTN methods (`PlaceBlockAt(c)` → `FetchBlock`), one goal per cell |
+| Goal = a block structure (wall) | composable methods (`PlaceBlockAt(c)` → `FetchBlock`) + `goalAgenda` serialization of the per-cell sub-goals |
 
 This is an intentionally small seed of the planned `@htn-ai/devtools` inspector
 and `@htn-ai/react` adapter described in `ROADMAP.md`.

@@ -47,6 +47,21 @@ export interface PlannerOptions {
   collectRejections?: boolean;
   /** drift tolerance: replan when actual time falls this many seconds behind projection (0 = off) */
   driftTolerance?: number;
+  /**
+   * Goal-agenda (serialization) mode. When true, the `goals` list is treated as
+   * an ordered agenda of subgoals to be achieved ONE AT A TIME with commitment:
+   * the planner solves goals[0], executes it, then plans goals[1] from the
+   * resulting state, and so on — only reporting `succeeded` once the last is done.
+   *
+   * This is the standard fix for a conjunction of (largely) independent,
+   * serializable subgoals — e.g. "place a block on each of these cells". Handing
+   * such a conjunction to ONE search blows up combinatorially (every ordering and
+   * object↔slot assignment is a distinct state); serializing turns it into N
+   * small searches. It is only complete when the subgoals don't clobber one
+   * another, so the caller is responsible for ordering/independence (in the wall
+   * demo, source-gated grab guarantees a placed block is never undone).
+   */
+  goalAgenda?: boolean;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -62,6 +77,11 @@ export class Planner {
   public readonly state: ExecState;
   public readonly rng: Rng;
 
+  /** the full ordered agenda (all subgoals); `goals` is the active slice */
+  private allGoals: GoalSpec[];
+  /** index of the subgoal currently being pursued in goal-agenda mode */
+  private goalCursor = 0;
+  private readonly goalAgenda: boolean;
   private goals: GoalSpec[];
   private readonly nowFn: () => number;
   private readonly epoch: number;
@@ -85,7 +105,10 @@ export class Planner {
     this.model = model;
     this.state = model.createExecState();
     this.rng = createRng(opts.seed ?? 0x12345678);
-    this.goals = opts.goals ?? [];
+    this.goalAgenda = opts.goalAgenda ?? false;
+    this.allGoals = opts.goals ?? [];
+    this.goalCursor = 0;
+    this.goals = this.activeGoals();
     this.nowFn = opts.now ?? defaultNow;
     this.epoch = this.nowFn();
     this.opts = opts;
@@ -93,9 +116,29 @@ export class Planner {
   }
 
   setGoals(goals: GoalSpec[]): void {
-    this.goals = goals;
+    this.allGoals = goals;
+    this.goalCursor = 0;
+    this.goals = this.activeGoals();
     this.abandonPlan();
     this.status = "idle";
+  }
+
+  /** the subgoal(s) actively being planned: a single agenda item in goal-agenda
+   *  mode, or the whole conjunction otherwise. */
+  private activeGoals(): GoalSpec[] {
+    if (!this.goalAgenda) return this.allGoals;
+    const g = this.allGoals[this.goalCursor];
+    return g ? [g] : [];
+  }
+
+  /** In goal-agenda mode, the index of the subgoal currently being pursued, and
+   *  the total number of subgoals — handy for progress UIs. */
+  activeGoalIndex(): number {
+    return this.goalCursor;
+  }
+
+  goalCount(): number {
+    return this.allGoals.length;
   }
 
   setTrace(fn: TraceFn): void {
@@ -270,12 +313,7 @@ export class Planner {
     // bookkeeping steps are free; at most one operator executor runs per tick
     for (;;) {
       if (this.cursor >= plan.steps.length) {
-        this.trace({ t: "plan.completed" });
-        this.plan = null;
-        this.cursor = 0;
-        this.lastMTR = [];
-        this.scopeStack = [];
-        this.status = "succeeded";
+        this.completePlan();
         return;
       }
       const step = plan.steps[this.cursor];
@@ -420,14 +458,25 @@ export class Planner {
       }
       return;
     }
-    if (this.cursor >= plan.steps.length) {
-      this.trace({ t: "plan.completed" });
-      this.plan = null;
-      this.cursor = 0;
-      this.lastMTR = [];
-      this.scopeStack = [];
-      this.status = "succeeded";
+    if (this.cursor >= plan.steps.length) this.completePlan();
+  }
+
+  /** All steps of the active plan are done. In goal-agenda mode, commit this
+   *  subgoal and advance to the next (planned on the next tick from the reached
+   *  state); otherwise the whole goal set is achieved. */
+  private completePlan(): void {
+    this.trace({ t: "plan.completed" });
+    this.plan = null;
+    this.cursor = 0;
+    this.lastMTR = [];
+    this.scopeStack = [];
+    if (this.goalAgenda && this.goalCursor < this.allGoals.length - 1) {
+      this.goalCursor++;
+      this.goals = this.activeGoals();
+      this.status = "running";
+      return;
     }
+    this.status = "succeeded";
   }
 
   private invokeExecutor(name: string | undefined, args: Bindings): TaskStatus {
