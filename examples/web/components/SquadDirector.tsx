@@ -6,7 +6,8 @@
  * a clear "replanning" state), and — when a branch was rejected — the readable
  * "why not X" reasons from collectRejections/explainFailure.
  */
-import type { SquadFrame, UnitFrame } from "@scenarios/squad-combat";
+import type { SquadFrame, SquadInstance, UnitFrame } from "@scenarios/squad-combat";
+import { tacticalRead } from "../lib/tacticalView";
 
 const SIDE_COLOR: Record<string, string> = { enemy: "#ef4444", ally: "#3b82f6", player: "#3b82f6" };
 
@@ -37,16 +38,20 @@ const tacticWord: Record<string, string> = {
 
 export default function SquadDirector({
   frame,
+  instance,
   units,
   selected,
   onSelect,
 }: {
   frame: SquadFrame;
+  instance: SquadInstance;
   units: string[];
   selected: string | null;
   onSelect: (name: string) => void;
 }) {
   const u: UnitFrame | undefined = frame.units.find((x) => x.name === selected);
+  const read = tacticalRead(instance, frame, selected ?? null);
+  const best = read.spots.find((s) => s.best && !s.current);
   return (
     <div className="card">
       <h2>AI director · glass-box</h2>
@@ -81,6 +86,36 @@ export default function SquadDirector({
             <div className="mono" style={{ color: u.posture.includes("cover") || u.posture.includes("shielded") ? "var(--accent)" : "#fca5a5", marginTop: 3, fontSize: 11 }}>
               ◈ reading the room: {u.posture}
             </div>
+          )}
+
+          {u.alive && read.unit && (
+            <>
+              <h3 className="dir-h" style={{ marginTop: 12 }}>
+                POSITION READ <span style={{ color: "var(--muted)", fontWeight: 400 }}>· scoring the map</span>
+              </h3>
+              <div className="risk-row">
+                <span className="risk-tag">here</span>
+                <span className="mono" style={{ color: read.unit.exposure > 0 ? "#fca5a5" : "var(--accent)" }}>
+                  {read.unit.cover > 0 ? `🛡 covered vs ${read.unit.cover}` : read.unit.exposure > 0 ? "exposed" : "no contact"}
+                </span>
+                <span className="mono" style={{ color: "var(--muted)" }}>
+                  {read.unit.exposure} gun{read.unit.exposure === 1 ? "" : "s"} on me{read.unit.range != null ? ` · ${Math.round(read.unit.range)}m` : ""}
+                </span>
+                <span className="pill" style={{ color: read.unit.hasShot ? "var(--good)" : "var(--muted)" }}>{read.unit.hasShot ? "has shot" : "no shot"}</span>
+              </div>
+              {best && (
+                <div className="risk-row">
+                  <span className="risk-tag good">best</span>
+                  <span className="mono" style={{ color: "var(--good)" }}>{best.named ? best.name : "a covered angle"}</span>
+                  <span className="mono" style={{ color: "var(--muted)" }}>
+                    {best.cover > 0 ? `cover vs ${best.cover} · ` : ""}{best.exposure > 0 ? `exposed ${best.exposure}` : "safe"} · {Math.round(best.travel)}m away
+                  </span>
+                </div>
+              )}
+              <div className="mono" style={{ color: "var(--muted)", marginTop: 4, fontSize: 10.5 }}>
+                {read.spots.filter((s) => s.hasLos).length} firing position{read.spots.filter((s) => s.hasLos).length === 1 ? "" : "s"} scored · select on the map to see the heat overlay
+              </div>
+            </>
           )}
 
           <h3 className="dir-h" style={{ marginTop: 12 }}>

@@ -66,6 +66,7 @@ export default function Page() {
   const [speed, setSpeed] = useState(450);
   const [liveStepMs, setLiveStepMs] = useState(90);
   const [selected, setSelected] = useState<string | null>(null);
+  const [showThinking, setShowThinking] = useState(true);
 
   const isLive = scenario === "companion";
   const live = useLiveSquad(isLive ? "companion" : null, liveStepMs);
@@ -128,7 +129,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} showThinking={showThinking} />}
 
         {squad && (
           <div className="hud-top">
@@ -147,7 +148,18 @@ export default function Page() {
             <span><i className="dot" style={{ background: "#ef4444" }} />Red team</span>
             <span><i className="dot" style={{ background: "#3b82f6" }} />Blue team</span>
             <span><i className="dash" style={{ background: "#34d399" }} />line of fire</span>
-            <span><i className="dash" style={{ background: "#ef4444" }} />blocked</span>
+            <span><i className="dash" style={{ background: "#ef4444" }} />blocked / incoming</span>
+            <label className="hud-toggle">
+              <input type="checkbox" checked={showThinking} onChange={(e) => setShowThinking(e.target.checked)} />
+              show what it&apos;s thinking
+            </label>
+            {showThinking && (
+              <>
+                <span><i className="dot" style={{ background: "#22c55e" }} />good position</span>
+                <span><i className="dot" style={{ background: "#ef4444" }} />risky position</span>
+                <span><i className="dot" style={{ background: "#7dd3fc" }} />has cover</span>
+              </>
+            )}
           </div>
         )}
         {narration && <div className="hud-narration">{narration}</div>}
@@ -230,7 +242,7 @@ export default function Page() {
           </div>
         )}
 
-        {squad && <SquadDirector frame={squad.frame} units={squad.units} selected={selected} onSelect={(n) => setSelected(n || null)} />}
+        {squad && <SquadDirector frame={squad.frame} instance={squad.instance} units={squad.units} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {run?.kind === "grid" && (
           <div className="card">
