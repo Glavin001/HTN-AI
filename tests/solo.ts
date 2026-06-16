@@ -14,6 +14,8 @@ import {
   neutralizeGoal,
   openFieldArena,
   postureArena,
+  runSolo,
+  soloField,
   soloDomain,
   soloModel,
   steppingStoneArena,
@@ -315,6 +317,39 @@ test("solo: with NO cover the NPC still closes and resolves the fight (positioni
   // engaged decisively (positioning is a preference layered on a reliable engagement,
   // not a way to stall): with no cover it closed and brought the threat to the brink
   assert.ok(sim.world.actors.get("t")!.hp < 25, `the threat took heavy fire (hp=${Math.round(sim.world.actors.get("t")!.hp)})`);
+});
+
+// ---------------------------------------------------------------- web/run API
+
+test("solo: runSolo returns a deterministic replay bundle with an enriched frame", () => {
+  const run = runSolo(postureArena(3, 14), { seed: 1 });
+  assert.equal(run.scenario, "solo-combat");
+  assert.ok(run.frames.length > 1, "produced frames");
+  assert.equal(run.units.length, 1, "single agent");
+  assert.is(run.instance, run.instance, "the original instance is carried for rendering");
+  const f = run.frames[run.frames.length - 1];
+  assert.type(f.npc.action, "string", "humanized action present");
+  assert.type(f.npc.exposure, "number", "exposure present (heatmap/HUD)");
+  assert.ok("firingAt" in f.npc, "firingAt present (tracer beam)");
+  assert.ok(f.threats.every((t) => "firing" in t), "threats carry a firing flag");
+});
+
+test("solo: a baked disruption (disruptAt) destroys the relied-on cover and forces a replan", () => {
+  // commit to cover, then destroy it mid-run — the deterministic replay shows the reaction
+  const run = runSolo(disruptionArena(), { seed: 3, profile: DEFENSIVE, disruptAt: { t: 1.5 } });
+  const reacted = run.trace.some((e) => e.t === "step.fail" || e.t === "replan.dirty" || e.t === "repair.attempt");
+  assert.ok(reacted, "the destroyed cover triggered a reactive replan");
+});
+
+test("solo: soloField shades danger — exposed open ground vs behind a wall", () => {
+  const inst: SoloInstance = {
+    units: [{ name: "npc", side: "npc", x: 0, z: 0 }, { name: "t", side: "threat", x: 0, z: 12 }],
+    covers: [],
+    walls: [{ x: -4, z: 5, w: 8, d: 0.6 }],
+  };
+  const field = soloField(inst, [{ x: 0, z: 12 }]);
+  assert.ok(field.exposureAt(0, 0, 0) === 0, "behind the wall ⇒ shielded");
+  assert.ok(field.exposureAt(10, 8, 0) >= 1, "out to the side with a clear line ⇒ exposed");
 });
 
 test.run();

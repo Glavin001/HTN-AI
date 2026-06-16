@@ -792,15 +792,48 @@ export interface SoloSimOptions {
   debug?: boolean;
   /** the NPC's goal: default the Fight task; pass a GOAP goal for lookahead tests */
   goals?: GoalSpec[];
+  /** bake a mid-run disruption: at sim time `t`, destroy `cover` (or the cover the NPC
+   *  is currently moving to) so a deterministic replay shows the reactive replan (S2) */
+  disruptAt?: { t: number; cover?: string };
 }
 
 export interface SoloFrame {
   clock: number;
-  npc: { name: string; x: number; z: number; elev: number; hp: number; ammo: number; alive: boolean; step: string; posture: string; bark: string };
-  threats: { name: string; x: number; z: number; hp: number; alive: boolean }[];
+  npc: {
+    name: string;
+    x: number;
+    z: number;
+    elev: number;
+    hp: number;
+    ammo: number;
+    alive: boolean;
+    /** the running operator label (e.g. "moveToSpot(spot4)") */
+    step: string;
+    /** a humanized verb for the HUD (e.g. "moving to cover", "firing") */
+    action: string;
+    /** committed posture: open / cover / advance / retreat / none */
+    posture: string;
+    /** how many threats can shoot the NPC right now (drives "in the open" vs "shielded") */
+    exposure: number;
+    /** the threat the NPC is firing on this beat, if any (for the tracer beam) */
+    firingAt: string | null;
+    bark: string;
+  };
+  threats: { name: string; x: number; z: number; hp: number; alive: boolean; firing: boolean }[];
 }
 
 export type PerceptionEvent = { t: number; kind: "saw" | "lost" | "search" | "heard"; detail?: string };
+
+/** A deterministic solo run bundle for replay/visualization (mirrors SquadRun). */
+export interface SoloRun {
+  scenario: string;
+  instance: SoloInstance;
+  frames: SoloFrame[];
+  trace: TraceEvent[];
+  events: PerceptionEvent[];
+  postureTrace: { t: number; posture: string }[];
+  units: string[];
+}
 
 export class SoloSim {
   public readonly world: SoloWorld;
@@ -808,6 +841,8 @@ export class SoloSim {
   public readonly model: Model;
   public readonly planner: PlannerT;
   public readonly self: string;
+  /** the ORIGINAL (un-augmented) instance — named covers + walls only, for rendering */
+  public readonly instance: SoloInstance;
   public readonly trace: TraceEvent[] = [];
   public readonly events: PerceptionEvent[] = [];
   public readonly postureTrace: { t: number; posture: string }[] = [];
@@ -819,10 +854,14 @@ export class SoloSim {
   /** world stochastics (threat fire) — independent of the planner's RNG so the two
    *  streams can't correlate (which would skew hit rolls). */
   private readonly simRng: Rng;
+  private readonly disruptAt?: { t: number; cover?: string };
+  private disrupted = false;
 
   constructor(inst: SoloInstance, opts: SoloSimOptions = {}) {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
+    this.instance = inst;
+    this.disruptAt = opts.disruptAt;
     const augmented: SoloInstance = { ...inst, covers: [...inst.covers, ...tacticalSpots(inst)] };
     this.world = new SoloWorld(augmented);
     this.self = inst.units.find((u) => u.side === "npc")!.name;
@@ -932,7 +971,10 @@ export class SoloSim {
   /** scripted threats fire back at the NPC at a realistic cadence when they have a
    *  clear shot — so an exposed NPC bleeds and a covered one survives (cover pays). */
   private nextThreatShot = new Map<string, number>();
+  /** threats that fired at the NPC on the most recent tick (for the view's tracer beams) */
+  private firedThisTick = new Set<string>();
   private threatsFire(): void {
+    this.firedThisTick.clear();
     const npc = this.world.actors.get(this.self);
     if (!npc || !npc.alive) return;
     for (const t of this.world.enemiesOf("npc")) {
@@ -941,6 +983,7 @@ export class SoloSim {
       const next = this.nextThreatShot.get(t.name) ?? 0;
       if (this.world.clock < next) continue;
       this.nextThreatShot.set(t.name, this.world.clock + SHOT_TIME);
+      this.firedThisTick.add(t.name);
       if (this.simRng.next() < this.world.hitChance(t, npc)) {
         npc.hp = Math.max(0, npc.hp - INCOMING_DAMAGE);
         if (npc.hp <= 0) npc.alive = false;
@@ -954,6 +997,12 @@ export class SoloSim {
 
   step(): SoloFrame {
     this.world.clock += this.dt;
+    // baked disruption: destroy the relied-on cover mid-execution (S2)
+    if (this.disruptAt && !this.disrupted && this.world.clock >= this.disruptAt.t) {
+      const target = this.disruptAt.cover ?? /moveToSpot\(([^)]+)\)/.exec(this.snapshot().npc.step)?.[1] ?? this.world.actors.get(this.self)?.cover ?? undefined;
+      if (target) this.world.destroyCover(target);
+      this.disrupted = true;
+    }
     this.perceive();
     // write the committed posture into belief BEFORE planning (anti-dither inertia)
     set(this, "currentPosture", [], this.posture() === "open" ? "open" : this.posture() === "cover" ? "cover" : this.posture() === "advance" ? "advance" : "none");
@@ -1008,10 +1057,27 @@ export class SoloSim {
     const a = this.world.actors.get(this.self)!;
     const step = this.planner.currentStep();
     const stepLabel = step && step.k === "op" ? this.model.describeGroundOp(step.g) : step ? step.k : "—";
+    const status = this.planner.getStatus();
+    const firing = /^(engageFrom|advanceFiring)/.test(stepLabel) && a.alive;
+    const firingAt = firing ? (this.world.nearestThreat(this.self, true)?.name ?? null) : null;
     return {
       clock: round(this.world.clock),
-      npc: { name: a.name, x: round(a.x), z: round(a.z), elev: a.elev, hp: round(a.hp), ammo: a.ammo, alive: a.alive, step: stepLabel, posture: this.posture(), bark: this.world.barks.get(a.name) ?? "" },
-      threats: this.world.enemiesOf("npc").map((t) => ({ name: t.name, x: round(t.x), z: round(t.z), hp: round(t.hp), alive: t.alive })),
+      npc: {
+        name: a.name,
+        x: round(a.x),
+        z: round(a.z),
+        elev: a.elev,
+        hp: round(a.hp),
+        ammo: a.ammo,
+        alive: a.alive,
+        step: stepLabel,
+        action: describeSoloAction(stepLabel, status, a.alive),
+        posture: this.posture(),
+        exposure: a.alive ? this.ctx.field.exposureAt(a.x, a.z, a.elev) : 0,
+        firingAt,
+        bark: this.world.barks.get(a.name) ?? "",
+      },
+      threats: this.world.enemiesOf("npc").map((t) => ({ name: t.name, x: round(t.x), z: round(t.z), hp: round(t.hp), alive: t.alive, firing: this.firedThisTick.has(t.name) })),
     };
   }
 
@@ -1073,13 +1139,53 @@ export function soloModel(inst: SoloInstance, self: string, profile: Personality
   const model = buildSoloModel(self, world, augmented, profile, ctx);
   // build the field from the world's threats so direct planOnce() over this model is
   // exposure-aware (the SoloSim does this every perceive; this is the static analog)
-  ctx.field = buildField(world.enemiesOf("npc").map((a) => ({ pos: { x: a.x, z: a.z }, elev: a.elev, alive: true })), world.activeWalls(), world.softCovers(), FIELD_CFG);
+  ctx.field = buildField(threatSnapshotsOf(world), world.activeWalls(), world.softCovers(), FIELD_CFG);
   ctx.fieldBuilds++;
   return { model, world, ctx };
 }
 
 export function neutralizeGoal(): Formula {
   return F.lte(N.fl("threatHp"), N.c(0));
+}
+
+// ---------------------------------------------------------------- view / run helpers
+
+/** the live threats as a field snapshot (one place, reused by soloModel/greedyChoice/soloField). */
+function threatSnapshotsOf(world: SoloWorld): ThreatSnapshot[] {
+  return world.enemiesOf("npc").map((a) => ({ pos: { x: a.x, z: a.z }, elev: a.elev, alive: true }));
+}
+
+/** A humanized verb for the running step — for the web HUD (mirrors squad's describeAction). */
+export function describeSoloAction(step: string, status: string, alive: boolean): string {
+  if (!alive) return "down";
+  if (step.startsWith("engageFrom")) return "firing";
+  if (step.startsWith("advanceFiring")) return "advancing under fire";
+  if (step.startsWith("climbTo")) return "taking high ground";
+  if (step.startsWith("moveToSpot")) return "moving to cover";
+  if (step.startsWith("retreatTo")) return "falling back";
+  if (step.startsWith("reload")) return "reloading";
+  if (step === "wait" || step === "hold") return "holding";
+  if (status === "planning") return "thinking…";
+  return "holding";
+}
+
+/**
+ * A position-queryable danger field built from an instance's static geometry + given
+ * threat positions — for the web's floor heatmap (sample `exposureAt` over a grid).
+ * Reuses the same `buildField` + cover footprints the planner reasons over.
+ */
+export function soloField(inst: SoloInstance, threats: { x: number; z: number; elev?: number }[]): SpatialField {
+  const walls: Box[] = (inst.walls ?? []).map((w) => ({ x: w.x, z: w.z, w: w.w, d: w.d, height: w.height }));
+  const softCovers: Box[] = inst.covers.filter((c) => isSoftCover(c) && !c.blocked).map(coverFootprint);
+  const snap: ThreatSnapshot[] = threats.map((t) => ({ pos: { x: t.x, z: t.z }, elev: t.elev ?? 0, alive: true }));
+  return buildField(snap, walls, softCovers, FIELD_CFG);
+}
+
+/** Run a solo scenario to a terminal state and return a deterministic replay bundle. */
+export function runSolo(inst: SoloInstance, opts: SoloSimOptions = {}): SoloRun {
+  const sim = new SoloSim(inst, opts);
+  const frames = sim.run();
+  return { scenario: "solo-combat", instance: inst, frames, trace: sim.trace, events: sim.events, postureTrace: sim.postureTrace, units: [sim.self] };
 }
 
 // ---------------------------------------------------------------- greedy baseline (S4)
@@ -1098,7 +1204,7 @@ export function neutralizeGoal(): Formula {
 export function greedyChoice(world: SoloWorld, npcName: string, caution = 1): { label: string; cost: number } {
   const npc = world.actors.get(npcName)!;
   const t = world.enemiesOf("npc")[0];
-  const field = buildField(world.enemiesOf("npc").map((a) => ({ pos: { x: a.x, z: a.z }, elev: a.elev, alive: true })), world.activeWalls(), world.softCovers(), FIELD_CFG);
+  const field = buildField(threatSnapshotsOf(world), world.activeWalls(), world.softCovers(), FIELD_CFG);
   const visible = (x: number, z: number) => world.losClear(x, z, t.x, t.z) && dist2(x, z, t.x, t.z) <= SIGHT_RANGE;
   // myopic: a line of fire now ⇒ shoot now (don't reason about the cost of holding an
   // exposed position over the whole fight). The cost reported is what that commitment
