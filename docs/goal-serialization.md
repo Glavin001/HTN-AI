@@ -80,6 +80,42 @@ threshold landmarks (per fluent) are sound; the cross-variable *level* ordering 
 a "build the lower courses first" heuristic that matches the support structure of
 stacking domains.
 
+### `heuristic: "lmcut"` — admissible landmark heuristic for *optimal* joint planning
+
+Serialization buys tractability by **sacrificing optimality**: committing to one
+subgoal at a time can force re-work that an all-at-once plan avoids. The Sussman
+anomaly is the clean measurement — serialized (and protected, so *sound*) it costs
+**10 actions; the optimal plan is 6**. Crucially this gap is *structural to
+serializing*, not an artifact we can tune away: neither reordering the two
+subgoals nor solving each subgoal optimally (weight 1) changes the 10 — both
+orders still commit `b`-on-`c` while `c` is on `a` and must tear it down. Only a
+**joint** search that sees the whole goal at once clears `a` first and finds the 6.
+
+So when you want optimality, you want the joint search — but the joint search is
+exactly what blows up (that's why we serialize). The bridge is a stronger
+**admissible** heuristic. The engine's default admissible heuristic is `h_max`,
+which is weak; `heuristic: "lmcut"` adds **LM-cut** (Helmert & Domshlak 2009),
+which repeatedly extracts *disjunctive action landmarks* (the cheapest action
+across each cut between the goal zone and the rest) and sums their costs. It
+**dominates `h_max`** while staying admissible, so weight-1 A\* still returns the
+optimal plan but expands a tiny fraction of the nodes. Measured on reversing an
+`N`-tower (optimal joint planning, weight 1):
+
+| instance | optimal cost | `h_max` expansions | `lmcut` expansions |
+|---|---|---|---|
+| Sussman | 6 | 12 | 10 |
+| reverse-7 | 14 | 107 | 15 |
+| reverse-8 | 16 | 347 | 17 |
+| reverse-9 | 18 | 1253 | **19** |
+
+LM-cut's expansions track the plan length (the heuristic is nearly perfect here)
+while `h_max` blows up — a 66× cut on reverse-9. That is what makes the optimal
+joint plan **affordable**: where you'd otherwise serialize and accept the
+suboptimal-but-sound result, an admissible landmark heuristic lets you take the
+optimal one for as long as the joint search stays in budget. It's an admissible
+search heuristic (`planOnce(..., { weight: 1, heuristic: "lmcut" })`), independent
+of and complementary to the agenda machinery above.
+
 ## Soundness vs completeness — what we guarantee
 
 - **Sound:** with protection on (the default), the planner never reports success
@@ -97,10 +133,13 @@ stacking domains.
   order could still strand the planner (it then fails soundly). Two further
   extensions would close the remaining gap:
   - **Reasonable goal orderings** (Koehler-Hoffmann): derive an order so prefixes
-    stay achievable (for Sussman, order `on(b,c)` before `on(a,b)`) automatically,
-    rather than relying on the agenda's input order.
-  - **Landmark heuristics** (LAMA; LM-cut): use landmark counting/cost as a search
-    heuristic, and extract richer intermediate landmarks beyond numeric thresholds.
+    stay achievable rather than relying on the agenda's input order. Note this does
+    *not* help the Sussman optimality gap — both orders cost 10 (above); it is a
+    *completeness/soundness-of-order* tool, not an optimality one.
+  - **Optimality via admissible search** — *implemented*: `heuristic: "lmcut"`
+    (above) makes optimal joint planning tractable, recovering the optimal plan
+    that serialization gives up. The open extension is using these discovered
+    landmarks to drive the *agenda* (cost-based ordering), not just the search.
 
 ## When to reach for what
 
@@ -108,6 +147,7 @@ stacking domains.
 |---|---|
 | You can encode independence into the domain | Model it away first (e.g. the wall's source-gated `grab` + reach-one-up `place`) |
 | Subgoals serializable; speed > optimality | `goalAgenda` serialization (protection on) |
+| Need the **optimal** plan; problem moderate-sized | joint search + `heuristic: "lmcut"` (weight 1) |
 | Build-up subgoals INTERFERE (top needs base) | `goalAgenda` + `landmarks` (threshold landmarks, base course first) |
 | Lots of interchangeable objects; need completeness/optimality | Symmetry breaking (orbit pruning) |
 | General goals; want a principled heuristic + ordering | Landmarks / factored planning |
