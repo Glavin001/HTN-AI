@@ -8,10 +8,13 @@
  * The wall is handed over as ONE declarative goal (`∧ height(cell) ≥ 2`); the
  * domain has only goto/grab/place, so the planner DISCOVERS pickup-and-place by
  * search. The Planner runs in `goalAgenda` mode, which splits the conjunction into
- * per-cell subgoals and commits to them one at a time — the standard fix for a
- * conjunction of independent sub-goals that would otherwise blow up one-shot.
+ * per-cell subgoals (and, in hard mode, threshold landmarks) and commits to them
+ * one at a time.
+ *
+ * For the glass-box UI we also capture: the derived subgoal/landmark AGENDA, which
+ * subgoal each executed step served, and per-subgoal/plan metrics.
  */
-import { Planner, goal, type TraceEvent } from "htn-ai";
+import { Planner, goal, printFormula, type GoalSpec, type TraceEvent } from "htn-ai";
 import { wallGoal, wallInstance, wallInstanceHard, wallModel, type WallInstance } from "@scenarios/wall";
 
 export interface WallCell {
@@ -28,8 +31,35 @@ export interface WallFrame {
   holding: boolean;
   /** label of the action that produced this frame ("start" for the initial one) */
   action: string;
+  /** the action's verb: goto | grab | place | start */
+  verb: string;
   /** how many wall slots are fully laid (at wantHeight) in this frame */
   placed: number;
+  /** index into `subgoals` of the agenda item this step served */
+  goalIndex: number;
+}
+
+/** One item of the derived agenda — a per-cell subgoal or a threshold landmark. */
+export interface WallSubgoal {
+  /** human text, e.g. "height(c2_3) ≥ 1" */
+  text: string;
+  /** the cell it constrains, if any */
+  cell: string | null;
+  /** the target height (1 = base course, 2 = top course); 0 if not a threshold */
+  level: number;
+  /** number of executed steps that served this subgoal */
+  steps: number;
+}
+
+export interface WallMetrics {
+  /** agenda items (subgoals / landmarks) */
+  subgoals: number;
+  /** total executed actions in the realized plan */
+  actions: number;
+  /** how many distinct plans the planner built (one per subgoal + any repair) */
+  plansBuilt: number;
+  /** breakdown of executed actions by verb */
+  verbs: { goto: number; grab: number; place: number };
 }
 
 export interface WallRun {
@@ -43,11 +73,30 @@ export interface WallRun {
   /** how many blocks tall each wall slot must become */
   wantHeight: number;
   frames: WallFrame[];
+  /** the derived subgoal / landmark agenda, in serialization order */
+  subgoals: WallSubgoal[];
+  metrics: WallMetrics;
   status: string;
   trace: TraceEvent[];
   goalText: string;
   /** realistic-physics mode: cells interfere, solved by landmark layering */
   hard: boolean;
+}
+
+const verbOf = (label: string): string => label.split("(")[0] || "start";
+
+/** Parse a threshold-goal spec into {cell, level} for the agenda display. */
+function describeGoal(g: GoalSpec): { text: string; cell: string | null; level: number } {
+  if (g.kind !== "goal") return { text: g.name, cell: null, level: 0 };
+  const cond = g.condition;
+  let cell: string | null = null;
+  let level = 0;
+  if (cond.f === "cmp" && cond.a.n === "fluent" && cond.b.n === "const") {
+    const arg = cond.a.args[0];
+    if (arg && arg.t === "sym") cell = arg.name;
+    level = cond.b.value;
+  }
+  return { text: printFormula(cond).replace(/>=/g, "≥"), cell, level };
 }
 
 /**
@@ -79,7 +128,9 @@ export function runWall(hard = false): WallRun {
     trace: (e) => trace.push(e),
   });
 
-  const snap = (action: string): WallFrame => {
+  const subgoals: WallSubgoal[] = planner.agenda().map((g) => ({ ...describeGoal(g), steps: 0 }));
+
+  const snap = (action: string, goalIndex: number): WallFrame => {
     const heights = Object.fromEntries(cellNames.map((c) => [c, model.read(planner.state, "height", c) as number]));
     const placed = inst.targets.reduce((n, c) => n + (heights[c] >= want ? 1 : 0), 0);
     return {
@@ -88,20 +139,29 @@ export function runWall(hard = false): WallRun {
       agentY: model.read(planner.state, "agentY") as number,
       holding: model.read(planner.state, "holding") as boolean,
       action,
+      verb: verbOf(action),
       placed,
+      goalIndex,
     };
   };
 
-  const frames: WallFrame[] = [snap("start")];
+  const frames: WallFrame[] = [snap("start", 0)];
   for (let i = 0; i < 20000; i++) {
     const status = planner.getStatus();
     if (status === "succeeded" || status === "failed") break;
+    const gi = planner.activeGoalIndex(); // the subgoal being worked this tick
     t += 1;
     const before = trace.length;
     planner.tick({ ms: 30 }); // generous budget; runs offline, not per animation frame
     const done = trace.slice(before).find((e) => e.t === "step.done");
-    if (done && done.t === "step.done") frames.push(snap(done.label));
+    if (done && done.t === "step.done") {
+      if (subgoals[gi]) subgoals[gi].steps += 1;
+      frames.push(snap(done.label, gi));
+    }
   }
+
+  const verbs = { goto: 0, grab: 0, place: 0 };
+  for (const f of frames) if (f.verb in verbs) verbs[f.verb as keyof typeof verbs] += 1;
 
   return {
     cells: inst.cells.map((c) => ({ name: c.name, x: c.x, z: c.z })),
@@ -110,6 +170,13 @@ export function runWall(hard = false): WallRun {
     core: inst.core,
     wantHeight: want,
     frames,
+    subgoals,
+    metrics: {
+      subgoals: subgoals.length,
+      actions: frames.length - 1,
+      plansBuilt: trace.filter((e) => e.t === "plan.new").length,
+      verbs,
+    },
     status: planner.getStatus(),
     trace,
     goalText: `enclose the courtyard — a ${inst.targets.length}-slot wall, ${want} blocks tall`,

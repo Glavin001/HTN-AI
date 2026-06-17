@@ -24,6 +24,7 @@ const BlocksScene = dynamic(() => import("../components/BlocksScene"), { ssr: fa
 const WallScene = dynamic(() => import("../components/WallScene"), { ssr: false });
 const SquadScene = dynamic(() => import("../components/SquadScene"), { ssr: false });
 import SquadDirector from "../components/SquadDirector";
+import WallPanel from "../components/WallPanel";
 
 type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
 type ScenarioId = GridId | "blocks" | "wall" | "wallHard" | SquadScenarioId;
@@ -137,7 +138,7 @@ export default function Page() {
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
         {run?.kind === "blocks" && <BlocksScene key="blocks" frame={run.data.frames[step]} blocks={run.data.blocks} reached={step === lastStep} />}
-        {run?.kind === "wall" && <WallScene key="wall" frame={run.data.frames[step]} cells={run.data.cells} targets={run.data.targets} sources={run.data.sources} core={run.data.core} wantHeight={run.data.wantHeight} reached={step === lastStep && status === "succeeded"} />}
+        {run?.kind === "wall" && <WallScene key="wall" frame={run.data.frames[step]} cells={run.data.cells} targets={run.data.targets} sources={run.data.sources} core={run.data.core} wantHeight={run.data.wantHeight} reached={step === lastStep && status === "succeeded"} activeCell={run.data.subgoals[run.data.frames[Math.min(step, lastStep)]?.goalIndex ?? 0]?.cell ?? null} />}
         {squad && <SquadScene key="squad" frame={squad.frame} instance={squad.instance} selected={selected} onSelect={(n) => setSelected(n || null)} />}
 
         {squad && (
@@ -249,58 +250,7 @@ export default function Page() {
           </div>
         )}
 
-        {run?.kind === "wall" && (() => {
-          const f = run.data.frames[Math.min(step, lastStep)];
-          const want = run.data.wantHeight;
-          const totalBlocks = run.data.targets.length * want;
-          const blocksLaid = run.data.targets.reduce((n, c) => n + Math.min(f?.heights[c] ?? 0, want), 0);
-          const activeSlot = Math.min((f?.placed ?? 0) + 1, run.data.targets.length);
-          const phase = wallPhase(f?.action ?? "start", f?.holding ?? false);
-          return (
-            <>
-              <div className="card watch">
-                <h2>Goal · a structure, not a position</h2>
-                <div className="mono">{run.data.goalText}</div>
-                <ol style={{ marginTop: 8 }}>
-                  <li><b style={{ color: "#fbbf24" }}>amber wireframe</b> = a goal slot, {want} blocks tall, still to build</li>
-                  <li><b style={{ color: "#34d399" }}>green blocks</b> = wall laid · <b style={{ color: "#f59e0b" }}>orange</b> = scattered pile · <b style={{ color: "#a78bfa" }}>◆</b> = courtyard core</li>
-                </ol>
-                <div className="row" style={{ marginTop: 8, gap: 8 }}>
-                  <span className="mono" style={{ color: "var(--muted)", minWidth: 70 }}>blocks laid</span>
-                  <input type="range" min={0} max={totalBlocks} step={1} value={blocksLaid} readOnly style={{ flex: 1, accentColor: "#34d399" }} />
-                  <span className="mono" style={{ color: "#34d399" }}>{blocksLaid}/{totalBlocks}</span>
-                </div>
-                <div className="row" style={{ marginTop: 6, gap: 8 }}>
-                  <span className="mono" style={{ color: "var(--muted)", minWidth: 70 }}>slots done</span>
-                  <input type="range" min={0} max={run.data.targets.length} step={1} value={f?.placed ?? 0} readOnly style={{ flex: 1, accentColor: "#34d399" }} />
-                  <span className="mono" style={{ color: "#34d399" }}>{f?.placed ?? 0}/{run.data.targets.length}</span>
-                </div>
-              </div>
-
-              <div className="card">
-                <h2>How the planner solves it</h2>
-                <div className="mono" style={{ fontSize: 11, lineHeight: 1.7 }}>
-                  <div><span style={{ color: "var(--muted)" }}>goal (declarative):</span> <span style={{ color: "var(--accent-2)" }}>∧ height(cell) ≥ {want}</span> over {run.data.targets.length} cells</div>
-                  <div><span style={{ color: "var(--muted)" }}>domain ops:</span> <span style={{ color: "var(--accent)" }}>goto · grab · place</span> &nbsp;<span style={{ color: "var(--muted)" }}>// no &quot;build&quot; task</span></div>
-                  <div style={{ marginTop: 2 }}>planner <b style={{ color: "var(--accent-2)" }}>discovers</b> grab→carry→place per cell</div>
-                </div>
-                <div className="mono" style={{ color: "var(--muted)", marginTop: 8, fontSize: 11 }}>
-                  <b style={{ color: "var(--accent-2)" }}>goalAgenda</b>: splits the conjunction into {run.data.targets.length} per-cell subgoals and commits to them one at a time. A flat search over all of them blows up; this stays linear.
-                </div>
-                {run.data.hard && (
-                  <div className="mono" style={{ color: "#fbbf24", marginTop: 8, fontSize: 11 }}>
-                    <b>landmarks</b>: realistic physics makes the cells interfere — a cell can only be topped from a raised neighbour. The planner derives that <span style={{ color: "var(--accent-2)" }}>height ≥ 2</span> passes through <span style={{ color: "var(--accent-2)" }}>height ≥ 1</span> (a threshold landmark) and lays the whole <b>base course before any top course</b>. Without it, per-cell serialization strands cells.
-                  </div>
-                )}
-                <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 8, background: "rgba(56,189,248,0.08)", border: "1px solid rgba(56,189,248,0.18)" }}>
-                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>now · subgoal {activeSlot}/{run.data.targets.length} (height(cell) ≥ {want})</div>
-                  <div className="mono" style={{ marginTop: 2 }}><span style={{ color: phase.color }}>{phase.icon} {phase.text}</span></div>
-                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{f?.action ?? "start"}</div>
-                </div>
-              </div>
-            </>
-          );
-        })()}
+        {run?.kind === "wall" && <WallPanel run={run.data} step={Math.min(step, lastStep)} />}
 
         <div className="card">
           <h2>Trace events {squad ? "· glass-box" : ""}</h2>
@@ -320,13 +270,4 @@ function outcome(f: SquadFrame): string {
   const dead = f.teams.filter((t) => t.alive === 0);
   if (dead.length) return `${teamName(dead[0].side)} eliminated`;
   return "engaging";
-}
-
-/** Map a raw wall action label to a human phase for the "now" readout. */
-function wallPhase(action: string, holding: boolean): { icon: string; text: string; color: string } {
-  if (action.startsWith("grab")) return { icon: "✋", text: "picking up a block from the pile", color: "#f59e0b" };
-  if (action.startsWith("place")) return { icon: "▮", text: "laying a block on the wall", color: "#34d399" };
-  if (action.startsWith("goto")) return holding ? { icon: "→", text: "carrying a block to the wall", color: "#38bdf8" } : { icon: "→", text: "walking to a block", color: "#38bdf8" };
-  if (action === "start") return { icon: "•", text: "planning the first placement", color: "var(--muted)" };
-  return { icon: "✓", text: "wall complete", color: "#34d399" };
 }

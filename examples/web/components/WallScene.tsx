@@ -15,6 +15,29 @@ interface SceneProps {
   core: string;
   wantHeight: number;
   reached: boolean;
+  /** the cell whose subgoal is being worked right now — pulsed in the scene */
+  activeCell?: string | null;
+}
+
+/** A pulsing column of light over the cell the planner is currently working on. */
+function ActiveMarker({ pos }: { pos: THREE.Vector3 }) {
+  const ref = useRef<THREE.Mesh>(null);
+  useFrame((state) => {
+    const m = ref.current;
+    if (!m) return;
+    const s = 1 + Math.sin(state.clock.elapsedTime * 4) * 0.12;
+    m.scale.set(s, 1, s);
+    (m.material as THREE.MeshBasicMaterial).opacity = 0.35 + Math.sin(state.clock.elapsedTime * 4) * 0.15;
+  });
+  return (
+    <group position={pos}>
+      <mesh ref={ref} position={[0, 1.6, 0]}>
+        <cylinderGeometry args={[0.62, 0.62, 3.2, 20, 1, true]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.4} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <pointLight color="#38bdf8" intensity={1.4} distance={3} position={[0, 1.2, 0]} />
+    </group>
+  );
 }
 
 function Agent({ target, holding }: { target: THREE.Vector3; holding: boolean }) {
@@ -122,7 +145,7 @@ function FloorCell({ x, z, isCore }: { x: number; z: number; isCore: boolean }) 
   );
 }
 
-function Scene({ frame, cells, targets, sources, core, wantHeight, reached }: SceneProps) {
+function Scene({ frame, cells, targets, sources, core, wantHeight, reached, activeCell }: SceneProps) {
   const targetSet = useMemo(() => new Set(targets), [targets]);
   const sourceSet = useMemo(() => new Set(sources), [sources]);
 
@@ -167,6 +190,11 @@ function Scene({ frame, cells, targets, sources, core, wantHeight, reached }: Sc
 
       <Agent target={agentTarget} holding={frame.holding} />
 
+      {activeCell && !reached && (() => {
+        const p = cellPos.get(activeCell);
+        return p ? <ActiveMarker pos={new THREE.Vector3(p[0], 0, p[1])} /> : null;
+      })()}
+
       {reached && (
         <mesh position={[center[0], 0.02, center[2]]} rotation={[-Math.PI / 2, 0, 0]}>
           <ringGeometry args={[span * 0.32, span * 0.34, 64]} />
@@ -181,7 +209,7 @@ function Scene({ frame, cells, targets, sources, core, wantHeight, reached }: Sc
   );
 }
 
-export default function WallScene(props: SceneProps) {
+export default function WallScene(props: SceneProps & { activeCell?: string | null }) {
   return (
     <Canvas shadows dpr={[1, 2]} gl={{ antialias: true }} style={{ background: "linear-gradient(180deg,#0d1320,#0b0e14)" }}>
       <Scene {...props} />

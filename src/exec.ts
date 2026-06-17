@@ -260,6 +260,13 @@ export class Planner {
     return this.allGoals.length;
   }
 
+  /** The derived subgoal agenda (read-only) — the conjuncts/landmarks the planner
+   *  serializes through, in order. Useful for glass-box UIs that visualize the
+   *  decomposition and progress. */
+  agenda(): readonly GoalSpec[] {
+    return this.allGoals;
+  }
+
   setTrace(fn: TraceFn): void {
     this.trace = fn;
   }
