@@ -25,9 +25,10 @@ const WallScene = dynamic(() => import("../components/WallScene"), { ssr: false 
 const SquadScene = dynamic(() => import("../components/SquadScene"), { ssr: false });
 import SquadDirector from "../components/SquadDirector";
 import WallPanel from "../components/WallPanel";
+import BlocksComparePanel from "../components/BlocksComparePanel";
 
 type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
-type ScenarioId = GridId | "blocks" | "wall" | "wallHard" | SquadScenarioId;
+type ScenarioId = GridId | "blocks" | "blocksHard" | "wall" | "wallHard" | SquadScenarioId;
 type Kind = "grid" | "blocks" | "wall" | "squad";
 
 type Run =
@@ -48,13 +49,14 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerBig: { name: "Scavenger XL", kind: "grid", blurb: "A bigger 4×3 grid, a height-3 goal, seven scattered blocks. The planner harvests a pillar and stacks a 3-level structure." },
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
+  blocksHard: { name: "★ BFWS vs weighted-A* (12 blocks)", kind: "blocks", blurb: "The SAME 12-block scramble, solved two ways. The delete-relaxation heuristic plateaus here, so weighted-A* fans out — ~1400 expansions and ~4500 heuristic evaluations. Best-First Width Search orders the frontier by NOVELTY first (explore the structurally new), boosts FF preferred operators on a second queue, and DEFERS heuristic work to expanded nodes only — reaching a plan in ~130 expansions / ~130 heuristic evaluations. The panel shows the head-to-head cost; the animation plays the BFWS solve. The trade-off is honest: BFWS isn't cost-optimal, so its plan can be longer — agility for quality." },
   wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — and it isn't a recipe either. It's one DECLARATIVE end-state: 'every cell of this octagonal ring ends up two blocks tall.' The domain has only goto / grab / place; nothing tells the agent to pick up or place anything. The planner DISCOVERS pickup-and-place by search. A single search over all 12 cells blows up, so the planner runs in goal-agenda mode: it splits the conjunction into per-cell subgoals and commits to them one at a time. Blocks come only from the scattered pile, so a laid block is never cannibalised — which is what makes serialising sound." },
   wallHard: { name: "Build a wall — realistic physics (needs landmarks)", kind: "wall", blurb: "The SAME wall, same declarative goal — but realistic physics: the agent can't place a block above its own reach. Now a cell can only be topped from a neighbour that's already raised, so the cells INTERFERE: a lone 2-tall pillar is unbuildable, and per-cell serialization strands cells it can't reach. The fix is landmark layering — the planner derives that every cell's height-2 goal passes through height-1 first (a sound threshold landmark) and lays the WHOLE base course before any top course, so every upper course has a neighbour to stand on. This is the Sussman-like 'subgoals interfere, order matters' case made tractable." },
 };
 
 function buildRun(id: ScenarioId): Run {
   const kind = SCENARIOS[id].kind;
-  if (kind === "blocks") return { kind: "blocks", data: runBlocks() };
+  if (kind === "blocks") return { kind: "blocks", data: runBlocks(id === "blocksHard") };
   if (kind === "wall") return { kind: "wall", data: runWall(id === "wallHard") };
   if (kind === "squad") return { kind: "squad", data: runSquad(id as SquadScenarioId) };
   return { kind: "grid", data: runScenario(id as GridId) };
@@ -249,6 +251,8 @@ export default function Page() {
             <div className="mono">be at 3D position <span style={{ color: "var(--accent-2)" }}>({run.data.target.x}, {run.data.target.y}, {run.data.target.z})</span></div>
           </div>
         )}
+
+        {run?.kind === "blocks" && run.data.compare && <BlocksComparePanel compare={run.data.compare} />}
 
         {run?.kind === "wall" && <WallPanel run={run.data} step={Math.min(step, lastStep)} />}
 

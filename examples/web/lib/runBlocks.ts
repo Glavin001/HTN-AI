@@ -6,9 +6,17 @@
  * frame (so the renderer stays dumb): each block sits in the column of its
  * stack's table-root, at a height equal to its depth; a held block hovers above
  * where it will land next.
+ *
+ * Two scenarios share this path:
+ *  - Sussman (default): the classic A-on-B-on-C anomaly.
+ *  - Hard (`runBlocks(true)`): a 12-block scramble that the heuristic plateaus on,
+ *    run under BOTH weighted-A* and BFWS so the demo can show, side by side, how
+ *    much cheaper Best-First Width Search reaches a plan. The animated solve is the
+ *    BFWS one.
  */
-import { F, Planner, goal, type TraceEvent } from "htn-ai";
+import { F, Planner, goal, planOnce, type Formula, type TraceEvent } from "htn-ai";
 import { blocksModel, sussmanSetup } from "@scenarios/blocks";
+import type { Model } from "htn-ai";
 
 export interface BlocksFrame {
   /** block name → [x, stackDepth] for rendering */
@@ -19,30 +27,89 @@ export interface BlocksFrame {
   action: string;
 }
 
+/** one planner's cost to reach a plan on the same instance */
+export interface SearchMetric {
+  label: string;
+  note: string;
+  expansions: number;
+  heuristicEvals: number;
+  ms: number;
+  planLength: number;
+  ok: boolean;
+}
+export interface BlocksCompare {
+  wastar: SearchMetric;
+  bfws: SearchMetric;
+}
+
 export interface BlocksRun {
   blocks: string[];
   frames: BlocksFrame[];
   status: string;
   trace: TraceEvent[];
   goalText: string;
+  /** present only for the hard instance: the head-to-head search-cost comparison */
+  compare?: BlocksCompare;
 }
 
 const SPACING = 1.7;
 const CARRY_Y = 4;
 const HAND = "arm";
 
-export function runBlocks(): BlocksRun {
-  const setup = sussmanSetup(); // C on A; A,B on table — the Sussman anomaly
-  const blocks = setup.blocks;
-  const model = blocksModel(setup);
+// A deterministic 12-block scramble (random initial layout → random goal). The
+// delete-relaxation heuristic plateaus on it: weighted-A* expands ~1400 nodes and
+// runs ~4500 heuristic evaluations; BFWS solves it in ~130 expansions / ~130
+// heuristic evaluations — novelty + preferred operators + deferred evaluation.
+const HARD_INIT: [string, string][] = [["C", "F"], ["D", "H"], ["F", "B"], ["G", "K"], ["H", "I"], ["J", "L"], ["K", "A"], ["L", "E"]];
+const HARD_GOAL: [string, string][] = [["B", "G"], ["C", "I"], ["D", "A"], ["E", "D"], ["F", "J"], ["G", "H"], ["I", "L"], ["J", "K"]];
+const HARD_BLOCKS = "ABCDEFGHIJKL".split("");
+
+function hardModel(): Model {
+  return blocksModel({
+    blocks: HARD_BLOCKS,
+    init: (w) => {
+      for (const [b, u] of HARD_INIT) {
+        w.set("on", [b], u);
+        w.set("clear", [u], false);
+      }
+    },
+  });
+}
+
+/** Plan the joint goal once with a given strategy and report what it cost. */
+function bench(label: string, note: string, goalFormula: Formula, req: object): SearchMetric {
+  const model = hardModel();
+  const t0 = performance.now();
+  const r = planOnce(model, model.createExecState(), { goals: [goal(goalFormula)], maxNodes: 200_000, ...req });
+  const ms = performance.now() - t0;
+  const planLength = r.plan ? r.plan.steps.filter((s) => s.k === "op").length : -1;
+  return { label, note, expansions: r.stats.expansions, heuristicEvals: r.stats.heuristicEvals, ms, planLength, ok: r.status === "success" };
+}
+
+export function runBlocks(hard = false): BlocksRun {
+  const blocks = hard ? HARD_BLOCKS : sussmanSetup().blocks;
+  const model = hard ? hardModel() : blocksModel(sussmanSetup());
+  const goalFormula = hard
+    ? F.and(...HARD_GOAL.map(([b, u]) => F.lit("on", [b], u)))
+    : F.and(F.lit("on", ["a"], "b"), F.lit("on", ["b"], "c"));
+
+  // head-to-head search cost on the hard instance (same goal, same world)
+  const compare: BlocksCompare | undefined = hard
+    ? {
+        wastar: bench("weighted-A*", "default · cost-optimal-ish, evaluates every child", goalFormula, {}),
+        bfws: bench("BFWS", "novelty + preferred ops + deferred eval", goalFormula, { search: "bfws" }),
+      }
+    : undefined;
 
   const trace: TraceEvent[] = [];
   let t = 0;
   const planner = new Planner(model, {
-    goals: [goal(F.and(F.lit("on", ["a"], "b"), F.lit("on", ["b"], "c")))],
+    goals: [goal(goalFormula)],
     now: () => t,
     seed: 1,
     trace: (e) => trace.push(e),
+    // the animated solve uses BFWS for the hard instance, default for Sussman
+    ...(hard ? { search: "bfws" as const } : {}),
   });
 
   const sorted = [...blocks].sort();
@@ -69,7 +136,7 @@ export function runBlocks(): BlocksRun {
   };
 
   const raws: Raw[] = [readRaw("start")];
-  for (let i = 0; i < 500; i++) {
+  for (let i = 0; i < 800; i++) {
     const st = planner.getStatus();
     if (st === "succeeded" || st === "failed") break;
     t += 1;
@@ -110,5 +177,12 @@ export function runBlocks(): BlocksRun {
     frames[i].positions[held] = [destX, CARRY_Y];
   }
 
-  return { blocks, frames, status: planner.getStatus(), trace, goalText: "A·on·B·on·C" };
+  return {
+    blocks,
+    frames,
+    status: planner.getStatus(),
+    trace,
+    goalText: hard ? "12-block scramble → scramble" : "A·on·B·on·C",
+    compare,
+  };
 }
