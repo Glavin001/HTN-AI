@@ -75,6 +75,10 @@ It matches F.E.A.R., then exceeds it:
 
 Run it: the browser demo in [`examples/web`](./examples/web) renders four squad scenarios in 3D with a live glass-box AI-director panel (per-NPC plan, live step, "why not X", reservations); [`tests/squad.ts`](./tests/squad.ts) pins every behaviour above as a ground-truth assertion.
 
+## Mission planning: Bunker Heist (GOAP discovery)
+
+[`scenarios/bunker.ts`](./scenarios/bunker.ts) is the honest re-implementation of the classic *"Acquire key → C4 → Breach → Get star"* bunker mission. The goal is **one declarative fact** — `hasStar` — and the domain has **only primitive operators** (`goto` / `pickup_key` / `unlock_storage` / `pickup_c4` / `place_c4` / `detonate` / `pickup_star`). There is no `AcquireKey` task and no `needsC4` helper precomputing the order: the two gates (a locked storage door, a sealed bunker) are ordinary **preconditions**, so the planner must derive the whole causal chain backwards itself — *star ← breach ← detonate ← C4 ← behind the locked door ← the key*. Movement is **edge-by-edge** over the compound's walk graph, so the spatial route is discovered too, not teleported. [`tests/bunker.ts`](./tests/bunker.ts) pins that every required action is discovered (never named in the goal), that the discovered plan is causally valid, that the planner **adapts** when the world is pre-seeded, and that the star is **provably unreachable with no key**. A dedicated 3D page (`/bunker` in [`examples/web`](./examples/web)) animates the heist with a live mission checklist and the discovered plan.
+
 ## Install & develop
 
 ```bash

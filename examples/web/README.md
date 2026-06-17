@@ -94,6 +94,29 @@ Each scene below drives the same reactive `Planner`:
   [`../../tests/wall.ts`](../../tests/wall.ts), which also builds a *different*
   structure (a free-standing 2-tall tower) from the same operators and goal form.
 
+### ★ Bunker Heist (mission GOAP) — dedicated page at [`/bunker`](./app/bunker/page.tsx)
+
+The honest re-implementation of the classic *"Acquire key → C4 → Breach → Get
+star"* bunker demo ([`../../scenarios/bunker.ts`](../../scenarios/bunker.ts)). The
+goal is **one declarative fact** — `hasStar`. The domain has only primitive
+operators (`goto` / `pickup_key` / `unlock_storage` / `pickup_c4` / `place_c4` /
+`detonate` / `pickup_star`) and **two real gates expressed as preconditions**: you
+may only enter the storage interior while `storageUnlocked`, and the bunker
+interior while `bunkerBreached`.
+
+Nothing encodes the solution — no `AcquireKey` task, no `needsC4` helper. The star
+is sealed inside the bunker, so the planner **works the chain backwards itself**
+from the preconditions: *star ← breach ← detonate (from a safe distance) ← C4
+placed ← C4 ← behind the locked door ← the key*. Movement is **edge-by-edge** over
+the compound's walk graph, so the spatial route is discovered too — not a "teleport
+if a path exists" shortcut. The 3D scene animates the agent walking the route,
+doors swinging open, the breach explosion, and the star pickup; the panel shows the
+**mission checklist**, the **discovered plan** with the live cursor, and the trace
+stream. Switch the *Mission* dropdown (star / breach / C4-only) to watch the planner
+re-derive a different chain from the **same operators**. Ground-truth assertions —
+including a proof that the star is **unreachable with no key** — live in
+[`../../tests/bunker.ts`](../../tests/bunker.ts).
+
 The right-hand panel shows the live world state, the **plan the search
 discovered**, and the planner's **`TraceEvent` stream** (so repair/replan show up
 when they happen).
