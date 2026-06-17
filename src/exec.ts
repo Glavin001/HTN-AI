@@ -76,6 +76,23 @@ export interface PlannerOptions {
    * state the planner reports `failed`; it never silently returns a wrong result.
    */
   goalAgenda?: boolean;
+  /**
+   * Protect already-achieved subgoals while serializing (goal-agenda only). When a
+   * subgoal is committed, every *later* subgoal's search must keep it true — its
+   * goal becomes the cumulative conjunction of all subgoals achieved so far plus
+   * the current one. This is the difference between *blind* serialization (which is
+   * unsound on non-serializable goals — it can report success while an earlier
+   * subgoal has been clobbered, e.g. the Sussman anomaly) and *protected*
+   * serialization, which stays sound: a later subgoal may pass *through* states
+   * that break an earlier one, but the committed result never violates it (the
+   * planner temporarily undoes and restores as needed).
+   *
+   * Each step still starts from a state where the protected prefix already holds,
+   * so when subgoals are independent the protection is nearly free (it isn't
+   * disturbed); when they interact it pays for the local re-work that correctness
+   * demands. Defaults on whenever `goalAgenda` is set.
+   */
+  protectAchieved?: boolean;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -96,6 +113,7 @@ export class Planner {
   /** index of the subgoal currently being pursued in goal-agenda mode */
   private goalCursor = 0;
   private readonly goalAgenda: boolean;
+  private readonly protectAchieved: boolean;
   private goals: GoalSpec[];
   private readonly nowFn: () => number;
   private readonly epoch: number;
@@ -120,6 +138,8 @@ export class Planner {
     this.state = model.createExecState();
     this.rng = createRng(opts.seed ?? 0x12345678);
     this.goalAgenda = opts.goalAgenda ?? false;
+    // protection defaults ON with goal-agenda so serialization is sound by default
+    this.protectAchieved = opts.protectAchieved ?? this.goalAgenda;
     this.allGoals = this.buildAgenda(opts.goals ?? []);
     this.goalCursor = 0;
     this.goals = this.activeGoals();
@@ -156,12 +176,23 @@ export class Planner {
     return out;
   }
 
-  /** the subgoal actively being planned: a single agenda item in goal-agenda
-   *  mode, or the whole goal set otherwise. */
+  /** the subgoal actively being planned: in goal-agenda mode, the current agenda
+   *  item — conjoined with every already-achieved goal-subgoal when protection is
+   *  on, so committing the current one cannot clobber an earlier one. Outside
+   *  goal-agenda mode, the whole goal set (one joint plan). */
   private activeGoals(): GoalSpec[] {
     if (!this.goalAgenda) return this.allGoals;
     const g = this.allGoals[this.goalCursor];
-    return g ? [g] : [];
+    if (!g) return [];
+    if (this.protectAchieved && g.kind === "goal") {
+      const parts: Formula[] = [];
+      for (let i = 0; i <= this.goalCursor; i++) {
+        const gi = this.allGoals[i];
+        if (gi.kind === "goal") parts.push(gi.condition);
+      }
+      if (parts.length > 1) return [{ kind: "goal", condition: { f: "and", parts } }];
+    }
+    return [g];
   }
 
   /** In goal-agenda mode, the index of the subgoal currently being pursued, and
