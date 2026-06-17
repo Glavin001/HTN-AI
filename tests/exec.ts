@@ -14,6 +14,7 @@ import {
   planOnce,
   task,
 } from "../src/index";
+import { blocksModel, sussmanSetup } from "../scenarios/blocks";
 
 // ---------------------------------------------------------------- suffix repair from the failure point
 
@@ -286,6 +287,71 @@ test("goalAgenda off (default): the same goals are pursued as one joint plan", (
   // without goal-agenda the cursor never advances (it's not in serialization mode)
   assert.equal(planner.activeGoalIndex(), 0);
   for (const i of ids) assert.equal(model.read(planner.state, `on${i}`), true);
+});
+
+// ---------------------------------------------------------------- protected serialization (non-serializable goals)
+
+const sussmanGoal = goal(F.and(F.lit("on", ["a"], "b"), F.lit("on", ["b"], "c")));
+const bothOn = (model: ReturnType<typeof blocksModel>, p: Planner): boolean =>
+  model.read(p.state, "on", "a") === "b" && model.read(p.state, "on", "b") === "c";
+const drive = (p: Planner): void => {
+  for (let i = 0; i < 5000 && p.getStatus() !== "succeeded" && p.getStatus() !== "failed"; i++) p.tick({ ms: 20 });
+};
+
+test("goalAgenda: BLIND serialization (protectAchieved:false) is UNSOUND on the Sussman anomaly", () => {
+  // C-on-A, A,B on table; goal on(a,b) ∧ on(b,c). The conjuncts are non-serializable:
+  // achieving on(b,c) after on(a,b) clobbers on(a,b). Without protection the planner
+  // reports success after the LAST subgoal while the first has been undone.
+  const model = blocksModel(sussmanSetup());
+  const planner = new Planner(model, { goals: [sussmanGoal], goalAgenda: true, protectAchieved: false, now: () => 0, seed: 1 });
+  drive(planner);
+  assert.equal(planner.getStatus(), "succeeded", "blind serialization thinks it's done…");
+  assert.not.ok(bothOn(model, planner), "…but the conjunction is violated — that's why protection is the default");
+});
+
+test("goalAgenda: PROTECTED serialization (default) stays sound on the Sussman anomaly", () => {
+  const model = blocksModel(sussmanSetup());
+  const planner = new Planner(model, { goals: [sussmanGoal], goalAgenda: true, now: () => 0, seed: 1 });
+  drive(planner);
+  assert.equal(planner.getStatus(), "succeeded");
+  assert.ok(bothOn(model, planner), "both on(a,b) and on(b,c) must hold — protection re-works the clobber");
+});
+
+test("goalAgenda: protection is enabled by default whenever goalAgenda is set", () => {
+  const model = blocksModel(sussmanSetup());
+  // same as the protected case but without naming protectAchieved — must still be sound
+  const planner = new Planner(model, { goals: [sussmanGoal], goalAgenda: true, now: () => 0, seed: 1 });
+  drive(planner);
+  assert.ok(bothOn(model, planner));
+});
+
+// ---------------------------------------------------------------- landmark decomposition
+
+test("landmarks: a numeric build-up goal expands into level-ordered threshold landmarks", () => {
+  // two cells, each needing height ≥ 2. With landmarks, the goal h(a)≥2 ∧ h(b)≥2
+  // becomes the level-ordered agenda [a≥1, b≥1, a≥2, b≥2] — base course before top.
+  const doc: DomainDoc = {
+    name: "stack",
+    types: [{ name: "cell" }],
+    fluents: [{ name: "h", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 }],
+    operators: [{ name: "raise", params: [{ name: "c", type: "cell" }], eff: [E.inc("h", ["?c"], N.c(1))] }],
+  };
+  const model = createModel(doc, { entities: { a: "cell", b: "cell" } });
+  const buildUp = goal(F.and(F.gte(N.fl("h", "a"), N.c(2)), F.gte(N.fl("h", "b"), N.c(2))));
+
+  // without landmarks: 2 conjuncts (one per cell)
+  const plain = new Planner(model, { goals: [buildUp], goalAgenda: true, now: () => 0, seed: 1 });
+  assert.equal(plain.goalCount(), 2);
+
+  // with landmarks: 4 threshold landmarks, ordered by level
+  const lm = new Planner(model, { goals: [buildUp], goalAgenda: true, landmarks: true, now: () => 0, seed: 1 });
+  assert.equal(lm.goalCount(), 4, "h(a)≥2 ∧ h(b)≥2 → [a≥1, b≥1, a≥2, b≥2]");
+
+  // and it still solves (each raise op bumps height by one)
+  for (let i = 0; i < 200 && lm.getStatus() !== "succeeded" && lm.getStatus() !== "failed"; i++) lm.tick({ ms: 5 });
+  assert.equal(lm.getStatus(), "succeeded");
+  assert.equal(model.read(lm.state, "h", "a"), 2);
+  assert.equal(model.read(lm.state, "h", "b"), 2);
 });
 
 test.run();

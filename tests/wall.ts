@@ -1,7 +1,7 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
 import { Planner, goal, planOnce, type Model, type Snap } from "../src/index";
-import { wallGoal, wallInstance, wallModel, type WallInstance } from "../scenarios/wall";
+import { wallGoal, wallInstance, wallInstanceHard, wallModel, type WallInstance } from "../scenarios/wall";
 
 /**
  * Construction World — a *structure-building* scenario whose goal is purely
@@ -115,6 +115,28 @@ test("construction: the SAME declarative domain builds a different structure (a 
   runToEnd(planner);
   assert.equal(planner.getStatus(), "succeeded", "the same operators + declarative goal build any structure");
   assert.equal(model.read(planner.state, "height", nm(2)), 2, "the tower must be two blocks tall");
+});
+
+test("construction (HARD): interdependent wall needs landmark layering, not plain serialization", () => {
+  // realistic physics (strictReach): a ring cell can only be topped from a neighbour
+  // that's already been raised, so the per-cell subgoals INTERFERE.
+  const inst = wallInstanceHard();
+
+  // plain goal-agenda (split per cell, protected) cannot finish it — a lone cell
+  // can't be built to full height before its neighbours, and it strands cells.
+  const plain = new Planner(wallModel(inst), { goals: [goal(wallGoal(inst))], goalAgenda: true, weight: 3, maxNodes: 200_000, now: () => 0, seed: 1 });
+  runToEnd(plain);
+  const plainBuilt = inst.targets.filter((c) => (plain.model.read(plain.state, "height", c) as number) >= inst.wantHeight).length;
+  assert.ok(plainBuilt < inst.targets.length, "without landmarks the interdependent wall can't be completed");
+
+  // landmarks: derive the threshold landmarks and lay the whole base course before
+  // any top course — every upper course then has a neighbour to stand on.
+  const withLM = new Planner(wallModel(inst), { goals: [goal(wallGoal(inst))], goalAgenda: true, landmarks: true, weight: 3, maxNodes: 200_000, now: () => 0, seed: 1 });
+  runToEnd(withLM);
+  assert.equal(withLM.getStatus(), "succeeded");
+  for (const c of inst.targets) {
+    assert.equal(withLM.model.read(withLM.state, "height", c), inst.wantHeight, `slot ${c} must reach full height with landmark layering`);
+  }
 });
 
 test.run();

@@ -76,6 +76,39 @@ export interface PlannerOptions {
    * state the planner reports `failed`; it never silently returns a wrong result.
    */
   goalAgenda?: boolean;
+  /**
+   * Protect already-achieved subgoals while serializing (goal-agenda only). When a
+   * subgoal is committed, every *later* subgoal's search must keep it true — its
+   * goal becomes the cumulative conjunction of all subgoals achieved so far plus
+   * the current one. This is the difference between *blind* serialization (which is
+   * unsound on non-serializable goals — it can report success while an earlier
+   * subgoal has been clobbered, e.g. the Sussman anomaly) and *protected*
+   * serialization, which stays sound: a later subgoal may pass *through* states
+   * that break an earlier one, but the committed result never violates it (the
+   * planner temporarily undoes and restores as needed).
+   *
+   * Each step still starts from a state where the protected prefix already holds,
+   * so when subgoals are independent the protection is nearly free (it isn't
+   * disturbed); when they interact it pays for the local re-work that correctness
+   * demands. Defaults on whenever `goalAgenda` is set.
+   */
+  protectAchieved?: boolean;
+  /**
+   * Landmark decomposition of numeric build-up goals (goal-agenda only). A goal
+   * `f ≥ k` over a unit-step integer fluent (changed only by ±1) can only be
+   * reached by passing through `f ≥ 1, f ≥ 2, …` — each lower threshold is a
+   * sound *landmark* (a fact every solution must establish first). When set, the
+   * agenda is expanded into these threshold landmarks and **ordered by level**:
+   * every cell's `≥ 1` landmark before any cell's `≥ 2`, and so on.
+   *
+   * This matters when the build-up steps INTERFERE — e.g. a wall where placing a
+   * block's upper course requires standing on a neighbour's lower course. There,
+   * per-cell serialization fails (a lone 2-tall pillar is unbuildable in
+   * isolation), but laying the whole base course first (the level-ordered
+   * landmarks) makes every upper course reachable. It's the agenda analogue of
+   * ordered landmarks in classical planning (Hoffmann/Porteous/Sebastia 2004).
+   */
+  landmarks?: boolean;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -96,6 +129,8 @@ export class Planner {
   /** index of the subgoal currently being pursued in goal-agenda mode */
   private goalCursor = 0;
   private readonly goalAgenda: boolean;
+  private readonly protectAchieved: boolean;
+  private readonly landmarks: boolean;
   private goals: GoalSpec[];
   private readonly nowFn: () => number;
   private readonly epoch: number;
@@ -120,6 +155,9 @@ export class Planner {
     this.state = model.createExecState();
     this.rng = createRng(opts.seed ?? 0x12345678);
     this.goalAgenda = opts.goalAgenda ?? false;
+    // protection defaults ON with goal-agenda so serialization is sound by default
+    this.protectAchieved = opts.protectAchieved ?? this.goalAgenda;
+    this.landmarks = opts.landmarks ?? false;
     this.allGoals = this.buildAgenda(opts.goals ?? []);
     this.goalCursor = 0;
     this.goals = this.activeGoals();
@@ -144,24 +182,72 @@ export class Planner {
    *  whole (solved as one joint plan). */
   private buildAgenda(goals: GoalSpec[]): GoalSpec[] {
     if (!this.goalAgenda) return goals;
-    const out: GoalSpec[] = [];
+    // 1. split conjunctions into per-conjunct subgoals (tasks pass through)
+    const flat: GoalSpec[] = [];
     const pushGoal = (cond: Formula): void => {
       if (cond.f === "and") cond.parts.forEach(pushGoal);
-      else out.push({ kind: "goal", condition: cond });
+      else flat.push({ kind: "goal", condition: cond });
     };
     for (const g of goals) {
       if (g.kind === "goal") pushGoal(g.condition);
-      else out.push(g);
+      else flat.push(g);
     }
+    if (!this.landmarks) return flat;
+    return this.expandLandmarks(flat);
+  }
+
+  /** Expand unit-step numeric build-up goals (`f ≥ k`) into threshold landmarks
+   *  `f ≥ 1, …, f ≥ k` and order the agenda by level (every `≥ ℓ` before any
+   *  `≥ ℓ+1`). Non-numeric or single-level subgoals are appended unchanged. */
+  private expandLandmarks(flat: GoalSpec[]): GoalSpec[] {
+    /** if `cond` is `fluentExpr ≥/＞ const`, the integer height it must reach */
+    const targetOf = (cond: Formula): number | null => {
+      if (cond.f !== "cmp" || (cond.op !== ">=" && cond.op !== ">")) return null;
+      if (cond.b.n !== "const") return null;
+      const v = cond.b.value;
+      if (!Number.isFinite(v)) return null;
+      return cond.op === ">" ? Math.floor(v) + 1 : Math.ceil(v);
+    };
+    const levelGoal = (cond: Extract<Formula, { f: "cmp" }>, level: number): GoalSpec => ({
+      kind: "goal",
+      condition: { f: "cmp", op: ">=", a: cond.a, b: { n: "const", value: level } },
+    });
+
+    const thresholds: { cond: Extract<Formula, { f: "cmp" }>; target: number }[] = [];
+    const others: GoalSpec[] = [];
+    for (const g of flat) {
+      const t = g.kind === "goal" ? targetOf(g.condition) : null;
+      if (g.kind === "goal" && t !== null && t >= 2 && g.condition.f === "cmp") thresholds.push({ cond: g.condition, target: t });
+      else others.push(g);
+    }
+    if (thresholds.length === 0) return flat;
+
+    const maxLevel = thresholds.reduce((m, t) => Math.max(m, t.target), 0);
+    const out: GoalSpec[] = [];
+    for (let level = 1; level <= maxLevel; level++) {
+      for (const { cond, target } of thresholds) if (target >= level) out.push(levelGoal(cond, level));
+    }
+    out.push(...others); // booleans / single-level goals after the layered build-up
     return out;
   }
 
-  /** the subgoal actively being planned: a single agenda item in goal-agenda
-   *  mode, or the whole goal set otherwise. */
+  /** the subgoal actively being planned: in goal-agenda mode, the current agenda
+   *  item — conjoined with every already-achieved goal-subgoal when protection is
+   *  on, so committing the current one cannot clobber an earlier one. Outside
+   *  goal-agenda mode, the whole goal set (one joint plan). */
   private activeGoals(): GoalSpec[] {
     if (!this.goalAgenda) return this.allGoals;
     const g = this.allGoals[this.goalCursor];
-    return g ? [g] : [];
+    if (!g) return [];
+    if (this.protectAchieved && g.kind === "goal") {
+      const parts: Formula[] = [];
+      for (let i = 0; i <= this.goalCursor; i++) {
+        const gi = this.allGoals[i];
+        if (gi.kind === "goal") parts.push(gi.condition);
+      }
+      if (parts.length > 1) return [{ kind: "goal", condition: { f: "and", parts } }];
+    }
+    return [g];
   }
 
   /** In goal-agenda mode, the index of the subgoal currently being pursued, and
@@ -172,6 +258,13 @@ export class Planner {
 
   goalCount(): number {
     return this.allGoals.length;
+  }
+
+  /** The derived subgoal agenda (read-only) — the conjuncts/landmarks the planner
+   *  serializes through, in order. Useful for glass-box UIs that visualize the
+   *  decomposition and progress. */
+  agenda(): readonly GoalSpec[] {
+    return this.allGoals;
   }
 
   setTrace(fn: TraceFn): void {

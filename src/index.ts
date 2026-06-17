@@ -82,6 +82,7 @@ export {
   PlanningSession,
   planOnce,
   hAdd,
+  lmcut,
   type Plan,
   type PlanStep,
   type PlanRequest,

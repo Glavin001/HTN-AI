@@ -122,8 +122,11 @@ export interface PlanRequest {
   collectRejections?: boolean;
   /** novelty tie-breaking on goal-search open lists */
   novelty?: boolean;
-  /** goal-search heuristic: h_add (fast, may overestimate — default), h_max (admissible: use with weight 1 for guaranteed-optimal plans), or none (Dijkstra) */
-  heuristic?: "hadd" | "hmax" | "none";
+  /** goal-search heuristic: h_add (fast, may overestimate — default), h_max
+   *  (admissible, weak), lmcut (admissible, stronger — fewest expansions for
+   *  optimal/weight-1 search), or none (Dijkstra). Pair an admissible heuristic
+   *  with weight 1 for guaranteed-optimal plans. */
+  heuristic?: "hadd" | "hmax" | "lmcut" | "none";
   /** internal: plan a pre-built agenda instead of `goals` (used by plan repair) */
   agendaOverride?: Agenda;
 }
@@ -337,6 +340,166 @@ export function hAdd(model: Model, s: Snap, goalAtoms: Atom[], mode: "add" | "ma
   return relaxCore(model, snapToFlat(model, s), new Float64Array(model.relaxAtomCount), goalDescs(model, goalAtoms), mode === "add");
 }
 
+// ------------------------------------------------------- LM-cut landmark heuristic
+
+/**
+ * The model's delete-relaxation in the propositional form LM-cut needs, built once
+ * per model and reused: every ground operator (with an add effect) becomes an
+ * action with precondition/add atom-id lists over the interned relaxation atoms,
+ * plus two artificial atoms — a unique source `INIT` (precondition of any action
+ * that has no real preconditions) and a sink `GOAL`. Fuzzy (numeric/external)
+ * atoms are dropped from preconditions and treated as free, exactly as the h_max
+ * core treats them optimistically; this keeps LM-cut an admissible lower bound.
+ */
+interface LmcutStatic {
+  pre: Int32Array[]; // per action: precondition atom ids (≥1, INIT if otherwise empty)
+  add: Int32Array[]; // per action: add atom ids
+  nReal: number; // count of real relaxation atoms; GOAL = nReal, INIT = nReal+1
+}
+const lmcutStaticCache = new WeakMap<Model, LmcutStatic>();
+function lmcutStatic(model: Model): LmcutStatic {
+  const cached = lmcutStaticCache.get(model);
+  if (cached) return cached;
+  const nReal = model.relaxAtomCount;
+  const INIT = nReal + 1;
+  const fuzzy = model.relaxAtomFuzzy;
+  const pre: Int32Array[] = [];
+  const add: Int32Array[] = [];
+  for (const g of model.groundOps) {
+    const addIds = g.addIds as Int32Array;
+    if (addIds.length === 0) continue;
+    const preIds = g.preIds as Int32Array;
+    const fp: number[] = [];
+    for (let i = 0; i < preIds.length; i++) if (!fuzzy[preIds[i]]) fp.push(preIds[i]);
+    if (fp.length === 0) fp.push(INIT);
+    pre.push(Int32Array.from(fp));
+    add.push(addIds);
+  }
+  const st: LmcutStatic = { pre, add, nReal };
+  lmcutStaticCache.set(model, st);
+  return st;
+}
+
+/**
+ * LM-cut (Helmert & Domshlak 2009): an admissible landmark heuristic over the
+ * delete relaxation. Repeatedly computes h_max (with a precondition-choice
+ * function), extracts the cut between the goal zone and the rest, charges the
+ * cheapest action in that cut (a disjunctive action landmark), and subtracts it —
+ * until h_max reaches 0. The summed cut costs are an admissible estimate that
+ * dominates h_max, so weighted-A* with weight 1 stays optimal while expanding far
+ * fewer nodes on goals h_max under-informs (interacting subgoals, deep rework).
+ */
+function lmcutCore(model: Model, flat: Float64Array, goals: GoalAtomDesc[], st: LmcutStatic): number {
+  const nReal = st.nReal;
+  const GOAL = nReal;
+  const INIT = nReal + 1;
+  const nAtoms = nReal + 2;
+  const aSlot = model.relaxAtomSlot;
+  const aVal = model.relaxAtomValue;
+
+  // The artificial goal action's preconditions = the real goal atoms. Mirror the
+  // h_max core's optimism for atoms no operator can produce: a satisfied or fuzzy
+  // one is free; a non-fuzzy unreachable one makes the goal unreachable.
+  const goalPre: number[] = [];
+  for (const g of goals) {
+    if (g.id >= 0) goalPre.push(g.id);
+    else if (flat[g.slot] === g.value || g.fuzzy) continue;
+    else return Infinity;
+  }
+  const M = st.pre.length; // real actions; the goal action is index M
+  const nActions = M + 1;
+  const goalPreArr = Int32Array.from(goalPre);
+  const goalAddArr = Int32Array.from([GOAL]);
+  const preOf = (a: number): Int32Array => (a < M ? st.pre[a] : goalPreArr);
+  const addOf = (a: number): Int32Array => (a < M ? st.add[a] : goalAddArr);
+
+  const cost = new Float64Array(nActions).fill(1);
+  cost[M] = 0; // the goal action is free
+
+  const hmax = new Float64Array(nAtoms);
+  const supporter = new Int32Array(nActions); // precondition-choice function (per action)
+  const inZone = new Uint8Array(nAtoms);
+  let h = 0;
+
+  for (let iter = 0; iter < 100000; iter++) {
+    // --- h_max with precondition choice (supporter = costliest precondition) ---
+    hmax.fill(Infinity);
+    hmax[INIT] = 0;
+    for (let id = 0; id < nReal; id++) if (flat[aSlot[id]] === aVal[id]) hmax[id] = 0;
+    supporter.fill(-1);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let a = 0; a < nActions; a++) {
+        const pr = preOf(a);
+        let mx = 0;
+        let sup = -1;
+        let ok = true;
+        for (let i = 0; i < pr.length; i++) {
+          const hv = hmax[pr[i]];
+          if (hv === Infinity) { ok = false; break; }
+          if (hv >= mx) { mx = hv; sup = pr[i]; }
+        }
+        if (!ok) continue;
+        if (sup === -1) sup = INIT; // empty precondition ⇒ supported by the source
+        supporter[a] = sup;
+        const through = cost[a] + mx;
+        const ad = addOf(a);
+        for (let i = 0; i < ad.length; i++) {
+          if (through < hmax[ad[i]]) { hmax[ad[i]] = through; changed = true; }
+        }
+      }
+    }
+    const hg = hmax[GOAL];
+    if (hg === Infinity) return Infinity;
+    if (hg === 0) break;
+
+    // --- goal zone: atoms reaching GOAL through zero-cost supporter edges ---
+    inZone.fill(0);
+    inZone[GOAL] = 1;
+    changed = true;
+    while (changed) {
+      changed = false;
+      for (let a = 0; a < nActions; a++) {
+        const sup = supporter[a];
+        if (sup < 0 || cost[a] !== 0 || inZone[sup]) continue;
+        const ad = addOf(a);
+        for (let i = 0; i < ad.length; i++) {
+          if (inZone[ad[i]]) { inZone[sup] = 1; changed = true; break; }
+        }
+      }
+    }
+
+    // --- cut: reachable actions whose supporter is outside the zone but that add
+    //     into it; charge the cheapest and subtract it from each (a landmark) ---
+    let m = Infinity;
+    const cut: number[] = [];
+    for (let a = 0; a < nActions; a++) {
+      const sup = supporter[a];
+      if (sup < 0 || inZone[sup]) continue;
+      const ad = addOf(a);
+      let crosses = false;
+      for (let i = 0; i < ad.length; i++) if (inZone[ad[i]]) { crosses = true; break; }
+      if (!crosses) continue;
+      cut.push(a);
+      if (cost[a] < m) m = cost[a];
+    }
+    if (cut.length === 0 || !(m > 0) || m === Infinity) break; // safety; shouldn't happen
+    h += m;
+    for (const a of cut) cost[a] -= m;
+  }
+  return h;
+}
+
+/**
+ * Public LM-cut heuristic (admissible; dominates {@link hAdd} in `max` mode).
+ * Allocates scratch per call; the Engine reuses a faster cached path.
+ */
+export function lmcut(model: Model, s: Snap, goalAtoms: Atom[]): number {
+  if (goalAtoms.length === 0) return 0;
+  return lmcutCore(model, snapToFlat(model, s), goalDescs(model, goalAtoms), lmcutStatic(model));
+}
+
 // ---------------------------------------------------------------- engine
 
 interface MtrCursor {
@@ -367,6 +530,8 @@ export class Engine {
   private costBuf: Float64Array | null = null;
   /** reusable flat state buffer for O(1) reads during heuristic evaluation */
   private flatBuf: Float64Array | null = null;
+  /** memoized LM-cut relaxation (built once per model) */
+  private lmStatic: LmcutStatic | null = null;
   /** reusable candidate-op scratch for the indexed successor generator */
   private readonly succScratch: GroundOp[] = [];
 
@@ -785,7 +950,10 @@ export class Engine {
       this.flatBuf = new Float64Array(this.model.slotCount);
     }
     state.materializeInto(this.flatBuf);
-    const h = relaxCore(this.model, this.flatBuf, this.costBuf, descs, this.req.heuristic !== "hmax");
+    const h =
+      this.req.heuristic === "lmcut"
+        ? lmcutCore(this.model, this.flatBuf, descs, (this.lmStatic ??= lmcutStatic(this.model)))
+        : relaxCore(this.model, this.flatBuf, this.costBuf, descs, this.req.heuristic !== "hmax");
     this.hCache.set(key, h);
     return h;
   }
