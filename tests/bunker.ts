@@ -1,7 +1,7 @@
 import { test } from "uvu";
 import * as assert from "uvu/assert";
-import { Planner, goal, planOnce, simulatePlan, type Model, type Plan, type Snap } from "../src/index";
-import { bunkerDomain, bunkerModel, starGoal, breachGoal, c4Goal, N_, BUNKER_NODES } from "../scenarios/bunker";
+import { F, Planner, goal, planOnce, simulatePlan, type Formula, type Model, type Plan, type Snap } from "../src/index";
+import { bunkerDomain, bunkerModel, starGoal, breachGoal, c4Goal, N_, BUNKER_NODES, type BunkerSetup } from "../scenarios/bunker";
 
 /**
  * Bunker Heist — the classic "Acquire key → C4 → Breach → Star" mission, but with
@@ -118,6 +118,179 @@ test("bunker: model exposes a consistent waypoint graph", () => {
   // adjacency is symmetric (undirected walk graph)
   const st = model.createExecState();
   assert.equal(model.read(st, "adj", N_.COURTYARD, N_.SAFE), model.read(st, "adj", N_.SAFE, N_.COURTYARD));
+});
+
+// ---------------------------------------------------------------------------
+// Ported from vibe-city's bunker tests (src/tests/bunker-domain.spec.ts and
+// bunker_planner.spec.ts). Those drove a hand-authored Fluid-HTN domain whose
+// nested sequences encoded the answer; the assertions, though, describe the
+// INTENDED behaviour of the mission, so they port cleanly onto honest goal
+// search. The semantic upgrades here:
+//   • goals are declarative formulas, not a `{ hasStar: true }` recipe object;
+//   • movement is edge-by-edge (so vibe-city's single "MOVE x" becomes a `goto`
+//     to x — we render the destination as `MOVE x` so the assertions read the
+//     same — and extra interior hops may appear, which subsequence checks allow);
+//   • the safe zone is `safe_spot` here (vibe-city called it `blast_safe_zone`).
+// ---------------------------------------------------------------------------
+
+/** Render a discovered plan as vibe-city-style tokens: `MOVE <dest>` / `PICKUP_KEY` / … */
+function planTokens(model: Model, plan: Plan): string[] {
+  const map: Record<string, string> = {
+    pickup_key: "PICKUP_KEY",
+    unlock_storage: "UNLOCK_STORAGE",
+    pickup_c4: "PICKUP_C4",
+    place_c4: "PLACE_C4",
+    detonate: "DETONATE",
+    pickup_star: "PICKUP_STAR",
+  };
+  const out: string[] = [];
+  for (const s of plan.steps) {
+    if (s.k !== "op") continue;
+    if (s.g.op.name === "goto") out.push(`MOVE ${model.entityName(s.g.b[s.g.b.length - 1])}`);
+    else out.push(map[s.g.op.name] ?? s.g.op.name);
+  }
+  return out;
+}
+
+/** Plan a declarative goal over a fresh model and return the token lines. */
+function planLines(g: Formula, setup: BunkerSetup = {}): string[] {
+  const model = bunkerModel(setup);
+  const res = planOnce(model, model.createExecState(), { goals: [goal(g)], weight: 2, heuristic: "hadd", maxNodes: 300_000 });
+  assert.equal(res.status, "success", "expected a plan to be found");
+  return planTokens(model, res.plan!);
+}
+
+/** Assert the given tokens appear as an ordered subsequence of `lines`. */
+function expectInOrder(lines: string[], tokens: string[]): void {
+  let prev = -1;
+  for (const t of tokens) {
+    const idx = lines.indexOf(t);
+    assert.ok(idx >= 0, `token "${t}" missing from plan: ${JSON.stringify(lines)}`);
+    assert.ok(idx > prev, `token "${t}" out of order in plan: ${JSON.stringify(lines)}`);
+    prev = idx;
+  }
+}
+
+const posGoal = (node: string): Formula => F.lit("agentAt", [], node);
+
+test("bunker(ported): adjacent move via positional goal (courtyard → bunker_door)", () => {
+  const lines = planLines(posGoal(N_.BUNKER_DOOR));
+  assert.ok(lines.length >= 1);
+  assert.equal(lines[0], "MOVE bunker_door");
+});
+
+test("bunker(ported): goal hasKey generates the move-to-table + pickup sequence", () => {
+  const lines = planLines(F.lit("hasKey"));
+  assert.equal(lines[0], "MOVE table_area");
+  assert.ok(lines.includes("PICKUP_KEY"));
+});
+
+test("bunker(ported): hasC4 unlocks storage and picks up C4 (key before unlock before C4)", () => {
+  const lines = planLines(c4Goal());
+  expectInOrder(lines, ["MOVE table_area", "PICKUP_KEY"]);
+  assert.ok(lines.includes("UNLOCK_STORAGE"));
+  assert.ok(lines.includes("PICKUP_C4"));
+  expectInOrder(lines, ["UNLOCK_STORAGE", "PICKUP_C4"]);
+});
+
+test("bunker(ported): bunkerBreached places C4 then detonates", () => {
+  const lines = planLines(breachGoal());
+  assert.ok(lines.includes("PLACE_C4"));
+  assert.ok(lines.includes("DETONATE"));
+  expectInOrder(lines, ["PLACE_C4", "DETONATE"]);
+});
+
+test("bunker(ported): hasStar completes the full mission in causal order", () => {
+  const lines = planLines(starGoal());
+  expectInOrder(lines, [
+    "MOVE table_area",
+    "PICKUP_KEY",
+    "UNLOCK_STORAGE",
+    "PICKUP_C4",
+    "PLACE_C4",
+    "DETONATE",
+    "MOVE bunker_interior",
+    "MOVE star_pos",
+    "PICKUP_STAR",
+  ]);
+  assert.equal(lines[lines.length - 1], "PICKUP_STAR");
+});
+
+test("bunker(ported): hasStar ∧ return-to-table — fetches the star, then walks home", () => {
+  // a CONJUNCTIVE declarative goal: hold the star AND end up at the table
+  const lines = planLines(F.and(starGoal(), posGoal(N_.TABLE)));
+  const starIdx = lines.indexOf("PICKUP_STAR");
+  const returnIdx = lines.lastIndexOf("MOVE table_area");
+  assert.ok(starIdx >= 0);
+  assert.ok(returnIdx > starIdx, "the return to the table must come after taking the star");
+  assert.equal(lines[lines.length - 1], "MOVE table_area");
+});
+
+test("bunker(ported): pre-breached bunker — skip the whole chain, just fetch the star", () => {
+  const lines = planLines(starGoal(), { bunkerBreached: true });
+  for (const skip of ["PLACE_C4", "DETONATE", "PICKUP_KEY", "UNLOCK_STORAGE", "PICKUP_C4"]) {
+    assert.not.ok(lines.includes(skip), `should not ${skip} when already breached`);
+  }
+  assert.ok(lines.includes("MOVE bunker_interior"));
+  assert.ok(lines.includes("MOVE star_pos"));
+  assert.equal(lines[lines.length - 1], "PICKUP_STAR");
+});
+
+test("bunker(ported): C4 already placed — skip key/storage, detonate from safe, then star", () => {
+  const lines = planLines(starGoal(), { c4Placed: true });
+  for (const skip of ["PICKUP_KEY", "UNLOCK_STORAGE", "PICKUP_C4", "PLACE_C4"]) {
+    assert.not.ok(lines.includes(skip), `should not ${skip} when C4 is already placed`);
+  }
+  assert.ok(lines.includes("DETONATE"));
+  // must retreat to a safe distance before detonating
+  expectInOrder(lines, ["MOVE safe_spot", "DETONATE"]);
+  assert.ok(lines.includes("MOVE bunker_interior"));
+  assert.ok(lines.includes("MOVE star_pos"));
+  assert.equal(lines[lines.length - 1], "PICKUP_STAR");
+});
+
+test("bunker(ported): storage already unlocked — skip key, straight to the C4", () => {
+  const lines = planLines(starGoal(), { storageUnlocked: true });
+  assert.not.ok(lines.includes("PICKUP_KEY"));
+  assert.not.ok(lines.includes("UNLOCK_STORAGE"));
+  for (const need of ["MOVE storage_door", "MOVE c4_table", "PICKUP_C4", "PLACE_C4", "MOVE safe_spot", "DETONATE", "MOVE bunker_interior", "MOVE star_pos", "PICKUP_STAR"]) {
+    assert.ok(lines.includes(need), `should still ${need}`);
+  }
+  assert.equal(lines[lines.length - 1], "PICKUP_STAR");
+});
+
+test("bunker(ported): positional goal storage_interior — key + unlock + enter, nothing more", () => {
+  const lines = planLines(posGoal(N_.STORAGE_INT));
+  assert.ok(lines.includes("PICKUP_KEY"));
+  assert.ok(lines.includes("UNLOCK_STORAGE"));
+  assert.ok(lines.includes("MOVE storage_interior"));
+  for (const skip of ["PICKUP_C4", "PLACE_C4", "DETONATE", "PICKUP_STAR", "MOVE star_pos", "MOVE bunker_interior"]) {
+    assert.not.ok(lines.includes(skip), `positional goal should not over-plan into ${skip}`);
+  }
+  assert.equal(lines[lines.length - 1], "MOVE storage_interior", "ends standing in the storage");
+});
+
+test("bunker(ported): hasKey ∧ hasC4 (no star) — collects both, stops at the C4", () => {
+  const lines = planLines(F.and(F.lit("hasKey"), F.lit("hasC4")));
+  expectInOrder(lines, ["MOVE table_area", "PICKUP_KEY", "MOVE storage_door", "UNLOCK_STORAGE", "MOVE c4_table", "PICKUP_C4"]);
+  for (const skip of ["PICKUP_STAR", "PLACE_C4", "DETONATE", "MOVE star_pos"]) {
+    assert.not.ok(lines.includes(skip), `should not ${skip} for a key+C4 goal`);
+  }
+  assert.equal(lines[lines.length - 1], "PICKUP_C4");
+});
+
+test("bunker(ported): performance baseline — hasStar plans fast enough for real-time", () => {
+  // vibe-city logged a throughput baseline; we keep a generous wall-clock bound so
+  // it documents speed without being flaky on slow/Windows CI. (Local: ~0.6ms.)
+  const iterations = 200;
+  const start = Date.now();
+  for (let i = 0; i < iterations; i++) {
+    const model = bunkerModel();
+    const res = planOnce(model, model.createExecState(), { goals: [goal(starGoal())], weight: 2, heuristic: "hadd" });
+    assert.equal(res.status, "success");
+  }
+  const avgMs = (Date.now() - start) / iterations;
+  assert.ok(avgMs < 25, `full-mission planning should stay well under 25ms/plan (was ${avgMs.toFixed(2)}ms)`);
 });
 
 test.run();

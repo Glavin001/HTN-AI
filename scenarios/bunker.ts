@@ -191,6 +191,7 @@ export interface BunkerSetup {
   start?: BunkerNode;
   hasKey?: boolean;
   hasC4?: boolean;
+  c4Placed?: boolean;
   storageUnlocked?: boolean;
   bunkerBreached?: boolean;
   /** set false to remove the key entirely — makes the storage (and the star) unreachable */
@@ -217,6 +218,7 @@ export function bunkerModel(setup: BunkerSetup = {}): Model {
       if (setup.keyOnTable === false) w.set("keyOnTable", [], false);
       if (setup.hasKey) w.set("hasKey", [], true);
       if (setup.hasC4) w.set("hasC4", [], true);
+      if (setup.c4Placed) w.set("c4Placed", [], true);
       if (setup.storageUnlocked) w.set("storageUnlocked", [], true);
       if (setup.bunkerBreached) w.set("bunkerBreached", [], true);
     },
