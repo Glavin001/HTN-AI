@@ -325,4 +325,33 @@ test("goalAgenda: protection is enabled by default whenever goalAgenda is set", 
   assert.ok(bothOn(model, planner));
 });
 
+// ---------------------------------------------------------------- landmark decomposition
+
+test("landmarks: a numeric build-up goal expands into level-ordered threshold landmarks", () => {
+  // two cells, each needing height ≥ 2. With landmarks, the goal h(a)≥2 ∧ h(b)≥2
+  // becomes the level-ordered agenda [a≥1, b≥1, a≥2, b≥2] — base course before top.
+  const doc: DomainDoc = {
+    name: "stack",
+    types: [{ name: "cell" }],
+    fluents: [{ name: "h", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 }],
+    operators: [{ name: "raise", params: [{ name: "c", type: "cell" }], eff: [E.inc("h", ["?c"], N.c(1))] }],
+  };
+  const model = createModel(doc, { entities: { a: "cell", b: "cell" } });
+  const buildUp = goal(F.and(F.gte(N.fl("h", "a"), N.c(2)), F.gte(N.fl("h", "b"), N.c(2))));
+
+  // without landmarks: 2 conjuncts (one per cell)
+  const plain = new Planner(model, { goals: [buildUp], goalAgenda: true, now: () => 0, seed: 1 });
+  assert.equal(plain.goalCount(), 2);
+
+  // with landmarks: 4 threshold landmarks, ordered by level
+  const lm = new Planner(model, { goals: [buildUp], goalAgenda: true, landmarks: true, now: () => 0, seed: 1 });
+  assert.equal(lm.goalCount(), 4, "h(a)≥2 ∧ h(b)≥2 → [a≥1, b≥1, a≥2, b≥2]");
+
+  // and it still solves (each raise op bumps height by one)
+  for (let i = 0; i < 200 && lm.getStatus() !== "succeeded" && lm.getStatus() !== "failed"; i++) lm.tick({ ms: 5 });
+  assert.equal(lm.getStatus(), "succeeded");
+  assert.equal(model.read(lm.state, "h", "a"), 2);
+  assert.equal(model.read(lm.state, "h", "b"), 2);
+});
+
 test.run();

@@ -44,9 +44,19 @@ import type { CellSpec } from "./staircase";
  * The generic construction domain: just the primitive spatial actions. Nothing
  * here mentions a wall, a ring, or how to build anything — the desired shape lives
  * entirely in the declarative goal and in each cell's static `wantHeight`.
+ *
+ * `reachUp` controls the only physics knob that matters for the demo:
+ *   • true  — the agent may place a block ONE level above where it stands. A wall
+ *             cell can then be built to full height from the ground, so the cells
+ *             are INDEPENDENT (the easy wall; plain goal-agenda suffices).
+ *   • false — realistic: the agent must stand at ≥ the target column's height to
+ *             place. Topping a cell needs an adjacent cell already built up, so the
+ *             cells INTERFERE (the hard wall; needs landmark layering — base course
+ *             before top course).
  */
-export const constructionDomain: DomainDoc = {
-  name: "construction-world",
+function makeConstructionDomain(reachUp: boolean): DomainDoc {
+  return {
+  name: reachUp ? "construction-world" : "construction-world-strict",
   types: [{ name: "cell" }],
   fluents: [
     { name: "height", params: [{ name: "c", type: "cell" }], kind: "int", initial: 0 },
@@ -90,20 +100,28 @@ export const constructionDomain: DomainDoc = {
       cost: 1,
     },
     {
-      // drop the carried block on an adjacent cell, reaching up at most one level
+      // drop the carried block on an adjacent cell. With reachUp you may build one
+      // level above where you stand; without it you must stand at ≥ the target's
+      // height (so a cell can only be topped from an already-raised neighbour).
       name: "place",
       params: [{ name: "stand", type: "cell" }, { name: "at", type: "cell" }],
       pre: F.and(
         F.lit("holding"),
         F.lit("agentAt", [], "?stand"),
         F.lit("adj", ["?stand", "?at"]),
-        F.gte(N.fl("height", "?stand"), N.sub(N.fl("height", "?at"), N.c(1))),
+        F.gte(N.fl("height", "?stand"), reachUp ? N.sub(N.fl("height", "?at"), N.c(1)) : N.fl("height", "?at")),
       ),
       eff: [E.set("holding", [], false), E.inc("height", ["?at"], N.c(1))],
       cost: 1,
     },
   ],
-};
+  };
+}
+
+/** Easy physics: place reaches one level up, so wall cells are independent. */
+export const constructionDomain: DomainDoc = makeConstructionDomain(true);
+/** Realistic physics: no reach-up, so wall cells interfere (base before top). */
+export const strictConstructionDomain: DomainDoc = makeConstructionDomain(false);
 
 export interface WallInstance {
   /** the grid (floor tiles); a starting block is encoded as a cell `height` */
@@ -118,15 +136,19 @@ export interface WallInstance {
   sources: string[];
   /** the cell at the heart of the ring (the protected courtyard) — visual only */
   core: string;
+  /** realistic physics: no reach-up, so cells interfere and landmark layering is
+   *  needed (default false = the easy, independent wall) */
+  strictReach?: boolean;
 }
 
 /** Build a model for a construction instance over the generic domain. */
 export function wallModel(inst: WallInstance): Model {
   const entities: Record<string, string> = {};
   for (const c of inst.cells) entities[c.name] = "cell";
+  const domain = inst.strictReach ? strictConstructionDomain : constructionDomain;
   const sourceSet = new Set(inst.sources);
   const targetSet = new Set(inst.targets);
-  return createModel(constructionDomain, {
+  return createModel(domain, {
     entities,
     init: (w) => {
       for (const c of inst.cells) {
@@ -224,4 +246,16 @@ export function wallInstance(): WallInstance {
     sources: scattered.map(([x, z]) => nm(x, z)),
     core: nm(cx, cz),
   };
+}
+
+/**
+ * The HARD wall: the exact same courtyard fort, but under realistic physics
+ * (`strictReach`) — the agent can't place a block above its own reach. Now a ring
+ * cell can only be topped from an adjacent cell that's already been raised, so the
+ * 24 sub-goals INTERFERE: a lone 2-tall pillar is unbuildable, and per-cell
+ * serialization strands cells it can't reach. Solving it needs the base course
+ * laid before any top course — i.e. threshold-landmark layering (`landmarks: true`).
+ */
+export function wallInstanceHard(): WallInstance {
+  return { ...wallInstance(), strictReach: true };
 }

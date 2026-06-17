@@ -26,7 +26,7 @@ const SquadScene = dynamic(() => import("../components/SquadScene"), { ssr: fals
 import SquadDirector from "../components/SquadDirector";
 
 type GridId = "staircase" | "ledge" | "quarry" | "scavenger" | "scavengerBig" | "scavengerHuge";
-type ScenarioId = GridId | "blocks" | "wall" | SquadScenarioId;
+type ScenarioId = GridId | "blocks" | "wall" | "wallHard" | SquadScenarioId;
 type Kind = "grid" | "blocks" | "wall" | "squad";
 
 type Run =
@@ -48,12 +48,13 @@ const SCENARIOS: Record<ScenarioId, { name: string; blurb: string; kind: Kind }>
   scavengerHuge: { name: "Scavenger HUGE (~9s)", kind: "grid", blurb: "A 6×4 grid (24 cells) — a deliberate stress test (~9s to plan). Search is hard-capped so it can't run away." },
   blocks: { name: "Blocks World (Sussman)", kind: "blocks", blurb: "The classic Sussman anomaly: goal A-on-B-on-C. The naive order deadlocks, so the planner interleaves subgoals." },
   wall: { name: "Build a wall (structure goal)", kind: "wall", blurb: "The goal isn't a position to stand at — and it isn't a recipe either. It's one DECLARATIVE end-state: 'every cell of this octagonal ring ends up two blocks tall.' The domain has only goto / grab / place; nothing tells the agent to pick up or place anything. The planner DISCOVERS pickup-and-place by search. A single search over all 12 cells blows up, so the planner runs in goal-agenda mode: it splits the conjunction into per-cell subgoals and commits to them one at a time. Blocks come only from the scattered pile, so a laid block is never cannibalised — which is what makes serialising sound." },
+  wallHard: { name: "Build a wall — realistic physics (needs landmarks)", kind: "wall", blurb: "The SAME wall, same declarative goal — but realistic physics: the agent can't place a block above its own reach. Now a cell can only be topped from a neighbour that's already raised, so the cells INTERFERE: a lone 2-tall pillar is unbuildable, and per-cell serialization strands cells it can't reach. The fix is landmark layering — the planner derives that every cell's height-2 goal passes through height-1 first (a sound threshold landmark) and lays the WHOLE base course before any top course, so every upper course has a neighbour to stand on. This is the Sussman-like 'subgoals interfere, order matters' case made tractable." },
 };
 
 function buildRun(id: ScenarioId): Run {
   const kind = SCENARIOS[id].kind;
   if (kind === "blocks") return { kind: "blocks", data: runBlocks() };
-  if (kind === "wall") return { kind: "wall", data: runWall() };
+  if (kind === "wall") return { kind: "wall", data: runWall(id === "wallHard") };
   if (kind === "squad") return { kind: "squad", data: runSquad(id as SquadScenarioId) };
   return { kind: "grid", data: runScenario(id as GridId) };
 }
@@ -286,6 +287,11 @@ export default function Page() {
                 <div className="mono" style={{ color: "var(--muted)", marginTop: 8, fontSize: 11 }}>
                   <b style={{ color: "var(--accent-2)" }}>goalAgenda</b>: splits the conjunction into {run.data.targets.length} per-cell subgoals and commits to them one at a time. A flat search over all of them blows up; this stays linear.
                 </div>
+                {run.data.hard && (
+                  <div className="mono" style={{ color: "#fbbf24", marginTop: 8, fontSize: 11 }}>
+                    <b>landmarks</b>: realistic physics makes the cells interfere — a cell can only be topped from a raised neighbour. The planner derives that <span style={{ color: "var(--accent-2)" }}>height ≥ 2</span> passes through <span style={{ color: "var(--accent-2)" }}>height ≥ 1</span> (a threshold landmark) and lays the whole <b>base course before any top course</b>. Without it, per-cell serialization strands cells.
+                  </div>
+                )}
                 <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 8, background: "rgba(56,189,248,0.08)", border: "1px solid rgba(56,189,248,0.18)" }}>
                   <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>now · subgoal {activeSlot}/{run.data.targets.length} (height(cell) ≥ {want})</div>
                   <div className="mono" style={{ marginTop: 2 }}><span style={{ color: phase.color }}>{phase.icon} {phase.text}</span></div>

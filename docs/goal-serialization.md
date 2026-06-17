@@ -57,6 +57,29 @@ interact.
 This is the soundness core of **agenda-driven / ordered-landmark planning**
 (cf. Koehler & Hoffmann, *On Reasonable and Forced Goal Orderings*, JAIR 2000).
 
+### `landmarks` — threshold landmarks for interfering build-up goals
+
+Protection keeps serialization *sound*, but per-cell serialization can still
+*fail* when the subgoals genuinely **interfere**. The worked example is the hard
+wall (`wallInstanceHard`): under realistic physics a ring cell can only be topped
+from a neighbour that's already been raised, so a lone 2-tall pillar is
+unbuildable and committing cell-by-cell strands cells the agent can't reach.
+
+The fix is **ordered landmarks**. A goal `f ≥ k` over a unit-step integer fluent
+(changed only by ±1) can only be reached by passing through `f ≥ 1, …, f ≥ k-1`
+— each lower threshold is a **landmark** (a fact every solution must establish
+first). With `landmarks: true` the agenda is expanded into these threshold
+landmarks and **ordered by level**: every cell's `≥ 1` before any cell's `≥ 2`.
+For the wall that means *the whole base course is laid before any top course*, so
+every upper course has a neighbour to stand on. The same hard instance that fails
+10/12 under plain serialization finishes 12/12 in tens of milliseconds.
+
+This is the agenda analogue of ordered landmarks in classical planning
+(Hoffmann/Porteous/Sebastia, *Ordered Landmarks in Planning*, JAIR 2004). The
+threshold landmarks (per fluent) are sound; the cross-variable *level* ordering is
+a "build the lower courses first" heuristic that matches the support structure of
+stacking domains.
+
 ## Soundness vs completeness — what we guarantee
 
 - **Sound:** with protection on (the default), the planner never reports success
@@ -65,16 +88,19 @@ This is the soundness core of **agenda-driven / ordered-landmark planning**
 - **Serializable-under-protection:** protected serialization solves any goal where
   some order lets each prefix be (re-)achieved while protecting the rest — which
   includes the classic non-serializable puzzles like Sussman.
+- **Interfering build-up goals:** `landmarks: true` decomposes numeric `f ≥ k`
+  goals into level-ordered threshold landmarks (base course before top course),
+  which solves the hard, interdependent wall that plain per-cell serialization
+  strands.
 - **Not a completeness guarantee in general.** In a *reactive* executor, commitment
   means *executed* actions, which can't be un-executed; a pathologically bad static
-  order could strand the planner (it then fails soundly). Two standard extensions
-  close the remaining gap and are good future work:
+  order could still strand the planner (it then fails soundly). Two further
+  extensions would close the remaining gap:
   - **Reasonable goal orderings** (Koehler-Hoffmann): derive an order so prefixes
-    stay achievable (for Sussman, order `on(b,c)` before `on(a,b)`), so even blind
-    serialization succeeds and protected serialization needs no re-work.
-  - **Landmark heuristics** (Hoffmann/Porteous/Sebastia 2004; LAMA): extract
-    intermediate landmarks and an LM-count/LM-cut heuristic to guide search and
-    derive orderings automatically.
+    stay achievable (for Sussman, order `on(b,c)` before `on(a,b)`) automatically,
+    rather than relying on the agenda's input order.
+  - **Landmark heuristics** (LAMA; LM-cut): use landmark counting/cost as a search
+    heuristic, and extract richer intermediate landmarks beyond numeric thresholds.
 
 ## When to reach for what
 
@@ -82,6 +108,7 @@ This is the soundness core of **agenda-driven / ordered-landmark planning**
 |---|---|
 | You can encode independence into the domain | Model it away first (e.g. the wall's source-gated `grab` + reach-one-up `place`) |
 | Subgoals serializable; speed > optimality | `goalAgenda` serialization (protection on) |
+| Build-up subgoals INTERFERE (top needs base) | `goalAgenda` + `landmarks` (threshold landmarks, base course first) |
 | Lots of interchangeable objects; need completeness/optimality | Symmetry breaking (orbit pruning) |
 | General goals; want a principled heuristic + ordering | Landmarks / factored planning |
 | You have reliable expert know-how on *how* | HTN control knowledge |

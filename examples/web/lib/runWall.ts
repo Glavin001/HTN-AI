@@ -12,7 +12,7 @@
  * conjunction of independent sub-goals that would otherwise blow up one-shot.
  */
 import { Planner, goal, type TraceEvent } from "htn-ai";
-import { wallGoal, wallInstance, wallModel, type WallInstance } from "@scenarios/wall";
+import { wallGoal, wallInstance, wallInstanceHard, wallModel, type WallInstance } from "@scenarios/wall";
 
 export interface WallCell {
   name: string;
@@ -46,10 +46,17 @@ export interface WallRun {
   status: string;
   trace: TraceEvent[];
   goalText: string;
+  /** realistic-physics mode: cells interfere, solved by landmark layering */
+  hard: boolean;
 }
 
-export function runWall(): WallRun {
-  const inst: WallInstance = wallInstance();
+/**
+ * @param hard when true, use realistic physics (no reach-up) so the wall cells
+ *   interfere — and switch the planner to `landmarks: true` so it lays the whole
+ *   base course before any top course (per-cell serialization alone can't finish).
+ */
+export function runWall(hard = false): WallRun {
+  const inst: WallInstance = hard ? wallInstanceHard() : wallInstance();
   const model = wallModel(inst);
   const cellNames = inst.cells.map((c) => c.name);
   const want = inst.wantHeight;
@@ -59,9 +66,12 @@ export function runWall(): WallRun {
   const planner = new Planner(model, {
     // ONE declarative goal: "every wall cell ends up wantHeight tall". goalAgenda
     // splits that conjunction into per-cell subgoals and serialises them; the
-    // planner discovers the goto/grab/place actions for each by search.
+    // planner discovers the goto/grab/place actions for each by search. In hard
+    // mode the cells interfere, so `landmarks` decomposes each cell's height goal
+    // into ordered threshold landmarks (base course before top course).
     goals: [goal(wallGoal(inst))],
     goalAgenda: true,
+    landmarks: hard,
     weight: 3,
     maxNodes: 200_000,
     now: () => t,
@@ -103,5 +113,6 @@ export function runWall(): WallRun {
     status: planner.getStatus(),
     trace,
     goalText: `enclose the courtyard — a ${inst.targets.length}-slot wall, ${want} blocks tall`,
+    hard,
   };
 }
