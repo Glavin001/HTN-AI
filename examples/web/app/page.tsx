@@ -1,5 +1,6 @@
 "use client";
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { runScenario, scenarioHeavyMs, traceSummary, type RunResult } from "../lib/run";
 import { runBlocks, type BlocksRun } from "../lib/runBlocks";
@@ -132,6 +133,10 @@ export default function Page() {
         <div className="title">
           <h1>htn-ai · {SCENARIOS[scenario].name}</h1>
           <p>{SCENARIOS[scenario].blurb}</p>
+          <p style={{ marginTop: 6 }}>
+            <Link href="/bunker" className="mono" style={{ color: "var(--accent-2)" }}>★ Bunker Heist →</Link>
+            <span className="mono" style={{ color: "var(--muted)" }}> a key→C4→breach→star mission solved from a single declarative goal</span>
+          </p>
         </div>
 
         {run?.kind === "grid" && <StaircaseScene key="grid" frame={run.data.frames[step]} instance={run.data.instance} target={run.data.target} reached={step === lastStep && status === "succeeded"} />}
