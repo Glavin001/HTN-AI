@@ -127,6 +127,20 @@ export interface PlanRequest {
    *  optimal/weight-1 search), or none (Dijkstra). Pair an admissible heuristic
    *  with weight 1 for guaranteed-optimal plans. */
   heuristic?: "hadd" | "hmax" | "lmcut" | "none";
+  /**
+   * Goal-search strategy. `"wastar"` (default) is weighted-A\* — cost-bounded,
+   * optimal at weight 1. `"bfws"` is **Best-First Width Search** (Lipovetzky &
+   * Geffner 2017): a satisficing/agile search that orders the frontier by
+   * **novelty width** first (explore the structurally new), then unmet-goal count,
+   * then a deferred relaxed-plan estimate. It pairs **preferred operators** (FF
+   * helpful actions, via a second open list) with **deferred heuristic evaluation**
+   * (the relaxed plan is computed once per *expanded* node, not per generated one).
+   * BFWS is not cost-optimal but scales to large, low-width problems that defeat
+   * pure heuristic search, while staying cheap per node — the right tool for
+   * real-time/agent planning. */
+  search?: "wastar" | "bfws";
+  /** BFWS novelty width cap (1 = atoms only, cheapest; 2 = atom pairs, default). */
+  noveltyWidth?: number;
   /** internal: plan a pre-built agenda instead of `goals` (used by plan repair) */
   agendaOverride?: Agenda;
 }
@@ -149,10 +163,16 @@ interface HeapNode {
   ops: GroundOp[] | null; // path as parent-pointer alternative kept simple: full path arrays are fine at v0 scale
   parent: HeapNode | null;
   via: GroundOp | null;
+  // BFWS evaluation keys (best-first width search); unused by weighted-A*
+  w: number; // novelty width (1 best)
+  hg: number; // number of unmet goals (#g)
+  h: number; // deferred heuristic estimate (relaxed-plan length, parent's)
 }
 
 class Heap {
   private items: HeapNode[] = [];
+
+  constructor(private readonly less: (a: HeapNode, b: HeapNode) => boolean = Heap.astarLess) {}
 
   get size(): number {
     return this.items.length;
@@ -164,7 +184,7 @@ class Heap {
     let i = a.length - 1;
     while (i > 0) {
       const p = (i - 1) >> 1;
-      if (Heap.less(a[i], a[p])) {
+      if (this.less(a[i], a[p])) {
         const t = a[i];
         a[i] = a[p];
         a[p] = t;
@@ -185,8 +205,8 @@ class Heap {
         const l = 2 * i + 1;
         const r = l + 1;
         let m = i;
-        if (l < a.length && Heap.less(a[l], a[m])) m = l;
-        if (r < a.length && Heap.less(a[r], a[m])) m = r;
+        if (l < a.length && this.less(a[l], a[m])) m = l;
+        if (r < a.length && this.less(a[r], a[m])) m = r;
         if (m === i) break;
         const t = a[i];
         a[i] = a[m];
@@ -197,12 +217,21 @@ class Heap {
     return top;
   }
 
-  private static less(a: HeapNode, b: HeapNode): boolean {
+  private static astarLess(a: HeapNode, b: HeapNode): boolean {
     if (a.f !== b.f) return a.f < b.f;
     if (a.novelty !== b.novelty) return a.novelty < b.novelty;
     if (a.g !== b.g) return a.g > b.g; // prefer more progress
     return a.seq < b.seq;
   }
+}
+
+/** BFWS ordering: novelty width first (explore the structurally new), then goal
+ *  count (#g — exploit progress), then the deferred relaxed-plan estimate. */
+function bfwsLess(a: HeapNode, b: HeapNode): boolean {
+  if (a.w !== b.w) return a.w < b.w;
+  if (a.hg !== b.hg) return a.hg < b.hg;
+  if (a.h !== b.h) return a.h < b.h;
+  return a.seq < b.seq;
 }
 
 // ---------------------------------------------------------------- h_add / h_max relaxation heuristic
@@ -500,6 +529,138 @@ export function lmcut(model: Model, s: Snap, goalAtoms: Atom[]): number {
   return lmcutCore(model, snapToFlat(model, s), goalDescs(model, goalAtoms), lmcutStatic(model));
 }
 
+// ----------------------------------------------- relaxed plan / preferred operators
+
+/**
+ * h_add over the delete relaxation, plus the **relaxed plan** extracted by
+ * back-chaining cheapest achievers from the goals. The ground-op ids it returns
+ * are the source of **preferred operators** (FF "helpful actions", Hoffmann &
+ * Nebel 2001): an applicable operator lying in the relaxed plan is far likelier to
+ * be useful, and biasing search toward them — via a second open list — is one of
+ * the largest practical speedups in satisficing planning (Richter & Helmert,
+ * *Preferred Operators and Deferred Evaluation*, ICAPS 2009). `h` is the relaxed
+ * plan's length (h_FF), a cheap, informative estimate.
+ */
+function relaxedPlan(model: Model, flat: Float64Array, goals: GoalAtomDesc[]): { h: number; pref: Set<number> } {
+  const n = model.relaxAtomCount;
+  const slot = model.relaxAtomSlot;
+  const val = model.relaxAtomValue;
+  const fuzzy = model.relaxAtomFuzzy;
+  const cost = new Float64Array(n);
+  const achiever = new Int32Array(n).fill(-1);
+  for (let id = 0; id < n; id++) cost[id] = flat[slot[id]] === val[id] ? 0 : Infinity;
+
+  const ops = model.groundOps;
+  let changed = true;
+  let rounds = 0;
+  while (changed && rounds < 64) {
+    changed = false;
+    rounds++;
+    for (let oi = 0; oi < ops.length; oi++) {
+      const addIds = ops[oi].addIds as Int32Array;
+      if (addIds.length === 0) continue;
+      const preIds = ops[oi].preIds as Int32Array;
+      let pc = 0;
+      let inf = false;
+      for (let i = 0; i < preIds.length; i++) {
+        const pid = preIds[i];
+        let c = cost[pid];
+        if (c === Infinity) c = fuzzy[pid] ? 1 : Infinity;
+        if (c === Infinity) { inf = true; break; }
+        pc += c; // h_add combination
+      }
+      if (inf) continue;
+      const through = pc + 1;
+      for (let i = 0; i < addIds.length; i++) {
+        const aid = addIds[i];
+        if (through < cost[aid]) { cost[aid] = through; achiever[aid] = oi; changed = true; }
+      }
+    }
+  }
+
+  const pref = new Set<number>();
+  const visited = new Uint8Array(n);
+  const stack: number[] = [];
+  for (const gd of goals) {
+    if (gd.id >= 0) {
+      if (cost[gd.id] === Infinity) return { h: Infinity, pref };
+      stack.push(gd.id);
+    } else if (flat[gd.slot] !== gd.value && !gd.fuzzy) {
+      return { h: Infinity, pref };
+    }
+  }
+  let h = 0;
+  while (stack.length > 0) {
+    const aid = stack.pop() as number;
+    if (visited[aid]) continue;
+    visited[aid] = 1;
+    if (cost[aid] === 0) continue; // already true: no achiever needed
+    const oi = achiever[aid];
+    if (oi < 0) continue;
+    if (!pref.has(oi)) {
+      pref.add(oi);
+      h += 1;
+      const preIds = ops[oi].preIds as Int32Array;
+      for (let i = 0; i < preIds.length; i++) {
+        const pid = preIds[i];
+        if (!fuzzy[pid] && !visited[pid]) stack.push(pid);
+      }
+    }
+  }
+  return { h, pref };
+}
+
+// ----------------------------------------------------------- novelty (width-based)
+
+/** Per-model, per-slot `value → relaxation-atom id` lookup so a state's true
+ *  relaxation atoms can be enumerated without string-keyed probes. */
+const slotValueAtomsCache = new WeakMap<Model, Map<number, number>[]>();
+function slotValueAtoms(model: Model): Map<number, number>[] {
+  const cached = slotValueAtomsCache.get(model);
+  if (cached) return cached;
+  const bySlot: Map<number, number>[] = Array.from({ length: model.slotCount }, () => new Map<number, number>());
+  for (let id = 0; id < model.relaxAtomCount; id++) bySlot[model.relaxAtomSlot[id]].set(model.relaxAtomValue[id], id);
+  slotValueAtomsCache.set(model, bySlot);
+  return bySlot;
+}
+
+/**
+ * Novelty bookkeeping for Best-First Width Search (Lipovetzky & Geffner, *Best-
+ * First Width Search*, AAAI 2017). A state's **width** is the size of the smallest
+ * atom tuple it makes new *within its partition* — here partitioned by the number
+ * of unmet goals (#g). Width 1 = it carries an atom never seen at this #g; width 2
+ * = a never-seen atom *pair*; capped beyond. Low width ⇒ structurally novel ⇒
+ * explored first. This is what lets BFWS cover huge, low-width problems that defeat
+ * pure heuristic search, while staying cheap per node.
+ */
+class NoveltyTable {
+  private readonly seen1: Set<number>[] = [];
+  private readonly seen2: (Set<number> | undefined)[] = [];
+  constructor(private readonly nAtoms: number, private readonly cap: number) {}
+
+  /** width of `atoms` (ascending true-atom ids) in partition `p`, recording them */
+  evaluate(p: number, atoms: number[]): number {
+    let s1 = this.seen1[p];
+    if (!s1) s1 = this.seen1[p] = new Set<number>();
+    let w = this.cap + 1;
+    for (let i = 0; i < atoms.length; i++) if (!s1.has(atoms[i])) { w = 1; break; }
+    if (this.cap >= 2) {
+      let s2 = this.seen2[p];
+      if (!s2) s2 = this.seen2[p] = new Set<number>();
+      let newPair = false;
+      for (let i = 0; i < atoms.length; i++) {
+        for (let j = i + 1; j < atoms.length; j++) {
+          const key = atoms[i] * this.nAtoms + atoms[j];
+          if (!s2.has(key)) { s2.add(key); newPair = true; }
+        }
+      }
+      if (w > 2 && newPair) w = 2;
+    }
+    for (let i = 0; i < atoms.length; i++) s1.add(atoms[i]);
+    return w;
+  }
+}
+
 // ---------------------------------------------------------------- engine
 
 interface MtrCursor {
@@ -516,7 +677,7 @@ interface SeekOutcome {
 
 export class Engine {
   private readonly model: Model;
-  private readonly req: Required<Pick<PlanRequest, "weight" | "maxNodes" | "maxDepth" | "novelty" | "heuristic">> & PlanRequest;
+  private readonly req: Required<Pick<PlanRequest, "weight" | "maxNodes" | "maxDepth" | "novelty" | "heuristic" | "search" | "noveltyWidth">> & PlanRequest;
   public decompositions = 0;
   public expansions = 0;
   public heuristicEvals = 0;
@@ -544,6 +705,8 @@ export class Engine {
       maxDepth: req.maxDepth ?? 400,
       novelty: req.novelty ?? true,
       heuristic: req.heuristic ?? "hadd",
+      search: req.search ?? "wastar",
+      noveltyWidth: req.noveltyWidth ?? 2,
     };
     this.mtrCursor = { last: req.lastMTR && req.lastMTR.length > 0 ? req.lastMTR : null, pos: 0, stillEqual: req.lastMTR !== undefined && (req.lastMTR?.length ?? 0) > 0 };
   }
@@ -830,6 +993,7 @@ export class Engine {
     item: { fn: (s: Snap) => boolean; atoms: Atom[]; label: string },
     scopes: ScopeInstance[],
   ): Generator<void, SeekOutcome | null, void> {
+    if (this.req.search === "bfws") return yield* this.goalSearchBFWS(start, item, scopes);
     const model = this.model;
     const weight = this.req.weight;
     const open = new Heap();
@@ -843,7 +1007,7 @@ export class Engine {
       this.reject(item.label, "goal unreachable under relaxation");
       return null;
     }
-    open.push({ f: weight * h0, novelty: 0, g: 0, seq: seq++, state: start, ops: null, parent: null, via: null });
+    open.push({ f: weight * h0, novelty: 0, g: 0, seq: seq++, state: start, ops: null, parent: null, via: null, w: 0, hg: 0, h: 0 });
     closed.set(start.key(), 0);
 
     while (open.size > 0) {
@@ -922,10 +1086,125 @@ export class Engine {
             }
           }
         }
-        open.push({ f: g2 + weight * h, novelty, g: g2, seq: seq++, state: child, ops: null, parent: node, via: g });
+        open.push({ f: g2 + weight * h, novelty, g: g2, seq: seq++, state: child, ops: null, parent: node, via: g, w: 0, hg: 0, h: 0 });
       }
     }
     this.reject(item.label, "goal search exhausted open list");
+    return null;
+  }
+
+  // ---------------- best-first width search (novelty + preferred ops + deferred eval)
+
+  private *goalSearchBFWS(
+    start: StateView,
+    item: { fn: (s: Snap) => boolean; atoms: Atom[]; label: string },
+    scopes: ScopeInstance[],
+  ): Generator<void, SeekOutcome | null, void> {
+    const model = this.model;
+    const descs = goalDescs(model, item.atoms);
+    const slotAtoms = slotValueAtoms(model);
+    const novelty = new NoveltyTable(model.relaxAtomCount, Math.max(1, this.req.noveltyWidth));
+    const open = new Heap(bfwsLess);
+    const openPref = new Heap(bfwsLess); // preferred-operator successors (FF helpful actions)
+    const closed = new Set<number>(); // generated-state dedupe
+    const expanded = new Set<number>(); // popped-state dedupe (a node can sit in both queues)
+    const flatScratch = new Float64Array(model.slotCount);
+    let seq = 0;
+
+    const unmetGoals = (st: StateView): number => {
+      let c = 0;
+      for (let i = 0; i < descs.length; i++) if (st.get(descs[i].slot) !== descs[i].value) c++;
+      return c;
+    };
+    const trueAtoms = (st: StateView): number[] => {
+      st.materializeInto(flatScratch);
+      const out: number[] = [];
+      for (let s = 0; s < flatScratch.length; s++) {
+        const id = slotAtoms[s].get(flatScratch[s]);
+        if (id !== undefined) out.push(id);
+      }
+      out.sort((a, b) => a - b);
+      return out;
+    };
+
+    const startHg = unmetGoals(start);
+    open.push({ f: 0, novelty: 0, g: 0, seq: seq++, state: start, ops: null, parent: null, via: null, w: novelty.evaluate(startHg, trueAtoms(start)), hg: startHg, h: 0 });
+    closed.add(start.key());
+
+    let turn = 0;
+    while (open.size > 0 || openPref.size > 0) {
+      // boosted dual-queue: favour preferred-operator nodes, but keep the regular
+      // queue in rotation so width-based exploration never starves.
+      const usePref = openPref.size > 0 && (open.size === 0 || (turn++ & 1) === 0);
+      const node = (usePref ? openPref.pop() : open.pop()) as HeapNode;
+      const nkey = node.state.key();
+      if (expanded.has(nkey)) continue;
+      expanded.add(nkey);
+
+      this.expansions++;
+      if (this.expansions % 16 === 0) yield;
+      if (this.expansions > this.req.maxNodes) {
+        this.reject(item.label, `BFWS node budget (${this.req.maxNodes}) exhausted`);
+        return null;
+      }
+
+      if (item.fn(node.state)) {
+        const ops: { g: GroundOp; start: number; end: number }[] = [];
+        let cur: HeapNode | null = node;
+        while (cur && cur.via) {
+          const prevClock = cur.parent ? cur.parent.state.get(CLOCK_SLOT) : 0;
+          ops.unshift({ g: cur.via, start: prevClock, end: cur.state.get(CLOCK_SLOT) });
+          cur = cur.parent;
+        }
+        const steps: PlanStep[] = ops.map((o) => ({ k: "op", g: o.g, projStart: o.start, projEnd: o.end, agendaBefore: null }));
+        return { state: node.state, steps, cost: node.g };
+      }
+
+      // deferred evaluation: the relaxed plan (h_FF + preferred ops) is computed
+      // once per EXPANDED node, not for every generated child.
+      node.state.materializeInto(flatScratch);
+      this.heuristicEvals++;
+      const { h: hSelf, pref } = relaxedPlan(model, flatScratch, descs);
+      if (hSelf === Infinity) continue; // dead end under the relaxation
+
+      const cand = this.succScratch;
+      cand.length = 0;
+      const always = model.succAlwaysOps;
+      for (let i = 0; i < always.length; i++) cand.push(always[i]);
+      const selSlots = model.succSelSlots;
+      const selTables = model.succSelTables;
+      for (let k = 0; k < selSlots.length; k++) {
+        const list = selTables[k].get(node.state.get(selSlots[k]));
+        if (list !== undefined) for (let i = 0; i < list.length; i++) cand.push(list[i]);
+      }
+      if (model.succNeedsSort && cand.length > 1) cand.sort(byGid);
+
+      for (let ci = 0; ci < cand.length; ci++) {
+        const g = cand[ci];
+        const pre = g.preAtoms;
+        let preOk = true;
+        for (let i = 0; i < pre.length; i++) {
+          if (node.state.get(pre[i].slot) !== pre[i].value) { preOk = false; break; }
+        }
+        if (!preOk) continue;
+        if (g.op.pre && !g.op.pre.atomsComplete && !g.op.pre.fn(node.state, g.b)) continue;
+        const child = node.state.child();
+        g.op.effects.apply(child, g.b, TIMINGS_PLANNING);
+        const dur = g.op.duration.fn(node.state, g.b);
+        if (dur !== 0) child.set(CLOCK_SLOT, node.state.get(CLOCK_SLOT) + dur);
+        if (!this.scopesOkQuiet(child, scopes)) continue;
+        const key = child.key();
+        if (closed.has(key)) continue;
+        closed.add(key);
+        const cost = g.op.cost.fn(node.state, g.b);
+        const g2 = node.g + (cost > 0 ? cost : 1e-6);
+        const hg = unmetGoals(child);
+        const cnode: HeapNode = { f: 0, novelty: 0, g: g2, seq: seq++, state: child, ops: null, parent: node, via: g, w: novelty.evaluate(hg, trueAtoms(child)), hg, h: hSelf };
+        open.push(cnode);
+        if (pref.has(g.gid)) openPref.push(cnode); // preferred operator ⇒ boosted queue
+      }
+    }
+    this.reject(item.label, "BFWS exhausted open list");
     return null;
   }
 

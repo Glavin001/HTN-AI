@@ -109,6 +109,18 @@ export interface PlannerOptions {
    * ordered landmarks in classical planning (Hoffmann/Porteous/Sebastia 2004).
    */
   landmarks?: boolean;
+  /**
+   * Goal-search strategy for each subgoal's planning episode. `"wastar"` (default)
+   * is weighted-A\* — cost-bounded, optimal at weight 1. `"bfws"` is **Best-First
+   * Width Search** (Lipovetzky & Geffner 2017): a satisficing/agile search ordered
+   * by novelty width, with preferred operators (FF helpful actions) and deferred
+   * heuristic evaluation. It is not cost-optimal but scales to large, low-width
+   * problems that defeat pure heuristic search while staying cheap per node — the
+   * right default for real-time/agent planning under a tick budget.
+   */
+  search?: "wastar" | "bfws";
+  /** BFWS novelty width cap (1 = atoms only, cheapest; 2 = atom pairs, default). */
+  noveltyWidth?: number;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -377,6 +389,8 @@ export class Planner {
     maxNodes?: number;
     maxDepth?: number;
     collectRejections?: boolean;
+    search?: "wastar" | "bfws";
+    noveltyWidth?: number;
   } {
     return {
       goals: this.goals,
@@ -384,6 +398,8 @@ export class Planner {
       maxNodes: this.opts.maxNodes,
       maxDepth: this.opts.maxDepth,
       collectRejections: this.opts.collectRejections,
+      search: this.opts.search,
+      noveltyWidth: this.opts.noveltyWidth,
       ...extra,
     };
   }
