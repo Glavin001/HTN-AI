@@ -171,7 +171,7 @@ Headless assertions:
 ## 5. Acceptance checklist (maps 1:1 to "done when")
 
 - [x] 6-operator demo domain plans correct sequences in headless tests
-      (`tests/director.ts` + `tests/director-fixture.ts`)
+      (`tests/director.ts`; domain in `scenarios/director.ts`)
 - [x] Replans correctly on live-query / oracle / world changes (all three paths:
       improve-on-belief-change, repair-on-silent-nav-break, improve-on-oracle-re-weight)
 - [x] `plan.created` / `step.started` / `plan.failed` / `plan.invalidated`
@@ -188,8 +188,12 @@ Headless assertions:
 
 - No merging of scenario PRs (#21–#27) or search features (#26, #28) as part of
   this task; no BFWS, no goal-agenda work.
-- No demo-domain scenario file under `scenarios/` — the fixture lives in tests;
-  the real domain ships in the flagship repo.
-- No devtools UI; events are data, the director renders them.
+- ~~No demo-domain scenario file under `scenarios/` — the fixture lives in tests~~
+  *(amended by request after the library work landed: the domain moved to
+  `scenarios/director.ts` so a runnable example (`examples/director-feed.ts`)
+  and the web preview's `/director` page can share it; `src/` stayed frozen)*
+- ~~No devtools UI; events are data, the director renders them~~ *(same
+  amendment: the `/director` page is a demo consumer of the data, not a
+  library feature)*
 
 Estimated size: ~450–550 LOC total including tests and bench.

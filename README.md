@@ -79,7 +79,7 @@ for (const e of stream.drain()) director.observe(e); // typed PlanEvent union
 //        reason: { kind: "step-failed", step: "GoTo(room)", cause: "precondition", … } }
 ```
 
-[`tests/director.ts`](./tests/director.ts) pins the full contract on a ~6-operator tactical demo domain (GoTo / Breach / TakeCover / Suppress / Regroup / Idle) whose preconditions are live external queries and whose movement costs come from a traversal oracle — including a `<10ms` replan gate (measured ~0.2–1ms).
+See it working: the web preview's **[`/director` page](./examples/web)** runs the ~6-operator demo domain ([`scenarios/director.ts`](./scenarios/director.ts): GoTo / Breach / TakeCover / Suppress / Regroup / Idle — live-query external preconditions, traversal-oracle costs) in the browser with sabotage buttons, and **`npm run demo:director`** ([`examples/director-feed.ts`](./examples/director-feed.ts)) prints a narrated feed of the same mission headlessly. [`tests/director.ts`](./tests/director.ts) pins the full contract — including a `<10ms` replan gate (measured ~0.2–1ms).
 
 ## Game AI: squad combat (F.E.A.R.-style)
 

@@ -23,7 +23,7 @@ import {
   planOnce,
   task,
 } from "../src/index";
-import { directorModel, directorWorld, edgeKey } from "./director-fixture";
+import { directorModel, directorWorld, edgeKey } from "../scenarios/director";
 
 // ---------------------------------------------------------------- helpers
 

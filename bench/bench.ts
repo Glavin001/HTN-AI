@@ -32,7 +32,7 @@ import {
   staircaseGoal,
 } from "../scenarios/staircase";
 import { F } from "../src/index";
-import { directorModel, directorWorld } from "../tests/director-fixture";
+import { directorModel, directorWorld } from "../scenarios/director";
 
 const quarry: Run = (() => {
   const model = staircaseModel(quarryInstance());
@@ -46,7 +46,7 @@ const staircase: Run = (() => {
   const model = staircaseModel(staircaseInstance());
   return () => planOnce(model, model.createExecState(), { goals: [goal(staircaseGoal())], weight: 1, heuristic: "hmax" });
 })();
-// the "discrete executive" demo mission (tests/director-fixture.ts): a full
+// the "discrete executive" demo mission (scenarios/director.ts): a full
 // 6-step tactical replan through external-predicate preconditions and an
 // external cost oracle — the spec's <10ms replan budget, measured
 const director: Run = (() => {

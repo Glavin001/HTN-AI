@@ -1,7 +1,7 @@
 /**
- * The "discrete executive" acceptance fixture: a ~6-operator tactical demo
- * domain — GoTo / Breach / TakeCover / Suppress / Regroup / Idle — wired the
- * way a flagship game layer would wire it:
+ * The "discrete executive" demo domain: ~6 tactical operators — GoTo / Breach /
+ * TakeCover / Suppress / Regroup / Idle — wired the way a flagship game layer
+ * would wire it:
  *
  *  - preconditions are FUNCTION-BASED live queries (`F.ext`) against mutable
  *    host objects (a nav-mesh stub and a cover-system stub), not baked fluents;
@@ -9,8 +9,12 @@
  *  - subsystems announce changes by bumping a version fluent declared in the
  *    externals' reads, which is what makes reactive replanning fluent-precise.
  *
- * This file is a test fixture (shared by tests/director.ts and bench/) — the
- * real demo domain ships in the flagship repo, per the integration spec.
+ * Shared by the acceptance suite (tests/director.ts), the benchmark
+ * (bench/bench.ts), the runnable integration example
+ * (examples/director-feed.ts) and the interactive web demo
+ * (examples/web/app/director). The production demo domain ships in the
+ * flagship repo, per the integration spec — this scenario exists so the
+ * plan-event stream has a first-class, self-contained showcase.
  *
  * Map (undirected edges; the doorstep–room edge is the breachable door):
  *
