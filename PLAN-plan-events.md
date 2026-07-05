@@ -170,12 +170,18 @@ Headless assertions:
 
 ## 5. Acceptance checklist (maps 1:1 to "done when")
 
-- [ ] 6-operator demo domain plans correct sequences in headless tests
-- [ ] Replans correctly on live-query / oracle / world changes (all three paths)
-- [ ] `plan.created` / `step.started` / `plan.failed` / `plan.invalidated`
+- [x] 6-operator demo domain plans correct sequences in headless tests
+      (`tests/director.ts` + `tests/director-fixture.ts`)
+- [x] Replans correctly on live-query / oracle / world changes (all three paths:
+      improve-on-belief-change, repair-on-silent-nav-break, improve-on-oracle-re-weight)
+- [x] `plan.created` / `step.started` / `plan.failed` / `plan.invalidated`
       arrive as structured, JSON-serializable events with machine-readable reasons
-- [ ] Median replan latency for 3–5 step plans asserted < 10ms in CI
-- [ ] Diff audit: no changes to `search.ts`, `compile.ts`, `state.ts`, `ir.ts`,
+      (final reason union: `world-changed` subsumes the sketched `replaced-by-better` —
+      the improve path's root cause is the announced change; the new plan's
+      `via: "improve"` carries the "better" half)
+- [x] Median replan latency for 3–5 step plans asserted < 10ms in CI
+      (measured ~0.2–1ms; bench row `director replan (w=1)`)
+- [x] Diff audit: no changes to `search.ts`, `compile.ts`, `state.ts`, `ir.ts`,
       `rng.ts`; `exec.ts` changes additive-only; all existing tests pass unmodified
 
 ## 6. Non-goals (feature freeze)

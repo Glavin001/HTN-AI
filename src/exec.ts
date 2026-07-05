@@ -14,24 +14,48 @@ import { Rng, createRng } from "./rng";
 
 // ---------------------------------------------------------------- trace events
 
+/** Why an executing step failed (machine-readable companion to the reason string). */
+export type StepFailCause = "precondition" | "verify" | "executor" | "scope" | "drift";
+
+/** JSON-serializable snapshot of a plan, carried on plan-lifecycle trace events. */
+export interface TracePlanInfo {
+  cost: number;
+  makespan: number;
+  steps: { label: string; kind: PlanStep["k"]; start: number | null; end: number | null }[];
+}
+
 export type TraceEvent =
-  | { t: "plan.new"; cost: number; steps: number; makespan: number }
-  | { t: "plan.replaced"; reason: "better" | "repair" }
+  | { t: "plan.new"; cost: number; steps: number; makespan: number; plan: TracePlanInfo }
+  | { t: "plan.replaced"; reason: "better" | "repair"; plan: TracePlanInfo }
   | { t: "plan.failed"; rejections?: Rejection[] }
   | { t: "plan.completed" }
   | { t: "replan.dirty"; fluents: string[] }
   | { t: "step.start"; label: string; index: number }
   | { t: "step.done"; label: string; index: number }
-  | { t: "step.fail"; label: string; index: number; reason: string }
+  | { t: "step.fail"; label: string; index: number; reason: string; cause: StepFailCause }
   | { t: "scope.enter"; label: string }
   | { t: "scope.exit"; label: string }
   | { t: "scope.violated"; label: string; reason: "deadline" | "maintain" }
   | { t: "drift"; label: string; behindSeconds: number }
   | { t: "repair.attempt"; from: number }
-  | { t: "repair.success"; from: number }
+  | { t: "repair.success"; from: number; plan: TracePlanInfo }
   | { t: "repair.fallback" };
 
 export type TraceFn = (e: TraceEvent) => void;
+
+/** Render a plan as the serializable summary used by plan-lifecycle trace events. */
+export function planInfo(model: Model, plan: Plan): TracePlanInfo {
+  return {
+    cost: plan.cost,
+    makespan: plan.makespan,
+    steps: plan.steps.map((s) => ({
+      label: stepLabel(model, s),
+      kind: s.k,
+      start: s.k === "op" ? s.projStart : null,
+      end: s.k === "op" ? s.projEnd : null,
+    })),
+  };
+}
 
 // ---------------------------------------------------------------- planner
 
@@ -187,7 +211,7 @@ export class Planner {
     // 4. enforce active scopes every tick
     const violation = this.checkScopes();
     if (violation) {
-      this.failStep(`scope ${violation.instance.label} violated`);
+      this.failStep(`scope ${violation.instance.label} violated`, "scope");
       return this.status;
     }
 
@@ -223,14 +247,14 @@ export class Planner {
     if (result.status === "success" && result.plan) {
       if (this.sessionKind === "repair") {
         // splice: completed prefix stays history; new plan replaces the remainder
-        this.trace({ t: "repair.success", from: this.repairFrom });
+        this.trace({ t: "repair.success", from: this.repairFrom, plan: planInfo(this.model, result.plan) });
         this.installPlan(result.plan, "repair");
         return;
       }
       if (this.plan) {
-        this.trace({ t: "plan.replaced", reason: "better" });
+        this.trace({ t: "plan.replaced", reason: "better", plan: planInfo(this.model, result.plan) });
       } else {
-        this.trace({ t: "plan.new", cost: result.plan.cost, steps: result.plan.steps.length, makespan: result.plan.makespan });
+        this.trace({ t: "plan.new", cost: result.plan.cost, steps: result.plan.steps.length, makespan: result.plan.makespan, plan: planInfo(this.model, result.plan) });
       }
       this.installPlan(result.plan, "normal");
       return;
@@ -326,7 +350,7 @@ export class Planner {
     if (!this.stepStarted) {
       // re-validate the precondition against the live world
       if (g.op.pre && !g.op.pre.fn(this.state, g.b)) {
-        this.failStep(`precondition of ${label} no longer holds`);
+        this.failStep(`precondition of ${label} no longer holds`, "precondition");
         return;
       }
       this.stepStarted = true;
@@ -338,7 +362,7 @@ export class Planner {
 
     // executing condition, every tick
     if (g.op.verify && !g.op.verify.fn(this.state, g.b)) {
-      this.failStep(`executing condition of ${label} violated`);
+      this.failStep(`executing condition of ${label} violated`, "verify");
       return;
     }
 
@@ -348,7 +372,7 @@ export class Planner {
       const behind = this.clock() - (this.plan.startClock + (step.projEnd - this.plan.startClock));
       if (behind > tol) {
         this.trace({ t: "drift", label, behindSeconds: behind });
-        this.failStep(`drift: ${behind.toFixed(2)}s behind projection at ${label}`);
+        this.failStep(`drift: ${behind.toFixed(2)}s behind projection at ${label}`, "drift");
         return;
       }
     }
@@ -384,7 +408,7 @@ export class Planner {
       return;
     }
 
-    this.failStep(`executor of ${label} returned failure`);
+    this.failStep(`executor of ${label} returned failure`, "executor");
   }
 
   /** advance through any non-operator steps without running another executor this tick */
@@ -507,11 +531,11 @@ export class Planner {
     this.scopeStack.length = idx;
   }
 
-  private failStep(reason: string): void {
+  private failStep(reason: string, cause: StepFailCause): void {
     const plan = this.plan;
     if (!plan) return;
     const index = Math.min(this.cursor, plan.steps.length - 1);
-    this.trace({ t: "step.fail", label: stepLabel(this.model, plan.steps[index]), index, reason });
+    this.trace({ t: "step.fail", label: stepLabel(this.model, plan.steps[index]), index, reason, cause });
 
     // run all open scope exits (cleanup-on-abort)
     if (this.scopeStack.length > 0) {
