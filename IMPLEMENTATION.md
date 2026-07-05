@@ -1,6 +1,6 @@
 # Implementation status vs. SPEC.md
 
-**As of v2.0.0-alpha.0.** Everything listed as *implemented* is covered by the test suite (`npm test`, **64 tests across 12 files; 96% line / 88% branch coverage**, gated in `npm run test:coverage`). Deferred items note where the architecture already prepares for them.
+**As of v2.0.0-alpha.0.** Everything listed as *implemented* is covered by the test suite (`npm test`, **107 tests across 17 files; ~96% line / ~90% branch coverage on `src/`**, gated in `npm run test:coverage`). Deferred items note where the architecture already prepares for them.
 
 ## Test inventory & evaluation methodology
 
@@ -18,6 +18,7 @@
 | `tests/classics.ts` | search scenarios | remaining PR #14 puzzles as real planning: **word ladder** (dictionary graph search, 3 steps), **crafting** (numeric resource production, optimal 7), **treasure hunt** (clue-gated navigation) |
 | `tests/csp.ts` | constraint search | PR #14 constraint puzzles as backtracking search with first-unfilled ordering + forward checks: **sudoku 4×4** (verified valid completion), **logic grid** (unique seating from relational clues), **crossword** (intersecting slots with letter agreement) |
 | `tests/scheduling.ts` | temporal scenario | PR #14 **scheduling**: sequence jobs on one machine meeting per-job deadlines + precedence, with projected-clock pruning of infeasible orderings (and an infeasibility proof) |
+| `tests/director.ts` | acceptance | the "discrete executive" spec: a ~6-operator tactical demo domain (GoTo/Breach/TakeCover/Suppress/Regroup/Idle, in `scenarios/director.ts`; live demos: `npm run demo:director` and the web preview's `/director` page) with live-query external preconditions and an external cost oracle — correct plans, improve/repair replans, every `PlanEventStream` failure cause as structured data, multi-agent stream merge, and a <10ms replan perf gate |
 
 **On the PR #14 puzzle canon:** all 15 titles were reviewed; the ones that are genuine action-planning or constraint problems are now solved *by the planner* (blocks world, sokoban, river crossing, Tower of Hanoi, water jug, bridge & torch in `puzzles.ts`; word ladder, crafting, treasure hunt in `classics.ts`; sudoku, logic grid, crossword in `csp.ts`; scheduling in `scheduling.ts`). Two are deliberately omitted because they are not planning problems the engine should solve: **bridge-math** (an arithmetic word problem, no action structure) and **full scrambled Rubik's cube** (search-infeasible without pattern-database heuristics — a 2–3 move scramble is blind-solvable but would add large, brittle sticker-permutation encoding for coverage that sudoku already provides).
 
@@ -43,6 +44,7 @@
 | §7.5/§8 determinism: seeded RNG, injectable clock, byte-identical traces | ✅ | `src/rng.ts`, `tests/exec.ts` |
 | §8 execution: MTR replan-only-if-better, fluent-precise + method-reads replan triggers, executing conditions (`verify`), scopes (deadline/maintain/minHold/onExit incl. cleanup-on-abort), suffix **repair from the failure point** with full-replan fallback, async (Promise) executors, multi-agent `Scheduler` | ✅ | `src/exec.ts` |
 | §9 trace events; `validatePlan` / `simulatePlan` / `applicableActions` / `explainFailure` / `planSummary` | ✅ | `src/exec.ts`, `src/trace.ts` |
+| §9 structured plan-event stream (`PlanEventStream`): plan created / step started / plan invalidated / plan failed with machine-readable reasons (`world-changed` fluents, `step-failed` cause, `search-exhausted` rejections), agent + plan-id + seq stamping, multi-planner merge | ✅ | `src/events.ts` (adapter over the trace seam; `exec.ts` trace events additively carry `TracePlanInfo` + `StepFailCause`) |
 | §11 ground-truth correctness suite (water jug 6 steps, blocks world 3 moves, river crossing 7, sokoban 3) + scenario ports (bunker-lite, dynamic-cost vehicle) | ✅ | `tests/` |
 
 ## Deferred (architecture prepared)

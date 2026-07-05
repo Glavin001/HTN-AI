@@ -8,6 +8,19 @@ app that **visualizes the `htn-ai` planner running in the browser**.
 Scenes selectable from the scenario dropdown, each driving the **real reactive
 `Planner`** in the browser (the app never re-implements planning).
 
+### ★ Director feed (`/director`)
+
+A live demo of the **structured plan-event stream** (`PlanEventStream`): one
+reactive `Planner` runs the ~6-operator director domain
+([`scenarios/director.ts`](../../scenarios/director.ts)) with a stream
+attached. Buttons sabotage the live world — collapse the breached doorway
+(silent nav-mesh change → `plan.invalidated {cause: "precondition"}` → repair),
+re-weight the flank traversal oracle (announced → `{kind: "world-changed"}` →
+a cheaper plan via improve), or make the threat vanish mid-suppression
+(executing-condition failure). The right panel shows the exact JSON `PlanEvent`
+data a game director or LLM would consume from `stream.drain()`; the same
+integration runs headlessly via `npm run demo:director` at the repo root.
+
 ### ★ Squad combat (F.E.A.R.-style game AI)
 
 Four scenarios where coordinated NPCs run one reactive `Planner` each over a

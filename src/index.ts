@@ -98,11 +98,23 @@ export {
   Planner,
   Scheduler,
   stepLabel,
+  planInfo,
   type PlannerOptions,
   type PlannerStatus,
   type TraceEvent,
   type TraceFn,
+  type StepFailCause,
+  type TracePlanInfo,
 } from "./exec";
+
+// Plan-event stream: structured plan lifecycle events for a director
+export {
+  PlanEventStream,
+  type PlanEvent,
+  type PlanEventReason,
+  type PlanCreatedVia,
+  type PlanEventStreamOptions,
+} from "./events";
 
 // Validation & explanation
 export { validatePlan, simulatePlan, applicableActions, planSummary, explainFailure, type PlanDiagnosis } from "./trace";

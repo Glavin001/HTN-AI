@@ -31,6 +31,8 @@ import {
   staircaseInstance,
   staircaseGoal,
 } from "../scenarios/staircase";
+import { F } from "../src/index";
+import { directorModel, directorWorld } from "../scenarios/director";
 
 const quarry: Run = (() => {
   const model = staircaseModel(quarryInstance());
@@ -44,6 +46,13 @@ const staircase: Run = (() => {
   const model = staircaseModel(staircaseInstance());
   return () => planOnce(model, model.createExecState(), { goals: [goal(staircaseGoal())], weight: 1, heuristic: "hmax" });
 })();
+// the "discrete executive" demo mission (scenarios/director.ts): a full
+// 6-step tactical replan through external-predicate preconditions and an
+// external cost oracle — the spec's <10ms replan budget, measured
+const director: Run = (() => {
+  const model = directorModel(directorWorld());
+  return () => planOnce(model, model.createExecState(), { goals: [goal(F.lit("regrouped"))], weight: 1 });
+})();
 
 console.log("=".repeat(86));
 console.log(`htn-ai benchmark — min of N trials${(globalThis as { gc?: unknown }).gc ? " (gc between trials)" : " (run with NODE_OPTIONS=--expose-gc for lower noise)"}`);
@@ -52,6 +61,7 @@ printHeader();
 printRow(measure("quarry (hmax,w=1)", quarry));
 printRow(measure("scavenger (hmax,w=1)", scavenger));
 printRow(measure("staircase (hmax,w=1)", staircase));
+printRow(measure("director replan (w=1)", director));
 printRow(measure("blocks reverse 6", blocksReverse(6)));
 printRow(measure("hanoi 5", hanoi(5)));
 printRow(measure("nav grid 6x6", navGrid(6)));

@@ -6,3 +6,4 @@
 export * from "./blocks";
 export * from "./staircase";
 export * from "./squad-combat";
+export * from "./director";

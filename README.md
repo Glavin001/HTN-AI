@@ -57,8 +57,29 @@ The 10-second deadline is enforced **inside the search**: walking (15s, cheap) i
 | Plan repair from the failure point | automatic on step failure (`repair.attempt` trace events) |
 | Multi-agent staggered planning | `new Scheduler().add(planner); scheduler.tick(budgetMs)` |
 | Validation / affordances / explanation (LLM-ready) | `validatePlan`, `simulatePlan`, `applicableActions`, `explainFailure` |
+| Structured plan-event stream for a director | `new PlanEventStream().attach(planner, "alpha")` → `stream.drain()` |
 | Deterministic runs & serializable domains | seeded RNG, injected clock, `domainToJSON` / `domainFromJSON` |
 | Escape hatches (semi-symbolic & opaque) | `F.ext(name, args, declaredReads)`, registry executors/predicates/effects |
+
+### Plan events for a director
+
+`PlanEventStream` correlates the low-level trace into plan-lifecycle events for a game director / mission narrator / LLM: `plan.created` (with the step list, cost and makespan), `step.started` / `step.completed`, `plan.completed`, and `plan.invalidated` / `plan.failed` carrying **structured reasons** — `world-changed` (with the fluents that changed), `step-failed` (with a `precondition` / `verify` / `executor` / `scope` / `drift` cause, plus the violated scope), or `search-exhausted` (with the search's rejection log). Events are plain JSON-serializable data stamped with agent, per-agent plan id, global sequence and the planner clock; many planners can share one stream so the director consumes a single merged feed.
+
+```ts
+import { PlanEventStream } from "htn-ai";
+
+const stream = new PlanEventStream();
+stream.attach(planner, "alpha"); // and attach the rest of the squad…
+
+// each frame:
+planner.tick({ ms: 1 });
+for (const e of stream.drain()) director.observe(e); // typed PlanEvent union
+
+// e.g. { t: "plan.invalidated", agent: "alpha", planId: 2, seq: 17, at: 6.1,
+//        reason: { kind: "step-failed", step: "GoTo(room)", cause: "precondition", … } }
+```
+
+See it working: the web preview's **[`/director` page](./examples/web)** runs the ~6-operator demo domain ([`scenarios/director.ts`](./scenarios/director.ts): GoTo / Breach / TakeCover / Suppress / Regroup / Idle — live-query external preconditions, traversal-oracle costs) in the browser with sabotage buttons, and **`npm run demo:director`** ([`examples/director-feed.ts`](./examples/director-feed.ts)) prints a narrated feed of the same mission headlessly. [`tests/director.ts`](./tests/director.ts) pins the full contract — including a `<10ms` replan gate (measured ~0.2–1ms).
 
 ## Game AI: squad combat (F.E.A.R.-style)
 

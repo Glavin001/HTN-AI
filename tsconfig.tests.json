@@ -2,10 +2,18 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "module": "ESNext",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "esModuleInterop": true,
     "rootDir": "."
   },
-  "include": ["tests/**/*.ts", "src/**/*.ts", "scenarios/**/*.ts", "tsup.config.ts"],
+  "include": [
+    "tests/**/*.ts",
+    "src/**/*.ts",
+    "scenarios/**/*.ts",
+    "examples/*.ts",
+    "tsup.config.ts"
+  ],
   "exclude": []
 }
