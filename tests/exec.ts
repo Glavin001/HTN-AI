@@ -240,4 +240,52 @@ test("scheduler: many agents share a planning budget and all complete", () => {
   }
 });
 
+// ---------------------------------------------------------------- goal-agenda serialization
+
+test("goalAgenda: a conjunction of independent sub-goals is solved one at a time, with commitment", () => {
+  // five lamps, each toggled on by its own operator. Handed as a goal agenda, the
+  // planner should achieve them in order and only report success after the last.
+  const ids = [0, 1, 2, 3, 4];
+  const doc: DomainDoc = {
+    name: "lamps",
+    fluents: ids.map((i) => ({ name: `on${i}`, kind: "boolean" as const, initial: false })),
+    operators: ids.map((i) => ({ name: `flip${i}`, eff: [E.set(`on${i}`, [], true)] })),
+  };
+  const model = createModel(doc, {});
+  const planner = new Planner(model, {
+    goals: ids.map((i) => goal(F.lit(`on${i}`))),
+    goalAgenda: true,
+    now: () => 0,
+    seed: 1,
+  });
+  assert.equal(planner.goalCount(), 5);
+
+  const seen: number[] = [];
+  for (let i = 0; i < 200 && planner.getStatus() !== "succeeded" && planner.getStatus() !== "failed"; i++) {
+    planner.tick({ ms: 5 });
+    seen.push(planner.activeGoalIndex());
+  }
+  assert.equal(planner.getStatus(), "succeeded");
+  // the cursor marched all the way to the final sub-goal
+  assert.equal(Math.max(...seen), 4);
+  // every sub-goal achieved
+  for (const i of ids) assert.equal(model.read(planner.state, `on${i}`), true);
+});
+
+test("goalAgenda off (default): the same goals are pursued as one joint plan", () => {
+  const ids = [0, 1, 2];
+  const doc: DomainDoc = {
+    name: "lamps2",
+    fluents: ids.map((i) => ({ name: `on${i}`, kind: "boolean" as const, initial: false })),
+    operators: ids.map((i) => ({ name: `flip${i}`, eff: [E.set(`on${i}`, [], true)] })),
+  };
+  const model = createModel(doc, {});
+  const planner = new Planner(model, { goals: ids.map((i) => goal(F.lit(`on${i}`))), now: () => 0, seed: 1 });
+  for (let i = 0; i < 200 && planner.getStatus() !== "succeeded" && planner.getStatus() !== "failed"; i++) planner.tick({ ms: 5 });
+  assert.equal(planner.getStatus(), "succeeded");
+  // without goal-agenda the cursor never advances (it's not in serialization mode)
+  assert.equal(planner.activeGoalIndex(), 0);
+  for (const i of ids) assert.equal(model.read(planner.state, `on${i}`), true);
+});
+
 test.run();

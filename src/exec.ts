@@ -7,7 +7,7 @@
  */
 
 import { Bindings, ExecutorApi, ExecutorFn, Model, TIMINGS_EXECUTION, TaskStatus } from "./compile";
-import { GoalSpec } from "./ir";
+import { Formula, GoalSpec } from "./ir";
 import { CLOCK_SLOT, ExecState } from "./state";
 import { Agenda, Plan, PlanResult, PlanStep, PlanningSession, Rejection, ScopeInstance, StepBudget } from "./search";
 import { Rng, createRng } from "./rng";
@@ -71,6 +71,35 @@ export interface PlannerOptions {
   collectRejections?: boolean;
   /** drift tolerance: replan when actual time falls this many seconds behind projection (0 = off) */
   driftTolerance?: number;
+  /**
+   * Goal-agenda (serialization) mode. When true, the goal set is treated as an
+   * ordered agenda of subgoals to be achieved ONE AT A TIME with commitment: the
+   * planner solves the first subgoal, executes it, then plans the next from the
+   * resulting state, and so on — only reporting `succeeded` once the last is done.
+   *
+   * Crucially, a single *declarative* conjunctive goal — `goal(a ∧ b ∧ c …)` — is
+   * automatically split into its conjuncts, so the caller hands over only the
+   * desired END STATE and the planner derives the subgoals from the goal's own
+   * structure (it is not told a task per conjunct). Each subgoal is then solved by
+   * ordinary search (operators discovered, not prescribed).
+   *
+   * This is the standard fix for a conjunction of (largely) independent,
+   * serializable subgoals — e.g. "every one of these cells ends up holding a
+   * block". Handing such a conjunction to ONE search blows up combinatorially
+   * (every ordering and object↔slot assignment is a distinct state); serializing
+   * turns it into N small searches.
+   *
+   * CAVEAT — completeness. Solving subgoals one at a time *with commitment* (no
+   * backtracking across them) is only complete when they are independent: a later
+   * subgoal must never require undoing an earlier one. Blind serialization is
+   * incomplete in general (cf. the Sussman anomaly, where "A on B" and "B on C"
+   * interfere). So this is an opt-in search strategy, and the DOMAIN is responsible
+   * for the independence it assumes — e.g. in the wall demo, source-gated `grab`
+   * makes a laid block ungrabbable and `place` reaches one level up, so cells never
+   * clobber one another. When a subgoal genuinely can't be met from the committed
+   * state the planner reports `failed`; it never silently returns a wrong result.
+   */
+  goalAgenda?: boolean;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -86,6 +115,11 @@ export class Planner {
   public readonly state: ExecState;
   public readonly rng: Rng;
 
+  /** the full ordered agenda (all subgoals); `goals` is the active slice */
+  private allGoals: GoalSpec[];
+  /** index of the subgoal currently being pursued in goal-agenda mode */
+  private goalCursor = 0;
+  private readonly goalAgenda: boolean;
   private goals: GoalSpec[];
   private readonly nowFn: () => number;
   private readonly epoch: number;
@@ -109,7 +143,10 @@ export class Planner {
     this.model = model;
     this.state = model.createExecState();
     this.rng = createRng(opts.seed ?? 0x12345678);
-    this.goals = opts.goals ?? [];
+    this.goalAgenda = opts.goalAgenda ?? false;
+    this.allGoals = this.buildAgenda(opts.goals ?? []);
+    this.goalCursor = 0;
+    this.goals = this.activeGoals();
     this.nowFn = opts.now ?? defaultNow;
     this.epoch = this.nowFn();
     this.opts = opts;
@@ -117,9 +154,48 @@ export class Planner {
   }
 
   setGoals(goals: GoalSpec[]): void {
-    this.goals = goals;
+    this.allGoals = this.buildAgenda(goals);
+    this.goalCursor = 0;
+    this.goals = this.activeGoals();
     this.abandonPlan();
     this.status = "idle";
+  }
+
+  /** In goal-agenda mode, derive the ordered subgoal agenda from the goal set by
+   *  splitting any declarative conjunction `goal(a ∧ b ∧ …)` into its conjuncts —
+   *  so the planner gets the subgoals from the goal's structure, not from the
+   *  caller naming a task per conjunct. Outside goal-agenda mode, goals are left
+   *  whole (solved as one joint plan). */
+  private buildAgenda(goals: GoalSpec[]): GoalSpec[] {
+    if (!this.goalAgenda) return goals;
+    const out: GoalSpec[] = [];
+    const pushGoal = (cond: Formula): void => {
+      if (cond.f === "and") cond.parts.forEach(pushGoal);
+      else out.push({ kind: "goal", condition: cond });
+    };
+    for (const g of goals) {
+      if (g.kind === "goal") pushGoal(g.condition);
+      else out.push(g);
+    }
+    return out;
+  }
+
+  /** the subgoal actively being planned: a single agenda item in goal-agenda
+   *  mode, or the whole goal set otherwise. */
+  private activeGoals(): GoalSpec[] {
+    if (!this.goalAgenda) return this.allGoals;
+    const g = this.allGoals[this.goalCursor];
+    return g ? [g] : [];
+  }
+
+  /** In goal-agenda mode, the index of the subgoal currently being pursued, and
+   *  the total number of subgoals — handy for progress UIs. */
+  activeGoalIndex(): number {
+    return this.goalCursor;
+  }
+
+  goalCount(): number {
+    return this.allGoals.length;
   }
 
   setTrace(fn: TraceFn): void {
@@ -294,12 +370,7 @@ export class Planner {
     // bookkeeping steps are free; at most one operator executor runs per tick
     for (;;) {
       if (this.cursor >= plan.steps.length) {
-        this.trace({ t: "plan.completed" });
-        this.plan = null;
-        this.cursor = 0;
-        this.lastMTR = [];
-        this.scopeStack = [];
-        this.status = "succeeded";
+        this.completePlan();
         return;
       }
       const step = plan.steps[this.cursor];
@@ -444,14 +515,25 @@ export class Planner {
       }
       return;
     }
-    if (this.cursor >= plan.steps.length) {
-      this.trace({ t: "plan.completed" });
-      this.plan = null;
-      this.cursor = 0;
-      this.lastMTR = [];
-      this.scopeStack = [];
-      this.status = "succeeded";
+    if (this.cursor >= plan.steps.length) this.completePlan();
+  }
+
+  /** All steps of the active plan are done. In goal-agenda mode, commit this
+   *  subgoal and advance to the next (planned on the next tick from the reached
+   *  state); otherwise the whole goal set is achieved. */
+  private completePlan(): void {
+    this.trace({ t: "plan.completed" });
+    this.plan = null;
+    this.cursor = 0;
+    this.lastMTR = [];
+    this.scopeStack = [];
+    if (this.goalAgenda && this.goalCursor < this.allGoals.length - 1) {
+      this.goalCursor++;
+      this.goals = this.activeGoals();
+      this.status = "running";
+      return;
     }
+    this.status = "succeeded";
   }
 
   private invokeExecutor(name: string | undefined, args: Bindings): TaskStatus {
