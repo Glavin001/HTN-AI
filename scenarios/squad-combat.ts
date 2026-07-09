@@ -31,11 +31,13 @@
 import {
   type DomainDoc,
   type ExecutorApi,
+  type ExtQuery,
   type Formula,
   type GoalSpec,
   type Model,
   type Planner as PlannerT,
   type Rejection,
+  type Snap,
   type TaskStatus,
   type TraceEvent,
   E,
@@ -56,9 +58,64 @@ export const SHOT_TIME = 0.32; // seconds to take a shot
 export const RELOAD_TIME = 1.6;
 export const SUPPRESS_MAX = 5; // a suppressor sustains fire up to this long (or until the flanker is set)
 export const MEMORY_SECONDS = 4; // how long a lost target is remembered before "search"
+export const SEARCH_SECONDS = 14; // after losing a target, sweep toward last contact this long before giving up
 export const LOW_HP = 48; // pull back to cover once this hurt (react to taking fire)
+// survival margin (HP) a unit insists on keeping after a projected engagement/crossing,
+// scaled by caution. The attrition model gates moves + engagements on this: a plan that
+// would drop you below it is "lethal" and pruned — so the planner reasons about whether
+// it will actually survive a fight or a dash, not just how exposed it is.
+export const SAFETY_MARGIN = 12;
+// a target at/under this HP in your sights is finished on the spot — don't reposition
+// for a prettier angle and let a near-dead enemy slip away (and stall the engagement).
+export const FINISH_HP = 30;
+// fraction of a dash actually spent under aimed fire: you cross most of a lane before
+// the enemy reacquires and lands shots, so a crossing is far less lethal than standing
+// in the open the whole time. Keeps units from freezing (they'll still dash to re-engage)
+// while a genuinely long, fully-exposed run is still gated as lethal.
+const CROSS_RISK = 0.5;
 export const SIGHT_RANGE = 22;
 export const BREACH_WINDOW = 6; // seconds the synchronized breach must complete within
+
+// ---- tactical positioning model (cover is directional + dynamic; range matters) ----
+// A "soft cover" crate is a half-height structure you stand BESIDE: it doesn't block
+// shooting line-of-sight (you peek/shoot over it) or movement, but if its footprint
+// sits between you and a shooter, that shooter's hit chance on you is cut. Which
+// enemies it shields you from depends on which side of the crate you stand — so the
+// same spot's value changes as enemies move or a new one appears on your flank.
+export const COVER_HALF_W = 0.6; // soft-cover footprint half-width (≈ drawn crate)
+export const COVER_HALF_D = 0.4; // soft-cover footprint half-depth
+export const COVER_REACH = 1.8; // how close you must hug a crate for it to shield you
+export const COVER_HIT_MULT = 0.28; // incoming hit chance is scaled by this when in cover
+export const BASE_ACCURACY = 0.96; // point-blank hit chance (open, no cover)
+export const ACC_MIN = 0.42; // hit chance at the edge of sight range (open)
+export const PEEK_PENALTY = 0.82; // your OWN outgoing accuracy when you shoot from cover
+// expected damage the planner reasons with when it sees a believed target (it plans
+// over the *average* shot; execution rolls the seeded RNG around it)
+export const EXPECTED_HIT = 0.78;
+
+// ---- search weights: the tactical trade-off the planner OPTIMISES OVER ----
+// These live in operator COST, not a greedy one-shot utility, so the planner's
+// weighted-A* composes multi-step plans (stage through cover, then push to the
+// strong angle) that a one-hop greedy score would miss.
+// The planner is myopic (it plans one shot per beat, then replans), so a single
+// exposed shot must stand in for the SUSTAINED danger of holding an exposed spot —
+// hence W_EXPOSE is large relative to the one-off cost of relocating. This is what
+// makes "break contact and reach cover" win over "trade shots in the open".
+export const W_MOVE = 0.35; // cost per world-unit travelled
+export const W_EXPOSE = 5.0; // cost per enemy with a clear shot on you (the danger lever)
+export const W_PATH_EXPOSE = 0.8; // cost for crossing exposed ground to reach a spot
+export const W_RANGE = 0.12; // mild pull toward comfortable firing range (don't let it dominate cover)
+export const IDEAL_RANGE = 12; // closer than this you fight well; far costs a little accuracy
+export const SPOT_GRID = 3.2; // spacing of the auto-generated walkable grid
+export const MAX_SPOTS = 48; // cap on tactical points exposed to the planner (branching)
+
+/** Fluents the move-cost externals read — listed so a foe moving (perception) dirties
+ *  the cost and the unit re-decides each beat. */
+const TACTICAL_READS = ["myPos", "coverPos", "threatPos", "foePos", "foeAlive"];
+/** Reads for the attrition/survival externals — moving (crossing damage) vs fighting
+ *  (engagement damage). Listed so a foe/ally moving or HP dropping re-decides the gate. */
+const MOVE_SURV_READS = ["myPos", "coverPos", "foePos", "foeAlive", "allyPos", "allyAlive", "caution", "myHp"];
+const ENGAGE_SURV_READS = ["myPos", "threatPos", "threatHp", "foePos", "foeAlive", "allyPos", "allyAlive", "caution", "myHp"];
 
 // ---------------------------------------------------------------- instance shapes
 
@@ -92,6 +149,9 @@ export interface CoverSpec {
   breach?: boolean;
   /** a fall-back / rally point used when retreating */
   rally?: boolean;
+  /** an auto-generated tactical standing position (grid / cover edge) — invisible,
+   *  not a crate, evaluated by the planner as a candidate firing/cover spot */
+  spot?: boolean;
 }
 
 /** Axis-aligned obstacle that blocks line of sight AND movement (a wall / crate). */
@@ -198,6 +258,88 @@ function boxCorners(w: WallSpec, pad: number): Vec2[] {
   ];
 }
 
+/** A cover crate is "soft cover" — a half-height thing you fight from beside —
+ *  unless it's a maneuver anchor (flank / high / breach / rally), which are open
+ *  waypoints, not crates. Only soft cover blocks incoming fire directionally. */
+export function isSoftCover(c: CoverSpec): boolean {
+  return !c.flank && !c.high && !c.breach && !c.rally && !c.spot;
+}
+
+/** The axis-aligned footprint of a soft-cover crate (used for directional cover). */
+export function coverFootprint(c: CoverSpec): WallSpec {
+  return { x: c.x - COVER_HALF_W, z: c.z - COVER_HALF_D, w: 2 * COVER_HALF_W, d: 2 * COVER_HALF_D };
+}
+
+/**
+ * Auto-generate the invisible tactical standing positions the planner evaluates:
+ * the padded corners of every wall + crate (the "peek the edge" spots) plus a
+ * coarse walkable grid over the play area. These are NOT crates (spot:true ⇒ not
+ * soft cover) and are not drawn — only real geometry is. Deterministic + capped so
+ * the planner's branching stays bounded.
+ */
+export function generateTacticalSpots(inst: SquadInstance): CoverSpec[] {
+  const walls = inst.walls ?? [];
+  const obstacles: WallSpec[] = [...walls, ...inst.covers.filter(isSoftCover).map(coverFootprint)];
+  const insideWall = (x: number, z: number) => walls.some((w) => x > w.x - 0.3 && x < w.x + w.w + 0.3 && z > w.z - 0.3 && z < w.z + w.d + 0.3);
+  const pts: Vec2[] = [];
+  // cover-edge spots first (kept preferentially under the cap): the 4 corners (peek
+  // an angle) AND the 4 edge-midpoints (tuck directly behind cover from a head-on
+  // shooter). Together these are the "go around the crate to block their line" spots.
+  const EDGE = UNIT_RADIUS + 0.7;
+  for (const o of obstacles) {
+    const cx = o.x + o.w / 2;
+    const cz = o.z + o.d / 2;
+    const offs: [number, number][] = [
+      [-1, -1], [1, -1], [-1, 1], [1, 1], // corners
+      [0, -1], [0, 1], [-1, 0], [1, 0], // edge midpoints (head-on cover)
+    ];
+    for (const [sx, sz] of offs) {
+      const x = cx + sx * (o.w / 2 + EDGE);
+      const z = cz + sz * (o.d / 2 + EDGE);
+      if (!insideWall(x, z)) pts.push({ x, z });
+    }
+    // a wider standoff ring — diagonal firing angles a step back from the crate, so a
+    // unit can pick an OBLIQUE line on the enemy (more interesting perspectives than
+    // just hugging the box edge)
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]] as [number, number][]) {
+      const x = cx + sx * (o.w / 2 + EDGE * 2.6);
+      const z = cz + sz * (o.d / 2 + EDGE * 2.6);
+      if (!insideWall(x, z)) pts.push({ x, z });
+    }
+  }
+  // coarse walkable grid over the bounding area
+  const xs = [...inst.units.map((u) => u.x), ...inst.covers.map((c) => c.x)];
+  const zs = [...inst.units.map((u) => u.z), ...inst.covers.map((c) => c.z)];
+  const pad = 3;
+  const minX = Math.min(...xs) - pad;
+  const maxX = Math.max(...xs) + pad;
+  const minZ = Math.min(...zs) - pad;
+  const maxZ = Math.max(...zs) + pad;
+  for (let x = minX; x <= maxX; x += SPOT_GRID) for (let z = minZ; z <= maxZ; z += SPOT_GRID) if (!insideWall(x, z)) pts.push({ x, z });
+  // dedupe + drop points that coincide with a named cover (already a candidate)
+  const near = (a: Vec2, b: { x: number; z: number }) => Math.hypot(a.x - b.x, a.z - b.z) < SPOT_GRID * 0.6;
+  const kept: Vec2[] = [];
+  for (const p of pts) {
+    if (kept.some((k) => near(k, p))) continue;
+    if (inst.covers.some((c) => near(p, c))) continue;
+    kept.push(p);
+  }
+  return kept.slice(0, MAX_SPOTS).map((p, i) => ({ name: `spot${i}`, x: round(p.x), z: round(p.z), spot: true }));
+}
+
+/** Distance from a point to an axis-aligned box (0 if inside). */
+function distToBox(px: number, pz: number, b: WallSpec): number {
+  const dx = Math.max(b.x - px, 0, px - (b.x + b.w));
+  const dz = Math.max(b.z - pz, 0, pz - (b.z + b.d));
+  return Math.hypot(dx, dz);
+}
+
+/** Hit-chance falloff with range: full at point-blank, ACC_MIN at sight range. */
+function rangeFalloff(d: number): number {
+  const t = Math.min(1, Math.max(0, d / SIGHT_RANGE));
+  return BASE_ACCURACY + (ACC_MIN - BASE_ACCURACY) * t;
+}
+
 /** Position reached by walking `dist` along a polyline; `done` once past the end. */
 function walkPolyline(path: Vec2[], dist: number): { x: number; z: number; done: boolean } {
   let rem = dist;
@@ -224,6 +366,8 @@ export class SquadWorld {
   public readonly covers: CoverSpec[];
   public readonly coverByName = new Map<string, CoverSpec>();
   public readonly walls: WallSpec[];
+  /** half-height crate footprints — block incoming fire directionally, not LOS/movement */
+  public readonly softCovers: WallSpec[];
 
   // ---- blackboard — PER TEAM (each side coordinates its own squad; the two teams
   //      share no memory, only physical cover reservations) ----
@@ -249,6 +393,7 @@ export class SquadWorld {
   constructor(inst: SquadInstance) {
     this.covers = inst.covers;
     this.walls = inst.walls ?? [];
+    this.softCovers = inst.covers.filter(isSoftCover).map(coverFootprint);
     for (const c of inst.covers) {
       this.coverByName.set(c.name, c);
       this.coverOwner.set(c.name, null);
@@ -280,6 +425,118 @@ export class SquadWorld {
   losClear(ax: number, az: number, bx: number, bz: number): boolean {
     for (const w of this.activeWalls()) if (segHitsBox(ax, az, bx, bz, w)) return false;
     return true;
+  }
+
+  /** Is a unit AT (px,pz) in soft cover against a shooter at (ex,ez)? True when a
+   *  crate it is hugging sits on the line between them — directional + dynamic, so
+   *  it lapses the instant the shooter rounds the crate (or a new one flanks). */
+  inCoverVs(px: number, pz: number, ex: number, ez: number): boolean {
+    for (const c of this.softCovers) {
+      if (distToBox(px, pz, c) > COVER_REACH) continue; // must be hugging THIS crate
+      if (segHitsBox(px, pz, ex, ez, c)) return true; // crate blocks the incoming line
+    }
+    return false;
+  }
+
+  /** Every living actor hostile to `side` (ground truth — used for tuning/tests). */
+  hostilesOf(side: Side): Actor[] {
+    return [...this.actors.values()].filter((a) => a.alive && HOSTILE[side].includes(a.side));
+  }
+
+  /** The names of every actor hostile to `self` (static — the set of possible foes,
+   *  alive or not). Each becomes a `foe` entity so belief can track it individually. */
+  foeNamesFor(self: string): string[] {
+    const me = this.actors.get(self);
+    if (!me) return [];
+    return [...this.actors.values()].filter((a) => HOSTILE[me.side].includes(a.side)).map((a) => a.name);
+  }
+
+  /** The names of every OTHER actor on `self`'s side (its squadmates) — each becomes an
+   *  `ally` entity so belief can track their positions (shared squad comms), which the
+   *  attrition model uses to count friendly guns on a shared threat. */
+  allyNamesFor(self: string): string[] {
+    const me = this.actors.get(self);
+    if (!me) return [];
+    return [...this.actors.values()].filter((a) => a.side === me.side && a.name !== self).map((a) => a.name);
+  }
+
+  /** Probability a shot from `shooter` lands on `target`, given range + the target's
+   *  cover relative to the shooter (and a small peek penalty if the shooter itself is
+   *  hugging cover). Deterministic inputs → the executor rolls a seeded RNG against it. */
+  hitChance(shooter: Actor, target: Actor): number {
+    const d = dist2(shooter.x, shooter.z, target.x, target.z);
+    let p = rangeFalloff(d);
+    if (this.inCoverVs(target.x, target.z, shooter.x, shooter.z)) p *= COVER_HIT_MULT;
+    // shooting from behind your own crate trims your accuracy a touch (you're peeking)
+    if (this.softCovers.some((c) => distToBox(shooter.x, shooter.z, c) <= COVER_REACH && segHitsBox(shooter.x, shooter.z, target.x, target.z, c))) p *= PEEK_PENALTY;
+    return Math.min(1, Math.max(0.02, p));
+  }
+
+  /** How many of `foes` currently have a clear line of fire on (px,pz) AND no soft
+   *  cover denies them — i.e. how exposed this spot is. Pass believed foe positions. */
+  exposureAt(px: number, pz: number, foes: { x: number; z: number }[]): number {
+    let n = 0;
+    for (const f of foes) {
+      if (dist2(px, pz, f.x, f.z) > SIGHT_RANGE) continue;
+      if (!this.losClear(px, pz, f.x, f.z)) continue; // a wall already shields you here
+      if (this.inCoverVs(px, pz, f.x, f.z)) continue; // a crate denies this shooter
+      n++;
+    }
+    return n;
+  }
+
+  /** How many of `foes` this spot has soft cover against (the spot's defensive value). */
+  coverCountAt(px: number, pz: number, foes: { x: number; z: number }[]): number {
+    let n = 0;
+    for (const f of foes) if (dist2(px, pz, f.x, f.z) <= SIGHT_RANGE && this.inCoverVs(px, pz, f.x, f.z)) n++;
+    return n;
+  }
+
+  /** Damage/second I'd take standing at (px,pz) from `shooters` that can see me, each
+   *  shot's chance discounted by my cover relative to that shooter. The core of the
+   *  attrition model — how fast this spot bleeds me. Pass believed foe positions. */
+  incomingDps(px: number, pz: number, shooters: { x: number; z: number }[]): number {
+    let dps = 0;
+    for (const f of shooters) {
+      if (dist2(px, pz, f.x, f.z) > SIGHT_RANGE) continue;
+      if (!this.losClear(px, pz, f.x, f.z)) continue;
+      let p = rangeFalloff(dist2(px, pz, f.x, f.z));
+      if (this.inCoverVs(px, pz, f.x, f.z)) p *= COVER_HIT_MULT; // my cover vs this shooter
+      dps += (SHOT_DAMAGE * p) / SHOT_TIME;
+    }
+    return dps;
+  }
+
+  /** Like incomingDps, but discounted by COVERING FIRE: a foe my squadmates can also
+   *  shoot splits/suppresses its fire instead of pouring it all on me. So two units
+   *  pushing a lone foe each take less return fire than one would — which is what lets
+   *  an outnumbering squad commit (and keeps a lone, uncovered unit from doing so). */
+  incomingDpsVsSquad(px: number, pz: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[]): number {
+    let dps = 0;
+    for (const f of foes) {
+      if (dist2(px, pz, f.x, f.z) > SIGHT_RANGE || !this.losClear(px, pz, f.x, f.z)) continue;
+      let p = rangeFalloff(dist2(px, pz, f.x, f.z));
+      if (this.inCoverVs(px, pz, f.x, f.z)) p *= COVER_HIT_MULT;
+      let covering = 0;
+      for (const a of allies) if (dist2(a.x, a.z, f.x, f.z) <= SIGHT_RANGE && this.losClear(a.x, a.z, f.x, f.z)) covering++;
+      dps += ((SHOT_DAMAGE * p) / SHOT_TIME) / (1 + covering); // each covering gun draws a share of the foe's fire
+    }
+    return dps;
+  }
+
+  /** Combined damage/second `shooters` (me + believed allies) put onto a target at
+   *  (tx,tz) — how fast WE kill it. This is what makes outnumbering matter: more guns
+   *  on the threat ⇒ a shorter fight ⇒ less time taking return fire ⇒ "we'll win". */
+  firepowerOnto(tx: number, tz: number, shooters: { x: number; z: number }[]): number {
+    let dps = 0;
+    for (const s of shooters) {
+      if (dist2(s.x, s.z, tx, tz) > SIGHT_RANGE) continue;
+      if (!this.losClear(s.x, s.z, tx, tz)) continue;
+      let p = rangeFalloff(dist2(s.x, s.z, tx, tz));
+      if (this.inCoverVs(tx, tz, s.x, s.z)) p *= COVER_HIT_MULT; // target's cover vs us
+      dps += (SHOT_DAMAGE * p) / SHOT_TIME;
+    }
+    return dps;
   }
 
   /** Shortest walkable path from (ax,az) to (bx,bz) around obstacles (visibility
@@ -363,7 +620,7 @@ export class SquadWorld {
  */
 export const squadDomain: DomainDoc = {
   name: "squad-combat",
-  types: [{ name: "cover" }],
+  types: [{ name: "cover" }, { name: "foe" }, { name: "ally" }],
   fluents: [
     // --- self (belief; perception mirrors truth, ungated) ---
     { name: "myPos", kind: "vec2" },
@@ -372,11 +629,50 @@ export const squadDomain: DomainDoc = {
     { name: "role", kind: "enum", values: ["assault", "flanker", "suppressor", "leader"], initial: "assault" },
     { name: "tactic", kind: "enum", values: ["hold", "flank", "breach", "regroup"], initial: "hold" },
     { name: "myCover", kind: "entity", entityType: "cover" },
+    // how much to weight staying alive right now (1 = normal). The coordinator raises
+    // it when a unit is outgunned or hurt, so it values cover + breaking contact more —
+    // an outnumbered unit flows to cover/escape instead of trading in the open.
+    { name: "caution", kind: "float", initial: 1 },
+    // the spot-graph route's decision for THIS beat (written by perception): either
+    // "engage from where I am" or the next hop of the optimal multi-step route. The
+    // deliberation (pick a spot now because it unlocks a better one) lives in that
+    // search; the planner just enacts the decision and re-decides as the world moves.
+    { name: "engageHere", kind: "boolean", initial: false },
+    { name: "chosenSpot", kind: "entity", entityType: "cover" },
+    // the unwinnable-fight read (written by perception via the attrition model): there
+    // is NO firing position — here or reachable — where this unit outlasts the threat,
+    // so it should break contact. False when squadmates make the fight winnable.
+    { name: "mustRetreat", kind: "boolean", initial: false },
+    // where to break contact TO when the fight is unwinnable — the safest reachable spot
+    // out of the enemy's fire (written by perception, enacted by the breakContact method)
+    { name: "retreatSpot", kind: "entity", entityType: "cover" },
+    // where to PRESS toward when we have a position on the threat but no shot (it's
+    // behind cover / just broke contact): the reachable spot that closes the distance.
+    // This is pursuit — a winning unit hunts a fleeing one down instead of losing it.
+    { name: "advanceSpot", kind: "entity", entityType: "cover" },
+    // sweeping toward last contact after losing the threat fix (search to re-acquire)
+    { name: "searching", kind: "boolean", initial: false },
+    // selects the positioning engine: false ⇒ the bespoke spot-graph route (default);
+    // true ⇒ the generic GOAP search over move+engage, guided by a domain potential-
+    // field heuristic (the planner DISCOVERS the route itself). Set per-unit at init.
+    { name: "useGoap", kind: "boolean", initial: false },
     // --- threat (belief; perception gates by line-of-sight + memory) ---
     { name: "threatPos", kind: "vec2" },
     { name: "threatHp", kind: "float", initial: 100 },
     { name: "threatSeen", kind: "boolean", initial: false }, // have a current line of sight
     { name: "hasThreat", kind: "boolean", initial: false }, // have a position fix at all (sight OR hearing)
+    // --- known hostiles (belief; one set of slots per foe, gated like the threat).
+    //     This is what makes EXPOSURE real: a spot's danger = how many of THESE have a
+    //     line of fire on it. A foe you haven't seen yet isn't dodged — so when one
+    //     appears on your flank, your cover lapses and you reactively reposition. ---
+    { name: "foePos", params: [{ name: "f", type: "foe" }], kind: "vec2" },
+    { name: "foeAlive", params: [{ name: "f", type: "foe" }], kind: "boolean", initial: false },
+    { name: "foeSeen", params: [{ name: "f", type: "foe" }], kind: "boolean", initial: false },
+    // --- squadmates (belief; shared comms within a team). Used to count friendly guns
+    //     on the shared threat, so an outnumbered unit knows to flee and an outnumbering
+    //     one knows to push — the attrition calculus behind "2v1, run" vs "2v1, we win". ---
+    { name: "allyPos", params: [{ name: "a", type: "ally" }], kind: "vec2" },
+    { name: "allyAlive", params: [{ name: "a", type: "ally" }], kind: "boolean", initial: false },
     // --- squad blackboard (belief; written by the coordinator) ---
     { name: "flankerReady", kind: "boolean", initial: false },
     // --- cover descriptors (static, set at init) ---
@@ -408,16 +704,103 @@ export const squadDomain: DomainDoc = {
       executor: "move",
     },
     {
-      // move to a flanking cover (coordinated flank tactic); same motion, tagged
-      name: "flankTo",
+      // the fluid tactical move: relocate to ANY useful standing position (grid spot,
+      // cover edge, or named cover). Its COST carries the whole positional trade-off —
+      // travel + the danger of crossing exposed ground to get there + being out of
+      // comfortable range — so the planner's weighted-A* composes multi-step plans
+      // (stage through cover, then push to the strong angle) a greedy score can't.
+      // Destination exposure isn't charged here; the following takeShot pays for
+      // firing while exposed, so "move to cover then fire" is what gets optimised.
+      name: "moveToSpot",
       params: [{ name: "c", type: "cover" }],
-      pre: F.and(F.lit("coverFlank", ["?c"]), F.not(F.lit("coverTaken", ["?c"]))),
-      // a flank is a deliberate maneuver to break symmetry — commit to it (only
-      // bail if the slot is taken; being hurt is handled by the retreat method)
-      verify: F.not(F.lit("coverTaken", ["?c"])),
+      pre: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("isChosen", ["?c"], ["chosenSpot"])),
+      // abort the move the instant the slot is taken OR the route re-decides (a foe
+      // moved, a new one appeared on your flank — the chosen hop is no longer best)
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("isChosen", ["?c"], ["chosenSpot"])),
       eff: [
         E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
         E.set("myCover", [], "?c", "planOnly"),
+      ],
+      cost: N.add(
+        N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
+        N.add(N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE)), N.mul(N.ext("spotRange", ["?c"], TACTICAL_READS), N.c(W_RANGE))),
+      ),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // GOAP-mode positioning: relocate to any FIRING position (a spot that sees the
+      // threat — the move executor pathfinds around walls to reach it). Used only by
+      // the generic kill-search (neutralizeGoap); its cost is travel + crossing danger,
+      // and engageFrom adds the firefight cost, so the search minimises the total. The
+      // potential-field heuristic is what keeps this search from wandering.
+      name: "moveFree",
+      params: [{ name: "c", type: "cover" }],
+      // survivesMove gates out a dash the enemy's fire would kill me during — so the
+      // search can't pick "great spot, dead on arrival". The projected HP loss is
+      // written to myHp, so a chain of moves accumulates damage the planner must survive.
+      pre: F.and(F.lit("useGoap"), F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+        E.dec("myHp", [], N.ext("crossDmgTo", ["?c"], MOVE_SURV_READS), "planOnly"),
+      ],
+      cost: N.add(N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)), N.mul(N.ext("pathExposure", ["?c"], TACTICAL_READS), N.c(W_PATH_EXPOSE))),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // break contact: fall back to the safe spot perception picked (out of the
+      // enemy's fire). Used when no survivable firefight exists — the "I'm not getting
+      // out of this, time to run" move. No survival gate (the point is to GET safe).
+      name: "breakTo",
+      // mustRetreat gates this out of normal kill-searches — it's ONLY available when
+      // perception has judged the fight unwinnable, so it's never picked as a generic
+      // reposition (that's moveFree's job); it's purely the bail-out move.
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("mustRetreat"), F.ext("isRetreatSpot", ["?c"], ["retreatSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      verify: F.and(F.lit("mustRetreat"), F.ext("isRetreatSpot", ["?c"], ["retreatSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+      ],
+      cost: N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // pursuit: close on the believed threat to re-establish a line of fire (it's
+      // behind cover or just broke contact). Survival-gated like any advance, so a unit
+      // only hunts when it can do so without crossing into a lethal lane — a healthy
+      // winner runs a fleeing enemy down; a hurt one doesn't over-extend.
+      name: "pursueTo",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("useGoap"), F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      verify: F.and(F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+        E.dec("myHp", [], N.ext("crossDmgTo", ["?c"], MOVE_SURV_READS), "planOnly"),
+      ],
+      cost: N.mul(N.dist("myPos", [], "coverPos", ["?c"]), N.c(W_MOVE)),
+      duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
+      executor: "move",
+    },
+    {
+      // move to a flanking cover (coordinated flank tactic); same motion, tagged.
+      // Now survival-aware: survivesMove gates a flank whose crossing would be lethal —
+      // BUT the crossing damage is discounted by covering fire (incomingDpsVsSquad), so
+      // a suppressor pinning the enemy is exactly what makes the flanker's dash survive.
+      // The flank thus EMERGES as safe only when the squad is actually suppressing.
+      name: "flankTo",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("coverFlank", ["?c"]), F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      verify: F.and(F.not(F.lit("coverTaken", ["?c"])), F.ext("survivesMove", ["?c"], MOVE_SURV_READS)),
+      eff: [
+        E.setVec("myPos", [], N.ext("coverX", ["?c"], ["coverPos"]), N.ext("coverZ", ["?c"], ["coverPos"]), undefined, "planOnly"),
+        E.set("myCover", [], "?c", "planOnly"),
+        E.dec("myHp", [], N.ext("crossDmgTo", ["?c"], MOVE_SURV_READS), "planOnly"),
       ],
       cost: N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)),
       duration: N.div(N.add(N.dist("myPos", [], "coverPos", ["?c"]), N.c(0.1)), N.c(MOVE_SPEED)),
@@ -467,27 +850,70 @@ export const squadDomain: DomainDoc = {
       executor: "move",
     },
     {
-      // fire on the threat; reactively aborts the instant line-of-sight is lost
+      // fire on the threat; reactively aborts the instant line-of-sight is lost.
+      // Like suppress, excluded from the GOAP kill-search (not(useGoap)): it chips
+      // threatHp per shot and burns ammo, so as a route to "threatHp ≤ 0" it spawns
+      // deep (threatHp × ammo) chip-chains that explode the search even with dedup.
+      // The GOAP search uses engageFrom (the whole-burst finisher) as its kill action.
       name: "takeShot",
       pre: F.and(
+        F.not(F.lit("useGoap")),
         F.lit("hasThreat"),
         F.ext("canSee", [], ["myPos", "threatPos"]),
         F.gt(N.fl("myAmmo"), N.c(0)),
         F.gt(N.fl("threatHp"), N.c(0)),
       ),
       verify: F.ext("canSee", [], ["myPos", "threatPos"]),
-      eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.c(SHOT_DAMAGE), "planOnly")],
-      cost: 1,
+      // planning reasons over the EXPECTED damage of a shot from where I am: closer +
+      // a target not in cover ⇒ more damage per shot, so the planner values closing in
+      // and denying the target its cover (execution rolls the seeded RNG around this).
+      eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.ext("shotDamage", [], ["myPos", "threatPos"]), "planOnly")],
+      // firing from an exposed position is COSTLY (every enemy with a clear shot on you
+      // costs W_EXPOSE), so the planner prefers to reach cover before it opens up —
+      // and weighs that against the travel it would take. This is the lever that makes
+      // "fight from cover" emerge instead of trading shots in the open.
+      cost: N.add(N.c(1), N.mul(N.ext("myExposure", [], ["myPos", "foePos", "foeAlive"]), N.c(W_EXPOSE))),
       duration: SHOT_TIME,
       executor: "shoot",
     },
     {
-      // suppressing fire: pins the target so a flanker can move (chips little HP)
+      // ENGAGE FROM HERE — the macro the kill-search reasons over. It stands for
+      // "fight the threat from this position to the finish": its planning COST is the
+      // whole engagement (shots-to-kill × the per-shot exposure of THIS spot), so the
+      // search compares "engage from the open" against "move to cover, then engage"
+      // over the full firefight, not one beat — which is what makes fighting from cover
+      // (and closing for accuracy) win. Search stays shallow (it's one op per position),
+      // while execution fires a burst and hands control back so the unit re-reads the
+      // room between magazines. The planOnly effect optimistically projects the kill so
+      // a single engageFrom satisfies the goal during search.
+      name: "engageFrom",
+      // survivesEngage gates out a firefight I lose: I must expect to outlast the threat
+      // (mine + allied guns shorten the kill; the foes' fire bleeds me) with a caution-
+      // scaled buffer to spare. This is what turns "2v1 alone → I'd die" into a pruned
+      // option (→ break contact) while "2v1 with a squadmate → we win" stays open.
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("threatHp"), N.c(0)), F.ext("survivesEngage", [], ENGAGE_SURV_READS)),
+      verify: F.and(F.ext("canSee", [], ["myPos", "threatPos"]), F.ext("survivesEngage", [], ENGAGE_SURV_READS)),
+      // project BOTH outcomes of the exchange: the threat dies, and I take the return
+      // fire I'd absorb over the kill — so myHp falls in the plan and later steps (and
+      // the survival gates) reason about a depleted me.
+      eff: [E.set("threatHp", [], N.c(0), "planOnly"), E.dec("myHp", [], N.ext("engageDmgHere", [], ENGAGE_SURV_READS), "planOnly")],
+      cost: N.ext("engageCost", [], ["myPos", "threatPos", "threatHp", "foePos", "foeAlive"]),
+      duration: N.ext("engageDur", [], ["myPos", "threatPos", "threatHp"]),
+      executor: "engage",
+    },
+    {
+      // suppressing fire: pins the target so a flanker can move (chips little HP).
+      // Excluded from the GOAP kill-search (not(useGoap)): it chips threatHp a little
+      // per shot, so as a path to "threatHp ≤ 0" it spawns deep chip-chains (threatHp ×
+      // ammo states spatialDedup can't fold) that explode the search. It's a coordinated
+      // team tactic (suppress-and-flank), not a solo finisher — engageFrom is the kill.
       name: "suppress",
-      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
+      pre: F.and(F.not(F.lit("useGoap")), F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.gt(N.fl("myAmmo"), N.c(0))),
       verify: F.ext("canSee", [], ["myPos", "threatPos"]),
       eff: [E.dec("myAmmo", [], N.c(1), "planOnly"), E.dec("threatHp", [], N.c(SUPPRESS_DAMAGE), "planOnly")],
-      cost: 1,
+      // suppressing is firing too — it exposes you, so the solo kill-search won't pick
+      // it over aimed shots; it earns its keep only in the coordinated suppress-and-flank
+      cost: N.add(N.c(1), N.mul(N.ext("myExposure", [], ["myPos", "foePos", "foeAlive"]), N.c(W_EXPOSE))),
       duration: 1.2,
       executor: "suppress",
     },
@@ -519,6 +945,24 @@ export const squadDomain: DomainDoc = {
       pre: F.and(F.lt(N.fl("myHp"), N.c(LOW_HP)), F.lit("coverRally", ["?r"]), F.not(F.lit("coverTaken", ["?r"]))),
       utility: N.sub(N.c(0), N.dist("myPos", [], "coverPos", ["?r"])),
       subtasks: [{ do: "retreatTo", args: ["?r"] }],
+    },
+    // 1b. UNWINNABLE fight → break contact. The survival model has found no firing
+    // position (here or reachable) where I outlast the threat — e.g. outnumbered and
+    // exposed with no cover that helps. Rather than trade and die, fall back to the
+    // safe spot perception picked. This is the emergent "2-on-1, I won't survive this —
+    // run" (and, conversely, it does NOT fire when squadmates' guns make the fight
+    // winnable, so an outnumbering unit pushes instead). Not during a breach assault.
+    {
+      name: "breakContact",
+      task: "Fight",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(
+        F.lit("mustRetreat"),
+        F.not(F.lit("tactic", [], "breach")),
+        F.ext("isRetreatSpot", ["?c"], ["retreatSpot"]),
+        F.not(F.lit("coverTaken", ["?c"])),
+      ),
+      subtasks: [{ do: "breakTo", args: ["?c"] }],
     },
     // 2. synchronized breach (E4) — stack up AND breach inside one deadline window.
     // The scoped deadline prunes any unit that can't reach the door in time *during
@@ -554,6 +998,16 @@ export const squadDomain: DomainDoc = {
         { do: "Neutralize" },
       ],
     },
+    // 4b. lost the threat fix but had contact recently → SWEEP toward where we last saw
+    // it to re-acquire, rather than idle and let it slip away. Survival-gated via
+    // pursueTo. This closes the "winner loses the fleeing loser" standoff.
+    {
+      name: "searchContact",
+      task: "Fight",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("searching"), F.not(F.lit("tactic", [], "breach")), F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      subtasks: [{ do: "pursueTo", args: ["?c"] }],
+    },
     // 5. no threat fix at all → stand by in short beats (reactively wakes on contact)
     {
       name: "idle",
@@ -582,28 +1036,75 @@ export const squadDomain: DomainDoc = {
     // --- Neutralize: reload if dry, fire if there's a line of sight, else
     // reposition to a cover that geometrically has one (the flank EMERGES from
     // method selection; short reactive plans, re-entered each beat).
+    // Neutralize ENACTS the spot-graph route computed in perception. That search is a
+    // bounded A*/Dijkstra over the discrete tactical-spot graph (≈two dozen nodes):
+    // edges are walkable hops costed by travel + the danger of crossing, and each node
+    // with a line of fire is a terminal costed by the whole engagement from there
+    // (shots-to-kill × the per-shot exposure of that spot). It returns the min-cost
+    // route to a killing position and we take its FIRST move — so the hop is chosen for
+    // the whole-route optimum (it will step through a so-so covered spot now precisely
+    // because that unlocks a much stronger angle next), which a greedy one-hop score
+    // can't do. Re-solved each beat, so it adapts as the fight moves. Two outcomes:
+    //   • engage from here (the route says this spot is already the best place), or
+    //   • move to the route's next hop, then re-decide.
+    // finishing shot: a target in your sights that's nearly dead (and that you can
+    // safely drop) gets engaged immediately — never reposition for a nicer angle and let
+    // a fleeing, near-dead enemy escape. Tried first, in both positioning modes.
     {
-      name: "reloadDry",
+      name: "finishOff",
       task: "Neutralize",
-      pre: F.and(F.lit("hasThreat"), F.lte(N.fl("myAmmo"), N.c(0))),
-      subtasks: [{ do: "reload" }, { do: "Neutralize" }],
+      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"]), F.lte(N.fl("threatHp"), N.c(FINISH_HP)), F.ext("survivesEngage", [], ENGAGE_SURV_READS)),
+      subtasks: [{ do: "engageFrom" }],
     },
     {
-      name: "fireNow",
+      name: "engageHere",
       task: "Neutralize",
-      pre: F.and(F.lit("hasThreat"), F.ext("canSee", [], ["myPos", "threatPos"])),
-      subtasks: [{ do: "takeShot" }],
+      pre: F.and(F.lit("hasThreat"), F.lit("engageHere"), F.ext("canSee", [], ["myPos", "threatPos"])),
+      subtasks: [{ do: "engageFrom" }],
     },
     {
-      name: "reposition",
+      name: "advanceRoute",
       task: "Neutralize",
       params: [{ name: "c", type: "cover" }],
-      pre: F.and(
-        F.lit("hasThreat"),
-        F.ext("coverSeesThreat", ["?c"], ["coverPos", "threatPos"]),
-        F.not(F.lit("coverTaken", ["?c"])),
-      ),
-      subtasks: [{ do: "advanceTo", args: ["?c"] }, { do: "takeShot" }],
+      pre: F.and(F.lit("hasThreat"), F.ext("isChosen", ["?c"], ["chosenSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      subtasks: [{ do: "moveToSpot", args: ["?c"] }],
+    },
+    // ALTERNATE engine (useGoap): let the generic planner DISCOVER the move+engage
+    // sequence itself, as a GOAP goal (threatHp ≤ 0). On its own this wanders — the
+    // goal is numeric so the symbolic heuristic is blind to geometry — so the planner
+    // is given a domain potential-field heuristic (customHeuristic) that estimates the
+    // remaining cost to reach a firing position. THAT is what makes the search
+    // goal-directed and fast. Selectable so it can be compared against the spot-graph
+    // route; both produce fight-from-cover behaviour.
+    {
+      name: "neutralizeGoap",
+      task: "Neutralize",
+      pre: F.and(F.lit("useGoap"), F.lit("hasThreat")),
+      subtasks: [{ achieve: F.lte(N.fl("threatHp"), N.c(0)) }],
+    },
+    // PURSUE: we have a position on the threat but no shot from anywhere reachable
+    // (it's behind cover or just ran) — so close on it to re-establish a line of fire
+    // rather than hold and lose it. Survival-gated (won't chase into a kill lane), and
+    // only when not already breaking contact, so a winning unit hunts a fleeing one
+    // down. This is what turns a cautious standoff into a resolution.
+    {
+      name: "pursue",
+      task: "Neutralize",
+      params: [{ name: "c", type: "cover" }],
+      pre: F.and(F.lit("hasThreat"), F.not(F.lit("mustRetreat")), F.ext("isAdvanceSpot", ["?c"], ["advanceSpot"]), F.not(F.lit("coverTaken", ["?c"]))),
+      subtasks: [{ do: "pursueTo", args: ["?c"] }],
+    },
+    // fallback: there's a threat but no actionable route right now (e.g. a defender
+    // behind a closed door — you can't yet walk to any angle on them). Hold ready in
+    // short beats rather than fail; a changed world (door breached, enemy steps out)
+    // re-solves the route and wakes it. This also lets methods that embed Neutralize
+    // (the breach assault) finish planning — the kill happens reactively once a line
+    // of fire opens up.
+    {
+      name: "holdEngage",
+      task: "Neutralize",
+      pre: F.lit("hasThreat"),
+      subtasks: [{ hold: 0.4 }],
     },
     // player order: fall back to a rally point (HTN — a direct decomposition, no
     // goal search; the `setGoals` seam routes "regroup" here)
@@ -620,11 +1121,174 @@ export const squadDomain: DomainDoc = {
   ],
 };
 
+// ---------------------------------------------------------------- tactical belief reads
+
+/** The believed positions of every hostile this unit currently thinks is alive —
+ *  read from belief (not ground truth), so reasoning is honest about what it knows. */
+function believedFoes(q: ExtQuery, foes: string[]): { x: number; z: number }[] {
+  const out: { x: number; z: number }[] = [];
+  for (const f of foes) {
+    if (q.get("foeAlive", f) < 0.5) continue;
+    const p = q.vec("foePos", f);
+    out.push({ x: p[0], z: p[1] });
+  }
+  return out;
+}
+
+/** The believed positions of this unit's living squadmates (shared comms). */
+function believedAllies(q: ExtQuery, allies: string[]): { x: number; z: number }[] {
+  const out: { x: number; z: number }[] = [];
+  for (const a of allies) {
+    if (q.get("allyAlive", a) < 0.5) continue;
+    const p = q.vec("allyPos", a);
+    out.push({ x: p[0], z: p[1] });
+  }
+  return out;
+}
+
+/** HP I expect to lose fighting the threat from (sx,sz): the incoming fire I take there
+ *  × how long the kill takes (my + allied guns combined). Projected onto myHp so the
+ *  planner sees its health fall across a plan. */
+function engageAttrition(world: SquadWorld, sx: number, sz: number, threat: number[], threatHp: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[]): number {
+  const killDps = world.firepowerOnto(threat[0], threat[1], [{ x: sx, z: sz }, ...allies]);
+  if (killDps <= 0) return Infinity; // can't hurt it from here at all
+  return world.incomingDpsVsSquad(sx, sz, foes, allies) * (threatHp / killDps);
+}
+
+/** Do I WIN the exchange from (sx,sz)? A race between two clocks: time for us (my gun +
+ *  allied guns on the threat) to drop it, vs time for the foes shooting me to drop me
+ *  (from `hp`). I'm safe if I'd outlast them — by a caution-scaled margin, so a fair
+ *  1v1 is allowed but an outgunned/hurt unit demands a clear win. More friendly guns
+ *  shorten MY kill clock (push); more enemy guns on me shorten THEIRS (flee). */
+function winsExchange(world: SquadWorld, sx: number, sz: number, threat: number[], threatHp: number, hp: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[], caution: number): boolean {
+  const killDps = world.firepowerOnto(threat[0], threat[1], [{ x: sx, z: sz }, ...allies]);
+  if (killDps <= 0) return false; // can't even hurt it from here
+  const incoming = world.incomingDpsVsSquad(sx, sz, foes, allies);
+  if (incoming <= 0) return true; // they can't shoot me here — free kill
+  const timeToKillThem = threatHp / killDps;
+  const timeToKillMe = hp / incoming;
+  return timeToKillMe >= timeToKillThem * caution; // outlast them (with margin)
+}
+
+/** Expected HP lost crossing from (mx,mz) to (cx,cz) — incoming fire sampled along the
+ *  straight leg × travel time. What makes "I'd die on the way there" representable. */
+function crossAttrition(world: SquadWorld, mx: number, mz: number, cx: number, cz: number, foes: { x: number; z: number }[], allies: { x: number; z: number }[]): number {
+  const moveTime = dist2(mx, mz, cx, cz) / MOVE_SPEED;
+  let dps = 0;
+  for (const k of [0.2, 0.4, 0.6, 0.8]) dps += world.incomingDpsVsSquad(mx + (cx - mx) * k, mz + (cz - mz) * k, foes, allies);
+  return (dps / 4) * moveTime * CROSS_RISK;
+}
+
+/** Whether a position has a line of fire to the believed primary threat. */
+function spotHasLos(world: SquadWorld, x: number, z: number, t: number[]): boolean {
+  if (x === t[0] && z === t[1]) return false;
+  return world.losClear(x, z, t[0], t[1]) && dist2(x, z, t[0], t[1]) <= SIGHT_RANGE;
+}
+
+/** The risk/reward of standing at (sx,sz) to fight `threat`, with `foes` able to shoot
+ *  you — the SAME cost the planner's spot search optimises, exposed so the view can
+ *  paint the potential field. `cost` is the whole-engagement cost (shots-to-kill ×
+ *  per-shot exposure); `firing` is false when the spot has no line of fire (cost ∞). */
+export interface SpotEval {
+  firing: boolean;
+  exposure: number;
+  cost: number;
+}
+export function evaluateSpot(world: SquadWorld, sx: number, sz: number, threat: { x: number; z: number }, foes: { x: number; z: number }[], caution = 1): SpotEval {
+  const exposure = world.exposureAt(sx, sz, foes);
+  if (!spotHasLos(world, sx, sz, [threat.x, threat.z])) return { firing: false, exposure, cost: Infinity };
+  let hit = rangeFalloff(dist2(sx, sz, threat.x, threat.z));
+  if (world.inCoverVs(threat.x, threat.z, sx, sz)) hit *= COVER_HIT_MULT;
+  const shots = Math.max(1, Math.ceil(100 / (SHOT_DAMAGE * Math.max(0.12, hit))));
+  return { firing: true, exposure, cost: shots * (1 + caution * W_EXPOSE * exposure) };
+}
+
+/**
+ * Builds the DOMAIN potential-field heuristic for one unit's GOAP kill-search: an
+ * estimate of the remaining cost to neutralize the threat from a given state. For each
+ * firing position it sums travel (straight-line · W_MOVE ≤ the real walked path) and
+ * the engagement from there (shots-to-kill × per-shot exposure), and takes the min.
+ * Including exposure makes the field TIGHT, so A* heads straight to the cheapest
+ * covered angle instead of wandering over equal-looking firing spots — the spatial
+ * structure the symbolic relaxation is blind to.
+ *
+ * The field (which covers are firing positions, and the full engagement cost from
+ * each) depends ONLY on the threat (position + HP), caution, and foe positions — all
+ * constant within a search and slow-changing between ticks. So we MEMOIZE it by that
+ * signature and rebuild only when the situation changes; the per-node work then
+ * collapses to a cheap distance to each precomputed firing spot (plus one line-of-fire
+ * check for the current position). That is what keeps the generic search's per-node
+ * cost on par with the bespoke route's single Dijkstra. Deterministic.
+ */
+function makeEngageHeuristic(world: SquadWorld, model: Model, foeNames: string[]): (s: Snap) => number {
+  const hasThreatSlot = model.slotOf("hasThreat");
+  const hpSlot = model.slotOf("threatHp");
+  const mypSlot = model.slotOf("myPos");
+  const tpSlot = model.slotOf("threatPos");
+  const cautionSlot = model.slotOf("caution");
+  const foeSlots = foeNames.map((f) => ({ alive: model.slotOf("foeAlive", model.entityId(f)), pos: model.slotOf("foePos", model.entityId(f)) }));
+  // cached field for the current situation
+  let sig = "";
+  let field: { x: number; z: number; engage: number }[] = [];
+  let tx = 0;
+  let tz = 0;
+  let hp = 0;
+  let caution = 0;
+  let foes: { x: number; z: number }[] = [];
+  const engageCostAt = (x: number, z: number): number => {
+    let hit = rangeFalloff(dist2(x, z, tx, tz));
+    if (world.inCoverVs(tx, tz, x, z)) hit *= COVER_HIT_MULT;
+    const shots = Math.max(1, Math.ceil(hp / (SHOT_DAMAGE * Math.max(0.12, hit))));
+    return shots * (1 + caution * W_EXPOSE * world.exposureAt(x, z, foes));
+  };
+  return (s: Snap): number => {
+    if (s.get(hasThreatSlot) < 0.5) return 0;
+    const curHp = s.get(hpSlot);
+    if (curHp <= 0) return 0;
+    const ctx = s.get(tpSlot);
+    const ctz = s.get(tpSlot + 1);
+    const ccaution = s.get(cautionSlot);
+    let nsig = `${ctx},${ctz},${curHp},${ccaution}`;
+    const cfoes: { x: number; z: number }[] = [];
+    for (const fs of foeSlots) {
+      if (s.get(fs.alive) < 0.5) continue;
+      const fx = s.get(fs.pos);
+      const fz = s.get(fs.pos + 1);
+      cfoes.push({ x: fx, z: fz });
+      nsig += `;${fx.toFixed(2)},${fz.toFixed(2)}`;
+    }
+    if (nsig !== sig) {
+      // situation changed — rebuild the field once, then reuse it for every node
+      sig = nsig;
+      tx = ctx;
+      tz = ctz;
+      hp = curHp;
+      caution = ccaution;
+      foes = cfoes;
+      field = [];
+      const t = [tx, tz];
+      for (const c of world.covers) if (spotHasLos(world, c.x, c.z, t)) field.push({ x: c.x, z: c.z, engage: engageCostAt(c.x, c.z) });
+    }
+    const mx = s.get(mypSlot);
+    const mz = s.get(mypSlot + 1);
+    let best = spotHasLos(world, mx, mz, [tx, tz]) ? engageCostAt(mx, mz) : Infinity; // engage from here
+    for (const f of field) {
+      const c = W_MOVE * dist2(mx, mz, f.x, f.z) + f.engage;
+      if (c < best) best = c;
+    }
+    return best === Infinity ? 1e6 : best;
+  };
+}
+
 // ---------------------------------------------------------------- registry / model per unit
 
 function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): Model {
   const entities: Record<string, string> = {};
   for (const c of inst.covers) entities[c.name] = "cover";
+  const foes = world.foeNamesFor(self);
+  for (const f of foes) entities[f] = "foe";
+  const allies = world.allyNamesFor(self);
+  for (const a of allies) entities[a] = "ally";
   return createModel(
     squadDomain,
     {
@@ -663,14 +1327,108 @@ function buildUnitModel(self: string, world: SquadWorld, inst: SquadInstance): M
           if (c[0] === t[0] && c[1] === t[1]) return false;
           return world.losClear(c[0], c[1], t[0], t[1]) && dist2(c[0], c[1], t[0], t[1]) <= SIGHT_RANGE;
         },
+        // Is `c` the next hop the spot-graph route chose this beat? (entities encode as
+        // gid+1; chosenSpot holds that, 0 = none.) Lets the planner bind the route's
+        // chosen spot as the move target while staying a normal precondition.
+        isChosen: (q) => Math.round(q.get("chosenSpot")) === q.args[0] + 1,
+        isRetreatSpot: (q) => Math.round(q.get("retreatSpot")) === q.args[0] + 1,
+        isAdvanceSpot: (q) => Math.round(q.get("advanceSpot")) === q.args[0] + 1,
+        // --- survival gates (the attrition model in the planner) ---
+        // Will I still be standing after fighting the threat from where I am? Required on
+        // engageFrom, so the planner never commits to a firefight it loses. caution
+        // scales the buffer — an outgunned/hurt unit insists on more HP to spare.
+        survivesEngage: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          if (!spotHasLos(world, m[0], m[1], t)) return false;
+          return winsExchange(world, m[0], m[1], t, q.get("threatHp"), q.get("myHp"), believedFoes(q, foes), believedAllies(q, allies), q.get("caution"));
+        },
+        // Will I survive the DASH to spot `c`? Required on a reposition, so the planner
+        // won't route me across a lane that kills me before I arrive.
+        survivesMove: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          const dmg = crossAttrition(world, m[0], m[1], c[0], c[1], believedFoes(q, foes), believedAllies(q, allies));
+          return q.get("myHp") - dmg > SAFETY_MARGIN * q.get("caution");
+        },
       },
       numerics: {
         coverX: (q) => q.vec("coverPos", q.args[0])[0],
         coverZ: (q) => q.vec("coverPos", q.args[0])[1],
+        // HP I expect to lose fighting the threat from where I am — projected onto myHp
+        // by engageFrom, so the planner SEES its health fall and reasons about survival.
+        engageDmgHere: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          const d = engageAttrition(world, m[0], m[1], t, q.get("threatHp"), believedFoes(q, foes), believedAllies(q, allies));
+          return Number.isFinite(d) ? d : 0;
+        },
+        // HP I expect to lose dashing to spot `c` — projected onto myHp by the move op.
+        crossDmgTo: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          return crossAttrition(world, m[0], m[1], c[0], c[1], believedFoes(q, foes), believedAllies(q, allies));
+        },
+        // expected damage of a shot from myPos at the believed threat — range falloff
+        // plus the target's cover relative to me. Drives "close in / break their cover".
+        shotDamage: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          let p = rangeFalloff(dist2(m[0], m[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
+          return SHOT_DAMAGE * Math.max(0.12, p);
+        },
+        // --- tactical costs (used by operator costs + the spot-graph route) ---
+        // how exposed I am RIGHT NOW — makes firing from the open costly in takeShot
+        myExposure: (q) => {
+          const m = q.vec("myPos");
+          return world.exposureAt(m[0], m[1], believedFoes(q, foes));
+        },
+        // danger of CROSSING to a spot (sampled along the straight approach) — this is
+        // what makes a staged route through cover beat a direct dash over open ground
+        pathExposure: (q) => {
+          const m = q.vec("myPos");
+          const c = q.vec("coverPos", q.args[0]);
+          const fb = believedFoes(q, foes);
+          let e = 0;
+          for (const t of [0.34, 0.67]) e += world.exposureAt(m[0] + (c[0] - m[0]) * t, m[1] + (c[1] - m[1]) * t, fb);
+          return e * 0.5;
+        },
+        // cost for a spot being beyond comfortable firing range of the threat
+        spotRange: (q) => {
+          const c = q.vec("coverPos", q.args[0]);
+          const t = q.vec("threatPos");
+          return Math.max(0, dist2(c[0], c[1], t[0], t[1]) - IDEAL_RANGE);
+        },
+        // the WHOLE-engagement cost of fighting the threat from my current position:
+        // shots-to-kill (range + the target's cover decide damage/shot) × the per-shot
+        // danger of standing here (1 + every enemy that can shoot me). This is the lever
+        // the kill-search optimises — exposed positions are dear over a full firefight.
+        engageCost: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          let p = rangeFalloff(dist2(m[0], m[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
+          const dmg = SHOT_DAMAGE * Math.max(0.12, p);
+          const shots = Math.max(1, Math.ceil(q.get("threatHp") / dmg));
+          const exposure = world.exposureAt(m[0], m[1], believedFoes(q, foes));
+          return shots * (1 + q.get("caution") * W_EXPOSE * exposure);
+        },
+        // projected duration of that engagement (shots-to-kill × aim time), so a scoped
+        // deadline or a racing flanker is reasoned about over the real firefight length
+        engageDur: (q) => {
+          const m = q.vec("myPos");
+          const t = q.vec("threatPos");
+          let p = rangeFalloff(dist2(m[0], m[1], t[0], t[1]));
+          if (world.inCoverVs(t[0], t[1], m[0], m[1])) p *= COVER_HIT_MULT;
+          const dmg = SHOT_DAMAGE * Math.max(0.12, p);
+          return Math.max(1, Math.ceil(q.get("threatHp") / dmg)) * SHOT_TIME;
+        },
       },
       executors: {
         move: moveExecutor(self, world),
         shoot: shootExecutor(self, world),
+        engage: engageExecutor(self, world),
         suppress: suppressExecutor(self, world),
         breach: breachExecutor(self, world),
         reload: reloadExecutor(self, world),
@@ -721,10 +1479,43 @@ function shootExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => T
     if (!target) return "failure"; // lost line of sight → repair
     if (api.elapsedInStep() < SHOT_TIME) return "continue"; // aiming
     a.ammo = Math.max(0, a.ammo - 1);
-    const dmg = SHOT_DAMAGE * (0.85 + 0.3 * api.rng.next());
-    target.hp = Math.max(0, target.hp - dmg);
-    if (target.hp <= 0) target.alive = false;
+    // roll the seeded RNG against the real hit chance (range + the target's cover):
+    // a covered or distant target is often missed, so position genuinely matters.
+    if (api.rng.next() < world.hitChance(a, target)) {
+      target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
+      if (target.hp <= 0) target.alive = false;
+    }
     return "success";
+  };
+}
+
+function engageExecutor(self: string, world: SquadWorld): (api: ExecutorApi) => TaskStatus {
+  return (api) => {
+    const a = world.actors.get(self);
+    if (!a || !a.alive) return "failure";
+    const target = world.nearestHostile(self, true);
+    if (!target) return "failure"; // lost the line of fire → repair / re-search a position
+    const mem = api.remember(() => ({ next: 0, reloadAt: -1 })) as { next: number; reloadAt: number };
+    const el = api.elapsedInStep();
+    // out of ammo → reload, then hand back so the unit re-reads the room with a fresh mag
+    if (a.ammo <= 0 && mem.reloadAt < 0) mem.reloadAt = el;
+    if (mem.reloadAt >= 0) {
+      if (el - mem.reloadAt < RELOAD_TIME) return "continue";
+      a.ammo = AMMO_MAX;
+      return "success";
+    }
+    if (el >= mem.next) {
+      a.ammo -= 1;
+      mem.next = el + SHOT_TIME;
+      if (api.rng.next() < world.hitChance(a, target)) {
+        target.hp = Math.max(0, target.hp - SHOT_DAMAGE);
+        if (target.hp <= 0) {
+          target.alive = false;
+          return "success"; // threat down — the goal is met
+        }
+      }
+    }
+    return "continue"; // keep firing this magazine
   };
 }
 
@@ -797,6 +1588,13 @@ function setBeliefVec(p: UnitPlanner, fluent: string, x: number, z: number): voi
   p.planner.state.set(slot + 1, z);
 }
 
+function setBeliefVecArgs(p: UnitPlanner, fluent: string, args: (string | number)[], x: number, z: number): void {
+  const gids = args.map((a) => (typeof a === "string" ? p.model.entityId(a) : a));
+  const slot = p.model.slotOf(fluent, ...gids);
+  p.planner.state.set(slot, x);
+  p.planner.state.set(slot + 1, z);
+}
+
 // ---------------------------------------------------------------- unit planner wrapper
 
 export interface UnitPlanner {
@@ -806,12 +1604,22 @@ export interface UnitPlanner {
   model: Model;
   planner: PlannerT;
   lastSeen: number;
+  /** the static set of this unit's possible foes (hostile actor names) */
+  foes: string[];
+  /** this unit's squadmates (same-side actor names) — for shared-comms ally belief */
+  allies: string[];
+  /** per-foe clock of the last time this unit had a clear line of sight to it */
+  foeLastSeen: Map<string, number>;
+  /** last believed contact (any foe seen/heard) + when — drives search-to-re-acquire */
+  lastContact?: { x: number; z: number; at: number };
   trace: TraceEvent[];
   /** most recent "why a branch was rejected" reasons (glass-box director, E3) */
   why: string[];
   /** the unit's current goal, in plain words + how the library expresses it */
   goalText: string;
   goalExpr: string;
+  /** this unit's positioning engine (resolved from SquadSimOptions.positioning) */
+  mode: "spotgraph" | "goap";
 }
 
 const DEFAULT_GOAL = { text: "Win the firefight — neutralize the enemy squad", expr: 'task("Fight")' };
@@ -852,6 +1660,14 @@ export interface UnitFrame {
   events: string[];
   /** most recent "why a branch was rejected" reasons (glass-box director) */
   why: string[];
+  /** plain-English read of the unit's current tactical posture (glass-box director):
+   *  whether it is in cover, how many enemies can shoot it, and its range to the threat */
+  posture: string;
+  /** the unit's BELIEVED primary threat position (null when it knows of no threat) —
+   *  what it scores spots against, for a belief-honest heatmap */
+  believedThreat: { x: number; z: number } | null;
+  /** the unit's BELIEVED positions of foes it thinks are alive */
+  believedFoes: { x: number; z: number }[];
 }
 
 export interface TeamFrame {
@@ -882,6 +1698,11 @@ export interface SquadSimOptions {
   nodes?: number;
   /** override the bark author (the LLM-rewrite seam, Phase D); defaults to `barkFor` */
   bark?: BarkAuthor;
+  /** positioning engine: "spotgraph" (bespoke route search, default) or "goap" (the
+   *  generic planner search over move+engage, guided by a domain potential-field
+   *  heuristic). A `(side) => mode` function selects per side, so the two engines can
+   *  be pitted head-to-head. Exposed to compare the two approaches. */
+  positioning?: "spotgraph" | "goap" | ((side: Side) => "spotgraph" | "goap");
 }
 
 /**
@@ -897,6 +1718,13 @@ export class SquadSim {
   private readonly dt: number;
   private readonly nodes: number;
   private readonly barkAuthor: BarkAuthor;
+  /** positioning engine ("mixed" when chosen per-side) — see SquadSimOptions.positioning */
+  public readonly positioning: "spotgraph" | "goap" | "mixed";
+  /** the invisible tactical standing positions the planner chooses among (grid + cover
+   *  edges) — the discrete candidate set the spot search/route scores each beat. The
+   *  view renders these so you can watch which the planner considers and picks. */
+  public readonly spots: { name: string; x: number; z: number }[];
+  private readonly modeOf: (side: Side) => "spotgraph" | "goap";
   private playerLeg = 0;
   private playerLegT = 0;
 
@@ -905,12 +1733,20 @@ export class SquadSim {
     this.dt = opts.dt ?? 0.1;
     this.nodes = opts.nodes ?? 60_000;
     this.barkAuthor = opts.bark ?? barkFor;
-    this.world = new SquadWorld(inst);
+    const pos = opts.positioning ?? "spotgraph";
+    this.modeOf = typeof pos === "function" ? pos : () => pos;
+    this.positioning = typeof pos === "function" ? "mixed" : pos;
+    // augment the map with invisible tactical standing positions (grid + cover edges)
+    // the planner can reposition to — fluid movement, not a handful of waypoints
+    const tacticalSpots = generateTacticalSpots(inst);
+    this.spots = tacticalSpots.map((c) => ({ name: c.name, x: c.x, z: c.z }));
+    const augmented: SquadInstance = { ...inst, covers: [...inst.covers, ...tacticalSpots] };
+    this.world = new SquadWorld(augmented);
     if (inst.breach) this.world.team("enemy").tactic = "breach"; // the attacking team breaches
     let seedBump = 0;
     for (const u of inst.units) {
       if (u.side === "player") continue;
-      const model = buildUnitModel(u.name, this.world, inst);
+      const model = buildUnitModel(u.name, this.world, augmented);
       const trace: TraceEvent[] = [];
       const entry: UnitPlanner = {
         name: u.name,
@@ -919,17 +1755,32 @@ export class SquadSim {
         model,
         planner: undefined as unknown as PlannerT,
         lastSeen: -Infinity,
+        foes: this.world.foeNamesFor(u.name),
+        allies: this.world.allyNamesFor(u.name),
+        foeLastSeen: new Map(),
         trace,
         why: [],
         goalText: DEFAULT_GOAL.text,
         goalExpr: DEFAULT_GOAL.expr,
+        mode: this.modeOf(u.side),
       };
+      const goap = entry.mode === "goap";
       entry.planner = new Planner(model, {
         goals: [{ kind: "task", name: "Fight" }],
         now: () => this.world.clock,
         seed: (opts.seed ?? 1) + seedBump++,
-        weight: 1.6,
+        // GOAP mode runs greedier (higher weight) with a tight node cap so the generic
+        // search satisfices fast; if it ever hits the cap, holdEngage covers the beat.
+        weight: goap ? 2.6 : 1.6,
+        maxNodes: goap ? 4000 : undefined,
         collectRejections: true,
+        // GOAP mode: feed the generic search the spatial potential-field heuristic so
+        // it stays goal-directed instead of wandering over the fine move space.
+        customHeuristic: goap ? makeEngageHeuristic(this.world, model, entry.foes) : undefined,
+        // the kill goal is time-independent (no deadline), so collapse positions that
+        // differ only in elapsed clock — turns the move search from combinatorial into
+        // ~a Dijkstra over positions.
+        spatialDedup: goap,
         trace: (e) => {
           trace.push(e);
           this.trace.push({ unit: entry.name, e });
@@ -963,12 +1814,241 @@ export class SquadSim {
       setBelief(p, "threatHp", [], heard.hp);
     }
     setBelief(p, "hasThreat", [], !!heard);
+    // per-foe belief: track every known hostile individually (drives exposure/cover).
+    // LOS now → write truth; recently lost → keep last fix but mark unseen; long lost
+    // → drop it (you stop dodging someone you've lost track of).
+    for (const fname of p.foes) {
+      const fa = this.world.actors.get(fname);
+      if (!fa) continue;
+      const los = fa.alive && dist2(a.x, a.z, fa.x, fa.z) <= SIGHT_RANGE && this.world.losClear(a.x, a.z, fa.x, fa.z);
+      if (los) {
+        p.foeLastSeen.set(fname, this.world.clock);
+        setBeliefVecArgs(p, "foePos", [fname], fa.x, fa.z);
+        setBelief(p, "foeAlive", [fname], fa.alive);
+        setBelief(p, "foeSeen", [fname], true);
+      } else {
+        setBelief(p, "foeSeen", [fname], false);
+        const lost = this.world.clock - (p.foeLastSeen.get(fname) ?? -Infinity);
+        if (!fa.alive || lost > MEMORY_SECONDS) setBelief(p, "foeAlive", [fname], false);
+      }
+    }
+    // squadmates: shared comms — a unit knows where its living teammates are, which is
+    // what lets the attrition model count friendly guns on the threat (push vs flee).
+    for (const aname of p.allies) {
+      const aa = this.world.actors.get(aname);
+      if (!aa) continue;
+      setBelief(p, "allyAlive", [aname], aa.alive);
+      if (aa.alive) setBeliefVecArgs(p, "allyPos", [aname], aa.x, aa.z);
+    }
     setBelief(p, "myCover", [], a.cover ?? false); // reconcile claimed cover (for the regroup goal)
     for (const c of this.world.covers) {
       const owner = this.world.coverOwner.get(c.name) ?? null;
       setBelief(p, "coverTaken", [c.name], owner !== null && owner !== p.name);
     }
     setBelief(p, "flankerReady", [], this.world.team(p.side).flankerReady);
+    setBelief(p, "useGoap", [], p.mode === "goap");
+    if (p.mode === "goap") {
+      // GOAP mode: the planner's own search (guided by the heuristic) decides — clear
+      // the spot-graph route beliefs so its methods stay inactive.
+      setBelief(p, "engageHere", [], false);
+      setBelief(p, "chosenSpot", [], false);
+    } else {
+      // the DEEP decision: solve the spot-graph route from belief and write the result
+      // the planner enacts this beat (engage from here, or the next hop toward the
+      // optimal killing position).
+      const route = this.computeEngageRoute(p);
+      setBelief(p, "engageHere", [], route.engageHere);
+      setBelief(p, "chosenSpot", [], route.nextSpot ?? false);
+    }
+    // the attrition read: is this fight unwinnable from anywhere, and where to run to
+    setBelief(p, "mustRetreat", [], this.computeMustRetreat(p));
+    setBelief(p, "retreatSpot", [], this.computeRetreatSpot(p) ?? false);
+    // pursuit / search: remember the last place we had contact; if we've since lost the
+    // threat fix entirely, sweep toward it to re-acquire (so a winner runs down a fleeing
+    // enemy instead of idling once it slips out of sight).
+    const fix = heard ?? null;
+    if (fix) p.lastContact = { x: fix.x, z: fix.z, at: this.world.clock };
+    const hasThreatNow = !!fix;
+    const searching = !hasThreatNow && !!p.lastContact && this.world.clock - p.lastContact.at < SEARCH_SECONDS;
+    setBelief(p, "searching", [], searching);
+    const target = hasThreatNow ? { x: heard!.x, z: heard!.z } : searching ? p.lastContact! : null;
+    setBelief(p, "advanceSpot", [], (target ? this.computeAdvanceSpot(p, target) : null) ?? false);
+  }
+
+  /** The cover that best closes on the believed threat (strictly nearer it than the
+   *  unit is now) — the next bound of a pursuit. Returns null when already as close as
+   *  the covers allow. pursueTo's survival gate decides whether the push is safe. */
+  private computeAdvanceSpot(p: UnitPlanner, target: { x: number; z: number }): string | null {
+    const me = this.world.actors.get(p.name);
+    if (!me) return null;
+    let best: string | null = null;
+    let bestD = dist2(me.x, me.z, target.x, target.z) - 1; // must be at least ~1 unit closer than here
+    for (const c of this.world.covers) {
+      const owner = this.world.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue;
+      const d = dist2(c.x, c.z, target.x, target.z);
+      if (d < bestD) { bestD = d; best = c.name; }
+    }
+    return best;
+  }
+
+  /** The safest cover this unit can fall back to — minimizes fire taken THERE plus fire
+   *  taken getting there. The destination for break-contact when no fight is survivable. */
+  private computeRetreatSpot(p: UnitPlanner): string | null {
+    const me = this.world.actors.get(p.name);
+    if (!me) return null;
+    const foes = this.believedFoePositions(p);
+    if (foes.length === 0) return null;
+    const allies = this.believedAllyPositions(p);
+    let best: string | null = null;
+    let bestScore = Infinity;
+    for (const c of this.world.covers) {
+      const owner = this.world.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue;
+      const score = this.world.incomingDpsVsSquad(c.x, c.z, foes, allies) * 3 + crossAttrition(this.world, me.x, me.z, c.x, c.z, foes, allies);
+      if (score < bestScore) { bestScore = score; best = c.name; }
+    }
+    return best;
+  }
+
+  /** Believed positions of every hostile this unit currently thinks is alive (belief,
+   *  not ground truth) — the foes the route reasons about for exposure/cover. */
+  private believedFoePositions(p: UnitPlanner): { x: number; z: number }[] {
+    const out: { x: number; z: number }[] = [];
+    for (const f of p.foes) {
+      const fid = p.model.entityId(f);
+      if (p.planner.state.get(p.model.slotOf("foeAlive", fid)) < 0.5) continue;
+      const ps = p.model.slotOf("foePos", fid);
+      out.push({ x: p.planner.state.get(ps), z: p.planner.state.get(ps + 1) });
+    }
+    return out;
+  }
+
+  /** Believed positions of living squadmates (shared comms) — the friendly guns the
+   *  attrition model counts on the shared threat. */
+  private believedAllyPositions(p: UnitPlanner): { x: number; z: number }[] {
+    const out: { x: number; z: number }[] = [];
+    for (const a of p.allies) {
+      const aid = p.model.entityId(a);
+      if (p.planner.state.get(p.model.slotOf("allyAlive", aid)) < 0.5) continue;
+      const ps = p.model.slotOf("allyPos", aid);
+      out.push({ x: p.planner.state.get(ps), z: p.planner.state.get(ps + 1) });
+    }
+    return out;
+  }
+
+  /** Is the fight unwinnable from anywhere reachable? Runs the attrition race (the same
+   *  winsExchange the operator gates use) over the current spot + every free cover: if
+   *  NO spot lets this unit both survive the dash and outlast the threat, it must break
+   *  contact. This is the emergent "2-on-1, I won't make it — run" read; friendly guns
+   *  (allies) shorten the kill and flip it back to "we can take them, push". */
+  private computeMustRetreat(p: UnitPlanner): boolean {
+    const me = this.world.actors.get(p.name);
+    const st = p.planner.state;
+    const m = p.model;
+    if (!me || st.get(m.slotOf("hasThreat")) < 0.5) return false;
+    const tp = m.slotOf("threatPos");
+    const threat = [st.get(tp), st.get(tp + 1)];
+    const tHp = st.get(m.slotOf("threatHp"));
+    const hp = st.get(m.slotOf("myHp"));
+    const caution = st.get(m.slotOf("caution"));
+    const fb = this.believedFoePositions(p);
+    const ab = this.believedAllyPositions(p);
+    const margin = SAFETY_MARGIN * caution;
+    const ok = (sx: number, sz: number, cross: number): boolean =>
+      spotHasLos(this.world, sx, sz, threat) && hp - cross > margin && winsExchange(this.world, sx, sz, threat, tHp, hp - cross, fb, ab, caution);
+    if (ok(me.x, me.z, 0)) return false; // can win from here
+    for (const c of this.world.covers) {
+      const owner = this.world.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue;
+      if (ok(c.x, c.z, crossAttrition(this.world, me.x, me.z, c.x, c.z, fb, ab))) return false; // a winnable spot is reachable
+    }
+    return true; // nothing survivable → break contact
+  }
+
+  /**
+   * The spot-graph search — the genuinely deep, emergent positioning. Over the
+   * discrete graph of tactical positions (current spot + every cover/edge/grid spot
+   * not reserved by someone else), a Dijkstra finds the minimum-cost route to a
+   * KILLING position, where:
+   *   • a hop i→j costs travel (W_MOVE·dist) + the danger of crossing it
+   *     (W_PATH_EXPOSE · exposure sampled along the straight, walkable leg), and
+   *   • each node with a line of fire is a terminal costing the whole engagement from
+   *     there: shots-to-kill × (1 + caution·W_EXPOSE·exposure) — cover and range fold
+   *     in via shots-to-kill and exposure.
+   * It returns the FIRST hop of the optimal route (or "engage here" when staying put
+   * is the cheapest terminal). Because the whole route is costed, it will deliberately
+   * stage through a weaker covered spot when that unlocks a far better angle — the
+   * multi-step, non-greedy behaviour a one-hop score misses. Bounded (~two dozen
+   * nodes) so it is fast and deterministic, re-solved every beat.
+   */
+  private computeEngageRoute(p: UnitPlanner): { engageHere: boolean; nextSpot: string | null } {
+    const me = this.world.actors.get(p.name);
+    const st = p.planner.state;
+    const none = { engageHere: false, nextSpot: null };
+    if (!me || st.get(p.model.slotOf("hasThreat")) < 0.5) return none;
+    const tp = p.model.slotOf("threatPos");
+    const threat = { x: st.get(tp), z: st.get(tp + 1) };
+    const threatHp = st.get(p.model.slotOf("threatHp"));
+    const caution = st.get(p.model.slotOf("caution"));
+    const foes = this.believedFoePositions(p);
+    const w = this.world;
+
+    // nodes: my current position (index 0) + every available cover/spot
+    const nodes: { x: number; z: number; name: string | null }[] = [{ x: me.x, z: me.z, name: null }];
+    for (const c of w.covers) {
+      const owner = w.coverOwner.get(c.name);
+      if (owner && owner !== p.name) continue; // someone else holds it — not a candidate
+      nodes.push({ x: c.x, z: c.z, name: c.name });
+    }
+    const n = nodes.length;
+    const crossExposure = (a: { x: number; z: number }, b: { x: number; z: number }): number => {
+      let e = 0;
+      for (const k of [0.34, 0.67]) e += w.exposureAt(a.x + (b.x - a.x) * k, a.z + (b.z - a.z) * k, foes);
+      return e * 0.5;
+    };
+    // Dijkstra over straight walkable hops (the move executor pathfinds within a hop;
+    // routes around walls emerge by stepping through corner/edge spots)
+    const dist = new Array<number>(n).fill(Infinity);
+    const prev = new Array<number>(n).fill(-1);
+    const done = new Array<boolean>(n).fill(false);
+    dist[0] = 0;
+    for (let it = 0; it < n; it++) {
+      let u = -1;
+      let best = Infinity;
+      for (let k = 0; k < n; k++) if (!done[k] && dist[k] < best) { best = dist[k]; u = k; }
+      if (u < 0) break;
+      done[u] = true;
+      for (let v = 0; v < n; v++) {
+        if (v === u || done[v]) continue;
+        if (!w.losClear(nodes[u].x, nodes[u].z, nodes[v].x, nodes[v].z)) continue; // not a straight walkable hop
+        const step = W_MOVE * dist2(nodes[u].x, nodes[u].z, nodes[v].x, nodes[v].z) + W_PATH_EXPOSE * crossExposure(nodes[u], nodes[v]);
+        if (dist[u] + step < dist[v]) { dist[v] = dist[u] + step; prev[v] = u; }
+      }
+    }
+    // pick the cheapest KILLING terminal: route cost to a node with a line of fire +
+    // the whole-engagement cost from it
+    const engageCostAt = (node: { x: number; z: number }): number => {
+      let hit = rangeFalloff(dist2(node.x, node.z, threat.x, threat.z));
+      if (w.inCoverVs(threat.x, threat.z, node.x, node.z)) hit *= COVER_HIT_MULT;
+      const dmg = SHOT_DAMAGE * Math.max(0.12, hit);
+      const shots = Math.max(1, Math.ceil(threatHp / dmg));
+      return shots * (1 + caution * W_EXPOSE * w.exposureAt(node.x, node.z, foes));
+    };
+    let bestNode = -1;
+    let bestTotal = Infinity;
+    for (let i = 0; i < n; i++) {
+      if (dist[i] === Infinity) continue;
+      if (!spotHasLos(w, nodes[i].x, nodes[i].z, [threat.x, threat.z])) continue; // not a firing position
+      const total = dist[i] + engageCostAt(nodes[i]);
+      if (total < bestTotal) { bestTotal = total; bestNode = i; }
+    }
+    if (bestNode < 0) return none; // no reachable line of fire (boxed in) → hold
+    if (bestNode === 0) return { engageHere: true, nextSpot: null }; // here IS the best place
+    // walk the route back to the first hop out of the current node
+    let cur = bestNode;
+    while (prev[cur] !== 0 && prev[cur] !== -1) cur = prev[cur];
+    return { engageHere: false, nextSpot: nodes[cur].name };
   }
 
   /** a fallen unit releases its cover reservation (so the slot frees up). */
@@ -1033,6 +2113,14 @@ export class SquadSim {
       for (const u of members) {
         setBelief(u, "role", [], u.role);
         setBelief(u, "tactic", [], tb.tactic === "breach" ? "breach" : tb.tactic === "flank" ? "flank" : "hold");
+        // caution: value safety more when locally outgunned (this unit sees more foes
+        // than it has friends in the fight) or hurt — so it leans to cover / breaking
+        // contact rather than trading shots. This is the "outnumbered ⇒ go to ground".
+        const me = this.world.actors.get(u.name);
+        const seenFoes = me ? this.world.hostilesOf(u.side).filter((h) => dist2(me.x, me.z, h.x, h.z) <= SIGHT_RANGE && this.world.losClear(me.x, me.z, h.x, h.z)).length : 0;
+        const outgunned = seenFoes > members.length;
+        const hurt = (me?.hp ?? 100) < LOW_HP;
+        setBelief(u, "caution", [], 1 + (outgunned ? 0.9 : 0) + (hurt ? 0.7 : 0));
       }
     }
   }
@@ -1114,11 +2202,21 @@ export class SquadSim {
         let firingAt: string | null = null;
         let firingKind: UnitFrame["firingKind"] = null;
         let sees: string | null = null;
+        // the unit's BELIEF of where the enemy is — what it actually scores spots
+        // against (vs ground truth), captured so the view can paint a belief-honest field
+        let believedThreat: { x: number; z: number } | null = null;
+        let believedFoes: { x: number; z: number }[] = [];
         if (up && a.alive) {
           sees = this.world.nearestHostile(a.name, true)?.name ?? null;
-          if (stepLabel.startsWith("takeShot")) { firingKind = "shot"; firingAt = sees; }
+          if (stepLabel.startsWith("takeShot") || stepLabel.startsWith("engageFrom")) { firingKind = "shot"; firingAt = sees; }
           else if (stepLabel.startsWith("suppress")) { firingKind = "suppress"; firingAt = sees; }
           else if (stepLabel.startsWith("breach")) { firingKind = "breach"; firingAt = this.world.nearestHostile(a.name, false)?.name ?? null; }
+          const st = up.planner.state;
+          if (st.get(up.model.slotOf("hasThreat")) > 0.5) {
+            const tp = up.model.slotOf("threatPos");
+            believedThreat = { x: round(st.get(tp)), z: round(st.get(tp + 1)) };
+          }
+          believedFoes = this.believedFoePositions(up).map((f) => ({ x: round(f.x), z: round(f.z) }));
         }
         return {
           name: a.name,
@@ -1145,9 +2243,25 @@ export class SquadSim {
           plan: up && plan ? planSummary(up.model, plan) : [],
           events: up ? up.trace.slice(-6).map((e) => e.t) : [],
           why: up ? up.why : [],
+          posture: up && a.alive ? this.describePosture(a) : "—",
+          believedThreat,
+          believedFoes,
         };
       }),
     };
+  }
+
+  /** A plain-English read of a unit's tactical posture for the glass-box director:
+   *  in cover or open, how many enemies can actually shoot it, and its range. */
+  private describePosture(a: Actor): string {
+    const foes = this.world.hostilesOf(a.side).map((h) => ({ x: h.x, z: h.z }));
+    const exposed = this.world.exposureAt(a.x, a.z, foes);
+    const covered = this.world.coverCountAt(a.x, a.z, foes);
+    const nearest = this.world.nearestHostile(a.name, false);
+    const range = nearest ? Math.round(dist2(a.x, a.z, nearest.x, nearest.z)) : null;
+    const head = covered > 0 ? `in cover vs ${covered}` : exposed > 0 ? "in the open" : "no line of fire";
+    const exp = exposed > 0 ? ` · exposed to ${exposed}` : exposed === 0 && covered > 0 ? " · shielded" : "";
+    return `${head}${exp}${range != null ? ` · range ${range}` : ""}`;
   }
 
   /** run the engagement to a terminal state (offline rollout for tests + web). */
@@ -1209,15 +2323,16 @@ function summarizeRejections(rejections: Rejection[]): string[] {
 /** A clear, human-readable verb for what a unit is doing right now (for the view). */
 function describeAction(step: string, status: string, alive: boolean, firingAt: string | null): string {
   if (!alive) return "down";
-  if (step.startsWith("takeShot")) return firingAt ? `firing on ${firingAt}` : "firing";
+  if (step.startsWith("takeShot") || step.startsWith("engageFrom")) return firingAt ? `firing on ${firingAt}` : "firing";
   if (step.startsWith("suppress")) return firingAt ? `suppressing ${firingAt}` : "suppressing";
   if (step.startsWith("flankTo")) return "flanking";
   if (step.startsWith("climbTo")) return "taking high ground";
+  if (step.startsWith("moveToSpot") || step.startsWith("moveFree")) return "repositioning to cover";
   if (step.startsWith("advanceTo")) return "moving to cover";
   if (step.startsWith("moveToBreach")) return "stacking on door";
   if (step.startsWith("breach")) return "breaching";
   if (step.startsWith("reload")) return "reloading";
-  if (step.startsWith("retreatTo")) return "falling back";
+  if (step.startsWith("retreatTo") || step.startsWith("breakTo")) return "breaking contact";
   if (step === "wait" || step === "hold") return "holding";
   if (status === "planning") return "thinking…";
   if (status === "failed") return "looking for a shot";
@@ -1230,11 +2345,12 @@ function describeAction(step: string, status: string, alive: boolean, firingAt: 
 export function barkFor(e: TraceEvent): string | null {
   if (e.t === "step.start") {
     if (e.label.startsWith("flankTo")) return "Flanking — moving!";
+    if (e.label.startsWith("moveToSpot")) return "Repositioning — working the angle!";
     if (e.label.startsWith("advanceTo")) return "Moving up!";
     if (e.label.startsWith("climbTo")) return "Taking the high ground!";
     if (e.label.startsWith("moveToBreach")) return "Stacking up!";
     if (e.label.startsWith("breach")) return "Breaching — go go go!";
-    if (e.label.startsWith("takeShot")) return "Engaging!";
+    if (e.label.startsWith("takeShot") || e.label.startsWith("engageFrom")) return "Engaging!";
     if (e.label.startsWith("suppress")) return "Suppressing — flank now!";
     if (e.label.startsWith("reload")) return "Reloading — cover me!";
     if (e.label.startsWith("retreatTo")) return "Falling back!";

@@ -8,7 +8,7 @@
 
 import { Bindings, ExecutorApi, ExecutorFn, Model, TIMINGS_EXECUTION, TaskStatus } from "./compile";
 import { GoalSpec } from "./ir";
-import { CLOCK_SLOT, ExecState } from "./state";
+import { CLOCK_SLOT, ExecState, Snap } from "./state";
 import { Agenda, Plan, PlanResult, PlanStep, PlanningSession, Rejection, ScopeInstance, StepBudget } from "./search";
 import { Rng, createRng } from "./rng";
 
@@ -71,6 +71,10 @@ export interface PlannerOptions {
   collectRejections?: boolean;
   /** drift tolerance: replan when actual time falls this many seconds behind projection (0 = off) */
   driftTolerance?: number;
+  /** optional domain heuristic for goal searches — see PlanRequest.customHeuristic */
+  customHeuristic?: (s: Snap) => number;
+  /** dedup goal-search nodes by position, ignoring the clock — see PlanRequest.spatialDedup */
+  spatialDedup?: boolean;
 }
 
 export type PlannerStatus = "idle" | "planning" | "running" | "succeeded" | "failed";
@@ -232,6 +236,8 @@ export class Planner {
     maxNodes?: number;
     maxDepth?: number;
     collectRejections?: boolean;
+    customHeuristic?: (s: Snap) => number;
+    spatialDedup?: boolean;
   } {
     return {
       goals: this.goals,
@@ -239,6 +245,8 @@ export class Planner {
       maxNodes: this.opts.maxNodes,
       maxDepth: this.opts.maxDepth,
       collectRejections: this.opts.collectRejections,
+      customHeuristic: this.opts.customHeuristic,
+      spatialDedup: this.opts.spatialDedup,
       ...extra,
     };
   }

@@ -19,6 +19,8 @@ export interface SquadRun {
   trace: { unit: string; e: TraceEvent }[];
   /** the AI unit names (both squads) for the director's unit picker */
   units: string[];
+  /** the discrete tactical positions the planner chooses among (rendered as spots) */
+  spots: { name: string; x: number; z: number }[];
 }
 
 /** A central barricade blocks every direct shot — both squads must flank around it. */
@@ -33,10 +35,16 @@ function blockedFlankInstance(): SquadInstance {
     covers: [
       { name: "cW", x: -5, z: 0 },
       { name: "cE", x: 5, z: 0 },
-      { name: "fNW", x: -3, z: -8, flank: true },
-      { name: "fSW", x: -3, z: 8, flank: true },
-      { name: "fNE", x: 3, z: -8, flank: true },
-      { name: "fSE", x: 3, z: 8, flank: true },
+      // scattered crates by the flank approaches — real directional cover to fight
+      // FROM once you've swung around the barricade (not just open firing lanes)
+      { name: "crNW", x: -3.5, z: -7 },
+      { name: "crNE", x: 3.5, z: -7 },
+      { name: "crSW", x: -3.5, z: 7 },
+      { name: "crSE", x: 3.5, z: 7 },
+      { name: "fNW", x: -3, z: -9.5, flank: true },
+      { name: "fSW", x: -3, z: 9.5, flank: true },
+      { name: "fNE", x: 3, z: -9.5, flank: true },
+      { name: "fSE", x: 3, z: 9.5, flank: true },
       { name: "rRally", x: -12, z: 0, rally: true },
       { name: "bRally", x: 12, z: 0, rally: true },
     ],
@@ -96,7 +104,10 @@ export interface SquadRunOptions {
 
 export function runSquad(id: SquadScenarioId, opts: SquadRunOptions = {}): SquadRun {
   const instance = squadInstance(id);
-  const sim = new SquadSim(instance, { seed: 1 });
+  // GOAP positioning: each unit's repositioning is DISCOVERED by the generic planner's
+  // own search over the tactical-spot graph (guided by a spatial potential-field
+  // heuristic), not a bespoke route — the engine doing the spatial reasoning.
+  const sim = new SquadSim(instance, { seed: 1, positioning: "goap" });
   const maxSteps = opts.maxSteps ?? 600;
   const frames: SquadFrame[] = [sim.snapshot()];
   for (let i = 0; i < maxSteps; i++) {
@@ -104,7 +115,7 @@ export function runSquad(id: SquadScenarioId, opts: SquadRunOptions = {}): Squad
     frames.push(sim.step());
     if (sim.engagementOver()) break;
   }
-  return { scenario: id, instance, frames, trace: sim.trace, units: sim.units.map((u) => u.name) };
+  return { scenario: id, instance, frames, trace: sim.trace, units: sim.units.map((u) => u.name), spots: sim.spots };
 }
 
 /** Counts per trace event kind, for the summary panel. */
@@ -148,7 +159,7 @@ function teamPhrase(units: SquadFrame["units"]): string {
   if (sup) return "laying down suppressing fire";
   if (fl) return "swinging to a flank";
   if (has((a) => a.startsWith("firing"))) return "trading fire from cover";
-  if (has((a) => a === "falling back")) return "falling back";
+  if (has((a) => a === "falling back" || a === "breaking contact")) return "breaking contact";
   if (has((a) => a.includes("moving"))) return "repositioning for an angle";
   if (has((a) => a === "reloading")) return "reloading";
   return "holding";
@@ -160,14 +171,15 @@ export function whatToWatch(id: SquadScenarioId): string[] {
     case "skirmish":
       return [
         "Two squads — Red and Blue — each plan from their OWN belief; neither can read the other's mind.",
-        "Each side coordinates suppress-and-flank and reactively readjusts as it discovers the other's moves (watch the replan count climb).",
-        "Select any unit to see its live plan + sight line (green = has a shot, red = blocked).",
+        "Select a unit: the faint floor dots are the discrete positions its planner SCORES every beat (risk vs reward); the lit-up dot + line is the move its GOAP search just chose.",
+        "Watch units READ THE ROOM: they tuck behind crates to deny the enemy a clean shot, close in for accuracy, and break contact when outgunned (see each unit's 'reading the room' line in the Director).",
+        "Cover is directional + dynamic — a crate that shields you now stops helping the instant a foe swings around it, so the scores shift and units reposition.",
       ];
     case "blockedFlank":
       return [
-        "A central barricade blocks every direct shot — both squads must flank around it.",
-        "Nobody scripted a route: each unit DISCOVERS a cover that can see the enemy (its red sight line turns green on arrival).",
-        "Two teams contesting the same flanks → cover reservation + constant replanning.",
+        "A central barricade blocks every direct shot — both squads must flank around it to earn a line of fire.",
+        "Nobody scripted a route: each unit's GOAP search DISCOVERS a firing position around the wall (select a unit to see the candidate spots it scores and the one it picks), then fights FROM the crates there.",
+        "Two teams contesting the same flanks → cover reservation, dynamic cover, and constant replanning.",
       ];
     case "breach":
       return [
